@@ -68,7 +68,7 @@ if is_linux_gpu_job ; then
     TAGS_FILTER="${TAGS_FILTER},${UNSUPPORTED_GPU_TAGS// /,}"
 
     ADDITIONAL_FLAGS="$ADDITIONAL_FLAGS --run_under=//tools/ci_build/gpu_build:parallel_gpu_execute"
-    RBE_FLAGS="--config=rbe_linux_cuda_nvcc --jobs=150"
+    RBE_FLAGS="--config=rbe_linux_cuda_nvcc --action_env=HERMETIC_CUDNN_VERSION=9.1.1 --jobs=150"
     (
       #TODO(b/338885148): Remove this block after TF was updated to cuDNN 9
       cd ${KOKORO_ARTIFACTS_DIR}/github/xla

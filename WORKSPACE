@@ -101,3 +101,17 @@ tf_workspace1()
 load("@//tensorflow:workspace0.bzl", "tf_workspace0")
 
 tf_workspace0()
+
+load(
+    "@local_tsl//third_party/gpus/cuda:hermetic_cuda_init_redist_json_repository.bzl",
+    "hermetic_cuda_init_redist_json_repository",
+)
+
+hermetic_cuda_init_redist_json_repository()
+
+load(
+    "@local_tsl//third_party/gpus/cuda:hermetic_cuda_init_repositories.bzl",
+    "hermetic_cuda_init_redist_repositories",
+)
+
+hermetic_cuda_init_redist_repositories()
