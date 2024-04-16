@@ -29,6 +29,7 @@ limitations under the License.
 #include "xla/client/local_client.h"
 #include "xla/literal_util.h"
 #include "xla/pjrt/local_device_state.h"
+#include "xla/pjrt/pjrt_client.h"
 #include "xla/pjrt/pjrt_stream_executor_client.h"
 #include "xla/service/platform_util.h"
 #include "xla/tests/literal_test_util.h"
@@ -121,13 +122,15 @@ TEST(StableHloAxpyTest, LoadAndRunCpuExecutable) {
 
   // Transfer our literals to buffers. If we were using a GPU, these buffers
   // would correspond to device memory.
-  TF_ASSERT_OK_AND_ASSIGN(
-      std::unique_ptr<PjRtBuffer> alpha,
-      pjrt_se_client.BufferFromHostLiteral(alpha_literal, cpu));
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<PjRtBuffer> alpha,
+                          pjrt_se_client.BufferFromHostLiteral(
+                              alpha_literal, cpu, /* device_layout */ nullptr));
   TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<PjRtBuffer> x,
-                          pjrt_se_client.BufferFromHostLiteral(x_literal, cpu));
+                          pjrt_se_client.BufferFromHostLiteral(
+                              x_literal, cpu, /* device_layout */ nullptr));
   TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<PjRtBuffer> y,
-                          pjrt_se_client.BufferFromHostLiteral(y_literal, cpu));
+                          pjrt_se_client.BufferFromHostLiteral(
+                              y_literal, cpu, /* device_layout */ nullptr));
 
   // Do our computation.
   TF_ASSERT_OK_AND_ASSIGN(

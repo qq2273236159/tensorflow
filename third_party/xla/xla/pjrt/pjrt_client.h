@@ -893,12 +893,14 @@ class PjRtClient {
   // the caller should, for example, wait for GetReadyFuture().Await()
   // completes on the return value before letting literal go out of scope.
   virtual absl::StatusOr<std::unique_ptr<PjRtBuffer>> BufferFromHostLiteral(
-      const LiteralSlice& literal, PjRtDevice* device) = 0;
+      const LiteralSlice& literal, PjRtDevice* device,
+      const Layout* device_layout) = 0;
 
   // TODO(b/277820585): remove BufferFromHostLiteral with PjRtDevice after the
   // migration is done.
   virtual absl::StatusOr<std::unique_ptr<PjRtBuffer>> BufferFromHostLiteral(
-      const LiteralSlice& literal, PjRtMemorySpace* memory_space) {
+      const LiteralSlice& literal, PjRtMemorySpace* memory_space,
+      const Layout* device_layout) {
     return tsl::errors::Unimplemented(
         "BufferFromHostLiteral with PjRtMemorySpace is not implemented on "
         "platform: ",

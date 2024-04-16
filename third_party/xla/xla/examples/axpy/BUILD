@@ -11,6 +11,7 @@ xla_cc_test(
         "//xla/client:client_library",
         "//xla/client:local_client",
         "//xla/pjrt:local_device_state",
+        "//xla/pjrt:pjrt_client",
         "//xla/pjrt:pjrt_stream_executor_client",
         "//xla/service:cpu_plugin",
         "//xla/service:platform_util",

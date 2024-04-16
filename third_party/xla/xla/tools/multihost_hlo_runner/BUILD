@@ -157,6 +157,7 @@ xla_test(
         "data/sharded_16_devices.hlo",
         "data/sharded_2_devices.hlo",
         "data/single_device.hlo",
+        "data/single_device_non_compact_layout.hlo",
         "data/single_device_tupled.hlo",
     ],
     tags = ["nomac"],
