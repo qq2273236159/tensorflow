@@ -528,6 +528,8 @@ void AddPostVariableFreezingTFToTFLConversionPasses(
     pass_manager->addNestedPass<mlir::func::FuncOp>(
         mlir::TFL::CreateRuntimeVerifyPass());
   }
+  if (pass_config.canonicalizing_inf_as_min_max_float)
+    pass_manager->addPass(mlir::TFL::CreateCanonicalizeBoundaryValuePass());
 }
 
 void AddTFToTFLConversionPasses(llvm::StringRef saved_model_dir,

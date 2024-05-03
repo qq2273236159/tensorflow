@@ -498,6 +498,8 @@ absl::Status ConvertTFExecutorToTFLOrFlatbuffer(
         MetadataForReducedPrecisionSupport(quant_specs.support_mask));
   }
   pass_manager.clear();
+  if (pass_config.canonicalizing_inf_as_min_max_float)
+    pass_manager.addPass(mlir::TFL::CreateCanonicalizeBoundaryValuePass());
   pass_manager.addPass(mlir::odml::createLegalizeStablehloToVhloPass());
   if (failed(pass_manager.run(module))) {
     return status_handler.Combine(
