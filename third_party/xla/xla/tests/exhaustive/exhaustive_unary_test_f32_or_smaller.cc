@@ -20,6 +20,7 @@ limitations under the License.
 #include <cmath>
 #include <limits>
 #include <random>
+#include <string>
 #include <tuple>
 #include <utility>
 
@@ -34,6 +35,8 @@ limitations under the License.
 
 namespace xla {
 namespace exhaustive_op_test {
+
+extern int GetEupVersion();
 
 using Eigen::half;
 
@@ -198,6 +201,13 @@ class Exhaustive32BitOrLessUnaryTest
     special_input_bounder_ = true;
   }
 
+  bool IsGpu(const std::string& platform) const { return platform == "CUDA"; }
+  bool IsCpu(const std::string& platform) const { return platform == "Host"; }
+  bool IsTpu(const std::string& platform) const {
+    return !IsGpu(platform) && !IsCpu(platform);
+  }
+  int EupVersion() { return xla::exhaustive_op_test::GetEupVersion(); }
+
  protected:
   using typename ExhaustiveUnaryTest<T>::NativeT;
 
@@ -264,6 +274,7 @@ class Exhaustive32BitOrLessUnaryTest
   float input_lower_bounder_;
   float input_upper_bounder_;
   bool special_input_bounder_;
+  int tpu_version_;
 };
 
 using ExhaustiveF32UnaryTest = Exhaustive32BitOrLessUnaryTest<F32>;
@@ -402,7 +413,7 @@ UNARY_TEST_FLOAT_32_BITS_OR_LESS(Acosh, {
     NativeT eps = std::numeric_limits<NativeT>::epsilon();
     return ErrorSpec{.abs_err = 1e-7, .rel_err = 50 * eps};
   };
-  if (platform_ != "Host" && platform_ != "CUDA") {
+  if (IsTpu(platform_)) {
     error_spec_gen = +[](NativeT x) {
       NativeT eps = std::numeric_limits<NativeT>::epsilon();
       return ErrorSpec{2e-4, eps};
@@ -412,7 +423,7 @@ UNARY_TEST_FLOAT_32_BITS_OR_LESS(Acosh, {
 })
 UNARY_TEST_FLOAT_32_BITS_OR_LESS(Asinh, {
   auto error_spec_gen = GetDefaultSpecGenerator();
-  if (platform_ != "Host" && platform_ != "CUDA") {
+  if (IsTpu(platform_)) {
     error_spec_gen = +[](NativeT x) {
       NativeT eps = std::numeric_limits<NativeT>::epsilon();
       return ErrorSpec{.abs_err = 2e-4, .rel_err = eps};
@@ -422,7 +433,7 @@ UNARY_TEST_FLOAT_32_BITS_OR_LESS(Asinh, {
 })
 UNARY_TEST_FLOAT_32_BITS_OR_LESS(Atanh, {
   auto error_spec_gen = GetDefaultSpecGenerator();
-  if (platform_ != "Host" && platform_ != "CUDA") {
+  if (IsTpu(platform_)) {
     error_spec_gen = +[](NativeT x) {
       NativeT eps = std::numeric_limits<NativeT>::epsilon();
       return ErrorSpec{.abs_err = 1e-4, .rel_err = eps};
@@ -461,7 +472,7 @@ UNARY_TEST_FLOAT_32_BITS_OR_LESS(Atan, {
 
 UNARY_TEST_FLOAT_32_BITS_OR_LESS(Cosh, {
   auto error_spec_gen = GetDefaultSpecGenerator();
-  if (platform_ != "Host" && platform_ != "CUDA") {
+  if (IsTpu(platform_)) {
     error_spec_gen = +[](NativeT x) {
       NativeT eps = std::numeric_limits<NativeT>::epsilon();
       // Cosh is always greater than or equal to 1, so an absolute
@@ -474,7 +485,7 @@ UNARY_TEST_FLOAT_32_BITS_OR_LESS(Cosh, {
 
 UNARY_TEST_FLOAT_32_BITS_OR_LESS(Sinh, {
   auto error_spec_gen = GetDefaultSpecGenerator();
-  if (platform_ != "Host" && platform_ != "CUDA") {
+  if (IsTpu(platform_)) {
     error_spec_gen = +[](NativeT x) {
       NativeT eps = std::numeric_limits<NativeT>::epsilon();
       return ErrorSpec{.abs_err = 1e-5, .rel_err = 100 * eps};
@@ -486,7 +497,7 @@ UNARY_TEST_FLOAT_32_BITS_OR_LESS(Sinh, {
 UNARY_TEST_FLOAT_32_BITS_OR_LESS(TanhBounderTestUpperBound, {
   SetBounder(8, 9);
   ErrorSpecGen error_spec_gen = GetDefaultSpecGenerator();
-  if (platform_ == "CUDA" || platform_ == "Host") {
+  if (!IsTpu(platform_)) {
     error_spec_gen =
         +[](NativeT x) { return ErrorSpec{.abs_err = 0, .rel_err = 0}; };
   }
@@ -498,7 +509,7 @@ UNARY_TEST_FLOAT_32_BITS_OR_LESS(TanhBounderTestUpperBound, {
 UNARY_TEST_FLOAT_32_BITS_OR_LESS(TanhBounderTestLowerBound, {
   SetBounder(-9, -8);
   ErrorSpecGen error_spec_gen = GetDefaultSpecGenerator();
-  if (platform_ == "CUDA" || platform_ == "Host") {
+  if (IsTpu(platform_)) {
     error_spec_gen = +[](NativeT x) { return ErrorSpec{0, 0}; };
   }
   Run(
@@ -508,7 +519,7 @@ UNARY_TEST_FLOAT_32_BITS_OR_LESS(TanhBounderTestLowerBound, {
 
 UNARY_TEST_FLOAT_32_BITS_OR_LESS(TanhNormalTest, {
   ErrorSpecGen error_spec_gen = GetDefaultSpecGenerator();
-  if (platform_ != "CUDA" && platform_ != "Host") {
+  if (IsTpu(platform_)) {
     error_spec_gen = +[](NativeT x) {
       // The range of tanh is [-1:1], so no point in giving a relative
       // tolerance when we have an absolute one.
@@ -548,7 +559,7 @@ UNARY_TEST_FLOAT_32_BITS_OR_LESS(Tan, {
 UNARY_TEST_FLOAT_32_BITS_OR_LESS(Erf, { Run(Erf, std::erf); })
 UNARY_TEST_FLOAT_32_BITS_OR_LESS(Erfc, {
   auto error_spec_gen = GetDefaultSpecGenerator();
-  if (platform_ != "Host" && platform_ != "CUDA") {
+  if (IsTpu(platform_)) {
     error_spec_gen = +[](NativeT x) {
       NativeT min = std::numeric_limits<NativeT>::min();
       NativeT eps = std::numeric_limits<NativeT>::epsilon();
@@ -559,7 +570,7 @@ UNARY_TEST_FLOAT_32_BITS_OR_LESS(Erfc, {
 })
 UNARY_TEST_FLOAT_32_BITS_OR_LESS(ErfInv, {
   auto error_spec_gen = GetDefaultSpecGenerator();
-  if (platform_ != "Host" && platform_ != "CUDA") {
+  if (IsTpu(platform_)) {
     error_spec_gen = +[](NativeT x) {
       NativeT eps = std::numeric_limits<NativeT>::epsilon();
       return ErrorSpec{.abs_err = 5e-5, .rel_err = 2 * eps};
@@ -573,7 +584,7 @@ UNARY_TEST_FLOAT_32_BITS_OR_LESS(Digamma, {
     NativeT eps = std::numeric_limits<NativeT>::epsilon();
     return ErrorSpec{2e-5, 10 * eps};
   };
-  if (platform_ != "Host" && platform_ != "CUDA") {
+  if (IsTpu(platform_)) {
     error_spec_gen = +[](NativeT x) {
       NativeT eps = std::numeric_limits<NativeT>::epsilon();
       return ErrorSpec{.abs_err = 2e-4, .rel_err = 10 * eps};
@@ -587,12 +598,12 @@ UNARY_TEST_FLOAT_32_BITS_OR_LESS(Lgamma, {
     NativeT eps = std::numeric_limits<NativeT>::epsilon();
     return ErrorSpec{.abs_err = 1e-5, .rel_err = 150 * eps};
   };
-  if (platform_ == "CUDA") {
+  if (IsGpu(platform_)) {
     error_spec_gen = +[](NativeT x) {
       NativeT eps = std::numeric_limits<NativeT>::epsilon();
       return ErrorSpec{.abs_err = 1e-5, .rel_err = 5000 * eps};
     };
-  } else if (platform_ != "Host") {
+  } else if (IsTpu(platform_)) {
     error_spec_gen = +[](NativeT x) {
       NativeT eps = std::numeric_limits<NativeT>::epsilon();
       return ErrorSpec{.abs_err = 5e-4, .rel_err = 5000 * eps};
