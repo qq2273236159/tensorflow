@@ -25,7 +25,13 @@ limitations under the License.
 #include <vector>
 
 #include "absl/container/flat_hash_set.h"
+#include "absl/log/log.h"
+#include "tensorflow/core/framework/numeric_types.h"
+#include "tensorflow/core/framework/tensor.h"
+#include "tensorflow/core/framework/tensor.pb.h"
 #include "tensorflow/core/framework/tensor_shape.h"
+#include "tensorflow/core/framework/tensor_shape.pb.h"
+#include "tensorflow/core/framework/types.h"
 #include "tensorflow/core/framework/versions.pb.h"
 #include "tensorflow/core/grappler/costs/graph_properties.h"
 #include "tensorflow/core/grappler/graph_view.h"
@@ -38,6 +44,7 @@ limitations under the License.
 #include "tensorflow/core/grappler/utils/symbolic_shapes.h"
 #include "tensorflow/core/grappler/utils/topological_sort.h"
 #include "tensorflow/core/lib/core/errors.h"
+#include "tensorflow/core/platform/bfloat16.h"
 #include "tensorflow/core/platform/logging.h"
 #include "tensorflow/core/protobuf/rewriter_config.pb.h"
 #include "tensorflow/core/util/env_var.h"
@@ -510,6 +517,82 @@ bool RuntimeFusionEnabled(const Cluster* cluster) {
   return is_enabled;
 }
 
+template <typename T>
+bool AllValuesAre(const TensorProto& proto, const T& value) {
+  Tensor tensor;
+  if (!tensor.FromProto(proto)) {
+    return false;
+  }
+  auto values = tensor.flat<T>();
+  for (int i = 0; i < tensor.NumElements(); ++i) {
+    if (values(i) != value) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool IsZeroTensor(const TensorProto& proto) {
+  switch (proto.dtype()) {
+    case DT_BOOL:
+      return AllValuesAre<bool>(proto, false);
+    case DT_HALF:
+      return AllValuesAre<Eigen::half>(proto, Eigen::half(0));
+    case DT_FLOAT:
+      return AllValuesAre<float>(proto, 0.0);
+    case DT_DOUBLE:
+      return AllValuesAre<double>(proto, 0.0);
+    case DT_BFLOAT16:
+      return AllValuesAre<bfloat16>(proto, bfloat16(0));
+    case DT_COMPLEX64:
+      return AllValuesAre<complex64>(proto, 0.0);
+    case DT_COMPLEX128:
+      return AllValuesAre<complex128>(proto, 0.0);
+    case DT_UINT8:
+      return AllValuesAre<uint8_t>(proto, 0);
+    case DT_INT8:
+      return AllValuesAre<int8_t>(proto, 0);
+    case DT_UINT16:
+      return AllValuesAre<uint16_t>(proto, 0);
+    case DT_INT16:
+      return AllValuesAre<int16_t>(proto, 0);
+    case DT_INT32:
+      return AllValuesAre<int32_t>(proto, 0);
+    case DT_INT64:
+      return AllValuesAre<int64_t>(proto, 0);
+    case DT_QINT32:
+      return AllValuesAre<qint32>(proto, 0);
+    case DT_QINT16:
+      return AllValuesAre<qint16>(proto, 0);
+    case DT_QUINT16:
+      return AllValuesAre<quint16>(proto, 0);
+    case DT_QINT8:
+      return AllValuesAre<qint8>(proto, 0);
+    case DT_QUINT8:
+      return AllValuesAre<quint8>(proto, 0);
+    default:
+      VLOG(1) << "Unsupported type " << DataTypeString(proto.dtype());
+  }
+  return false;
+}
+
+bool IsReluSemanticMaximum(const utils::MutableNodeView& node_view) {
+  if (!IsMaximum(*node_view.node())) return false;
+  const std::vector<utils::MutableFanoutView>& fanin_nodes =
+      node_view.GetRegularFanins();
+  if (fanin_nodes.size() != 2) return false;
+  bool is_relu_equivalent = false;
+  for (const auto& fanin_node : fanin_nodes) {
+    const NodeDef* node = fanin_node.node_view()->node();
+    if (!IsConstant(*node)) continue;
+    if (IsZeroTensor(node->attr().at("value").tensor())) {
+      is_relu_equivalent = true;
+      break;
+    }
+  }
+  return is_relu_equivalent;
+}
+
 bool IsSupportedActivation(const NodeDef& node, const Cluster* cluster) {
   bool is_default_supported =
       IsRelu(node) || IsRelu6(node) || IsElu(node) || IsLeakyRelu(node);
@@ -662,6 +745,64 @@ bool IsConvOrMatMul(const NodeDef& node) {
          IsConv3D(node);
 }
 
+bool IsMatMulAddV2(const RemapperContext& ctx,
+                   const utils::MutableNodeView& node_view, int& bias_port) {
+  const auto* node_def = node_view.node();
+  if (!NodeIsOnCpu(node_def)) return false;
+  if (!IsAdd(*node_def) || node_view.NumRegularFanins() != 2) return false;
+  const auto& regular_fanin_0 = node_view.GetRegularFanin(0);
+  const auto* node_view_0 = regular_fanin_0.node_view();
+  const auto* node_def_0 = node_view_0->node();
+  const auto& regular_fanin_1 = node_view.GetRegularFanin(1);
+  const auto* node_view_1 = regular_fanin_1.node_view();
+  const auto* node_def_1 = node_view_1->node();
+  const NodeDef* matmul_node = nullptr;
+  const NodeDef* bias_node = nullptr;
+  if (!IsMatMul(*node_def_0) && !IsMatMul(*node_def_1)) return false;
+  if (IsMatMul(*node_def_0)) {
+    matmul_node = node_def_0;
+    bias_node = node_def_1;
+    bias_port = 1;
+  } else if (IsMatMul(*node_def_1)) {
+    matmul_node = node_def_1;
+    bias_node = node_def_0;
+    bias_port = 0;
+  }
+  if (matmul_node->attr().find("_output_shapes") == matmul_node->attr().end()) {
+    return false;
+  }
+  if (bias_node->attr().find("_output_shapes") == bias_node->attr().end()) {
+    return false;
+  }
+  TensorShapeProto matmul_shape =
+      matmul_node->attr().at("_output_shapes").list().shape(0);
+  TensorShapeProto bias_shape =
+      bias_node->attr().at("_output_shapes").list().shape(0);
+  if (matmul_shape.unknown_rank() || bias_shape.unknown_rank() ||
+      matmul_shape.dim_size() < 1 || bias_shape.dim_size() < 1 ||
+      !IsKnown(matmul_shape.dim(matmul_shape.dim_size() - 1)) ||
+      !IsKnown(bias_shape.dim(bias_shape.dim_size() - 1)))
+    return false;
+  // Helper function to check Add/AddV2 could be replaced with BiasAdd.
+  const auto is_supported_shape =
+      [&](const TensorShapeProto& shape,
+          const TensorShapeProto& bcast_shape) -> bool {
+    if (shape.dim_size() < 2) return false;
+    // Check that the conv node's channel dim is equal to the 1-dim add node's
+    // dim
+    if (shape.dim(shape.dim_size() - 1).size() !=
+        bcast_shape.dim(bcast_shape.dim_size() - 1).size())
+      return false;
+
+    // Check that add nodes dims are all 1's except the channel dim
+    for (int i = 0; i < bcast_shape.dim_size() - 1; i++) {
+      if (1 != bcast_shape.dim(i).size()) return false;
+    }
+    return true;
+  };
+  return is_supported_shape(matmul_shape, bias_shape);
+}
+
 // Returns true if one input to Add is Conv2D/3D or DepthwiseConv2dNative or
 // MatMul, and the other input is semantically equivalent to BiasAdd.
 bool IsBiasSemanticAdd(const RemapperContext& ctx,
@@ -772,8 +913,12 @@ bool FindContractionWithBias(const RemapperContext& ctx, int node_index,
 
   const auto* node_def = node_view->node();
   int bias_port = 1;
-  if (!IsBiasAdd(*node_def) && !IsBiasSemanticAdd(ctx, *node_view, bias_port))
+  if (!IsMatMulAddV2(ctx, *node_view, bias_port) && !IsBiasAdd(*node_def) &&
+      !IsBiasSemanticAdd(ctx, *node_view, bias_port))
     return false;
+  // if (!IsBiasAdd(*node_def) && !IsBiasSemanticAdd(ctx, *node_view,
+  // bias_port))
+  //   return false;
 
   // Input to the BiasAdd must be a Conv2D/3D or a MatMul.
   if (node_view->NumRegularFanins() < 1) return false;
@@ -856,7 +1001,7 @@ bool FindFusedConvWithFusedActivation(const RemapperContext& ctx,
   return true;
 }
 
-bool FindContractionWithBiasAndActivation(
+bool FindContractionWithBiasAddAndActivation(
     const RemapperContext& ctx, Cluster* cluster, int node_index,
     ContractionWithBiasAddAndActivation* matched) {
   const auto* node_view = ctx.graph_view.GetNode(node_index);
@@ -865,7 +1010,9 @@ bool FindContractionWithBiasAndActivation(
   if (HasControlFaninOrFanout(*node_view)) return false;
 
   const auto* node_def = node_view->node();
-  if (!IsSupportedActivation(*node_def, cluster)) return false;
+  if (!IsSupportedActivation(*node_def, cluster) &&
+      !(IsReluSemanticMaximum(*node_view)))
+    return false;
 
   // And input to the activation node must match ContractionWithBiasAdd pattern.
   if (node_view->NumRegularFanins() < 1) return false;
@@ -3401,7 +3548,11 @@ Status AddFusedContractionNode(
     CopyConv3DAttributes(contraction, &fused_op, &activation);
   }
 
-  SetFusedOpAttributes(&fused_op, {"BiasAdd", activation.op()});
+  SetFusedOpAttributes(
+      &fused_op, {"BiasAdd", IsReluSemanticMaximum(
+                                 *ctx->graph_view.GetNode(matched.activation))
+                                 ? "Relu"
+                                 : activation.op()});
 
   utils::Mutation* mutation = ctx->graph_view.GetMutationBuilder();
   Status status;
@@ -5106,12 +5257,12 @@ Status Remapper::Optimize(Cluster* cluster, const GrapplerItem& item,
 
     // Remap {Conv2D,DepthwiseConv2D,MatMul,Conv3D}+BiasAdd+Activation into the
     // _Fused{Conv2D,DepthwiseConv2dNative,MatMul,Conv3D}.
-    ContractionWithBiasAddAndActivation contract_with_bias_and_activation;
+    ContractionWithBiasAddAndActivation contract_with_bias_add_and_activation;
     if (allow_non_differentiable_rewrites &&
-        FindContractionWithBiasAndActivation(
-            ctx, cluster, i, &contract_with_bias_and_activation)) {
+        FindContractionWithBiasAddAndActivation(
+            ctx, cluster, i, &contract_with_bias_add_and_activation)) {
       TF_RETURN_IF_ERROR(
-          AddFusedContractionNode(&ctx, contract_with_bias_and_activation,
+          AddFusedContractionNode(&ctx, contract_with_bias_add_and_activation,
                                   &invalidated_nodes, &nodes_to_delete));
       continue;
     }
