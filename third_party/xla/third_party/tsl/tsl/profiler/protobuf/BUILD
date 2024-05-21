@@ -1,7 +1,7 @@
 # copybara:uncomment(oss-unused) load("//net/grpc/go/build_defs:go_grpc_library.bzl", "go_grpc_library")
 # Placeholder: load py_proto_library
 load("@local_xla//xla/tsl:tsl.bzl", "internal_visibility")
-load("//tsl/platform:build_config.bzl", "tf_proto_library")
+load("//tsl/platform:build_config.bzl", "tf_proto_library", "tf_proto_library_py")
 
 # copybara:uncomment package(default_applicable_licenses = ["//tensorflow:license"])
 
@@ -123,6 +123,11 @@ tf_proto_library(
 #     deps = [":xplane_proto"],
 # )
 # copybara:uncomment_end
+
+tf_proto_library_py(
+    name = "xplane_proto_external",
+    srcs = ["xplane.proto"],
+)
 
 tf_proto_library(
     name = "profiled_instructions_proto",
