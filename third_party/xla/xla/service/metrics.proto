@@ -41,4 +41,6 @@ message CompilationLogEntry {
   int32 task_index = 4;
   // Pass specific metrics.
   repeated PassMetrics pass_metrics = 5;
+  // IDs of modules on which the compilation stage was run.
+  repeated int64 module_ids = 6;
 }
