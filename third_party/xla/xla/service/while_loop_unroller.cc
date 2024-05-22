@@ -93,6 +93,33 @@ std::unique_ptr<HloComputation> MakeTrivialLoopCondition(
           init_value_constant, ComparisonDirection::kLe)));
 }
 
+// Handle DynamicGte and DynamicTuple custom-calls created during unstacking
+// pass.
+absl::Status HandleDynamicGteOrTuple(HloInstruction* instr, int64_t iter_num) {
+  if (instr->IsCustomCall("DynamicGte")) {
+    return instr->parent()->ReplaceInstruction(
+        instr, instr->AddInstruction(HloInstruction::CreateGetTupleElement(
+                   instr->mutable_operand(0), iter_num)));
+  } else if (instr->IsCustomCall("DynamicTuple")) {
+    std::vector<HloInstruction*> tuple_operands;
+    for (int64_t i = 0; i < instr->operand(0)->shape().tuple_shapes_size();
+         i++) {
+      if (i == iter_num) {
+        tuple_operands.push_back(instr->mutable_operand(1));
+      } else {
+        HloInstruction* slice =
+            instr->AddInstruction(HloInstruction::CreateGetTupleElement(
+                instr->mutable_operand(0), i));
+        tuple_operands.push_back(slice);
+      }
+    }
+    return instr->parent()->ReplaceInstruction(
+        instr,
+        instr->AddInstruction(HloInstruction::CreateTuple(tuple_operands)));
+  }
+  return absl::OkStatus();
+}
+
 // Helper function that replaces a single iteration of a while loop with
 // induction variable equal to induction_value.
 absl::StatusOr<std::unique_ptr<HloComputation>>
@@ -119,11 +146,12 @@ UnrollSingleIterationOfTrivialLoop(HloInstruction* while_op,
   for (HloInstruction* body_inst : while_body_clone->instructions()) {
     // We need to assign a unique channel_id for the collective ops that are
     // unrolled within the while loop body or fusions containing collectives.
-    if (IsCollectiveWithChannelId(body_inst)) {
+    HloInstruction* collective = IsOrHasCollectiveWithChannelId(body_inst);
+    if (collective != nullptr) {
       // To obtain the channel_id for the collective ops we only need to
       // increment the `unique_channel_id` since it records the next available
       // channel_id across the module.
-      body_inst->set_channel_id(unique_channel_id++);
+      collective->set_channel_id(unique_channel_id++);
     }
 
     // We only consider induction variable instructions of the following form.
@@ -154,7 +182,7 @@ UnrollSingleIterationOfTrivialLoop(HloInstruction* while_op,
                                        match::Constant()))) {
         continue;
       }
-
+      CHECK_OK(HandleDynamicGteOrTuple(indvar_use, induction_value));
       for (int64_t i = 0; i < indvar_use->operand_count(); ++i) {
         const HloInstruction* indvar_use_operand = indvar_use->operand(i);
         // Found the induction var user.
@@ -327,8 +355,8 @@ bool IsLoopInductionVar(const HloInstruction* instr,
   }
 }
 
-bool MatchShapeCoveringDynamicIndexInstruction(HloInstruction* instr,
-                                               HloInstruction* input,
+bool MatchShapeCoveringDynamicIndexInstruction(const HloInstruction* instr,
+                                               const HloInstruction* input,
                                                HloOpcode opcode,
                                                const WhileLoopConfig& config) {
   // Based on the instruction type, start indices start from index 1 or 2 of the
@@ -341,7 +369,7 @@ bool MatchShapeCoveringDynamicIndexInstruction(HloInstruction* instr,
   } else {
     return false;
   }
-  HloInstruction* operand = instr->mutable_operand(0);
+  const HloInstruction* operand = instr->operand(0);
   if (operand != input) {
     return false;
   }
@@ -349,7 +377,7 @@ bool MatchShapeCoveringDynamicIndexInstruction(HloInstruction* instr,
   int64_t dynamic_index = -1;
   for (int64_t start_index = start_indices_offset;
        start_index < instr->operand_count(); ++start_index) {
-    HloInstruction* index = instr->mutable_operand(start_index);
+    const HloInstruction* index = instr->operand(start_index);
     // All constants must be zero in order to slice the entire shape.
     if (Match(index, match::ConstantScalar())) {
       std::optional<int64_t> offset =

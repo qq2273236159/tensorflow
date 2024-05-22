@@ -50,8 +50,8 @@ struct WhileLoopConfig {
 // 2. The start index of that dimension should be equal to the enclosing loop
 // induction variable.
 // 3. And, the size of that dimension must match the loop trip count.
-bool MatchShapeCoveringDynamicIndexInstruction(HloInstruction* instr,
-                                               HloInstruction* input,
+bool MatchShapeCoveringDynamicIndexInstruction(const HloInstruction* instr,
+                                               const HloInstruction* input,
                                                HloOpcode opcode,
                                                const WhileLoopConfig& config);
 
