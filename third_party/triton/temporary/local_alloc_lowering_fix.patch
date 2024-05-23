@@ -1,0 +1,40 @@
+diff --git a/lib/Dialect/TritonGPU/IR/Dialect.cpp b/lib/Dialect/TritonGPU/IR/Dialect.cpp
+--- a/lib/Dialect/TritonGPU/IR/Dialect.cpp
++++ b/lib/Dialect/TritonGPU/IR/Dialect.cpp
+@@ -2771,6 +2771,11 @@ struct CanonicalizeConvertFromAlloc
+     auto convert = op.getSrc().getDefiningOp<ConvertLayoutOp>();
+     if (!convert)
+       return failure();
++    // LocalAllocOp lowering doesn't support going from DotOperandEncoding
++    // to SharedEncoding, so we want to keep this layout conversion.
++    if (mlir::isa<triton::gpu::DotOperandEncodingAttr>(
++            convert.getSrc().getType().getEncoding()))
++      return failure();
+     rewriter.replaceOpWithNewOp<triton::gpu::LocalAllocOp>(
+         op, op->getResult(0).getType(), convert.getSrc());
+     return mlir::success();
+diff --git a/lib/Dialect/TritonGPU/Transforms/AccelerateMatmul.cpp b/lib/Dialect/TritonGPU/Transforms/AccelerateMatmul.cpp
+--- a/lib/Dialect/TritonGPU/Transforms/AccelerateMatmul.cpp
++++ b/lib/Dialect/TritonGPU/Transforms/AccelerateMatmul.cpp
+@@ -232,6 +232,21 @@ public:
+     auto newType = tt::MemDescType::get(argType.getShape(),
+                                         argType.getElementType(), newLayout);
+     rewriter.setInsertionPointAfterValue(arg);
++
++    // LocalAllocOp lowering doesn't support going from DotOperandEncoding
++    // to SharedEncoding.
++    if (mlir::isa<ttg::DotOperandEncodingAttr>(argType.getEncoding())) {
++      auto dotOpEnc =
++            mlir::cast<ttg::DotOperandEncodingAttr>(argType.getEncoding());
++      // Create a layout conversion from DotOperandEncoding to BlockedEncoding
++      // then pass it to the LocalAllocOp.
++      auto newArgType = RankedTensorType::get(
++          argType.getShape(), argType.getElementType(), dotOpEnc.getParent());
++      auto dotOperandToBlockedCvt =
++          rewriter.create<ttg::ConvertLayoutOp>(arg.getLoc(), newArgType, arg);
++      return rewriter.create<ttg::LocalAllocOp>(arg.getLoc(), newType,
++                                                dotOperandToBlockedCvt);
++    }
+     return rewriter.create<ttg::LocalAllocOp>(arg.getLoc(), newType, arg);
+   }
+ 
