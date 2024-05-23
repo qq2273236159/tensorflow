@@ -17,6 +17,7 @@ limitations under the License.
 #define TENSORFLOW_LITE_KERNELS_INTERNAL_REFERENCE_INTEGER_OPS_DEQUANTIZE_H_
 
 #include "tensorflow/lite/kernels/internal/common.h"
+#include "tensorflow/lite/kernels/internal/portable_tensor_utils.h"
 #include "tensorflow/lite/kernels/internal/types.h"
 
 namespace tflite {
@@ -35,6 +36,18 @@ inline void Dequantize(const tflite::DequantizationParams& op_params,
     const float result = static_cast<float>(scale * (val - zero_point));
     output_data[i] = result;
   }
+}
+
+inline void DequantizeWithPackedInt4(
+    const tflite::DequantizationParams& op_params,
+    const RuntimeShape& input_shape, const int8_t* input_data,
+    int8_t* unpacked_input_data, const RuntimeShape& output_shape,
+    float* output_data) {
+  TFLITE_DCHECK_NE(unpacked_input_data, nullptr);
+  tflite::tensor_utils::UnpackDenseInt4IntoInt8(
+      input_data, input_shape.FlatSize(), unpacked_input_data);
+  Dequantize<int8_t>(op_params, input_shape, unpacked_input_data, output_shape,
+                     output_data);
 }
 
 }  // namespace reference_integer_ops

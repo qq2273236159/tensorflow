@@ -66,12 +66,33 @@ class DequantizeOpModel : public SingleOpModel {
     PopulateTensor(input_, data);
   }
 
+  template <typename T>
+  void SetInputInt4(int input, const std::vector<T> data) {
+    auto non_const = *const_cast<std::vector<T>*>(&data);
+    std::vector<int8_t> data_int8(non_const.size());
+    std::copy(non_const.begin(), non_const.end(), data_int8.begin());
+    PopulateTensor4bit(input, 0, data_int8.data(),
+                       data_int8.data() + data_int8.size());
+  }
+
   std::vector<float> GetOutput() { return ExtractVector<float>(output_); }
 
  protected:
   int input_;
   int output_;
 };
+
+TEST(DequantizeOpTest, Int4) {
+  // [-63.5, 64] -> scale=0.5, zero_point=1 for INT4
+  DequantizeOpModel m(TensorType_INT4, {2, 5}, 0.5, -1, 6);
+
+  m.SetInputInt4<int8_t>(
+      0, {-128, -127, -126, -125, -124, 123, 124, 125, 126, 127});
+  ASSERT_EQ(m.Invoke(), kTfLiteOk);
+  EXPECT_THAT(m.GetOutput(),
+              ElementsAreArray(ArrayFloatNear(
+                  {0.5, 1, 1.5, 2, 2.5, -2, -1.5, -1, -0.5, 0})));
+}
 
 TEST(DequantizeOpTest, Uint8) {
   // [-63.5, 64] -> scale=0.5 zero_point=127 for UINT8

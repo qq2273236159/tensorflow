@@ -92,6 +92,8 @@ removed in the next release.
       delegate features.
     * Flatbuffer version update:
         * `GetTemporaryPointer()` bug fixed.
+    * `Dequantize` op supports `TensorType_INT4`.
+        * This change includes per-channel dequantization.
 
 * `tf.data`
     * Add `wait` to `tf.data.Dataset.load`. If `True`, for snapshots written
