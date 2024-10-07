@@ -16,7 +16,11 @@ limitations under the License.
 #ifndef XLA_HLO_UTILS_HLO_QUERY_H_
 #define XLA_HLO_UTILS_HLO_QUERY_H_
 
+#include <cstdint>
+#include <utility>
+
 #include "absl/container/flat_hash_set.h"
+#include "absl/strings/string_view.h"
 #include "xla/hlo/ir/hlo_computation.h"
 #include "xla/hlo/ir/hlo_instruction.h"
 #include "xla/hlo/ir/hlo_module.h"
@@ -144,6 +148,24 @@ int64_t NextChannelId(const HloModule& module);
 // This function is called after X64Rewriter, so X64 host transfers are already
 // rewritten into tuple shaped transfers.
 bool HasX64TransformedHostTransfer(const HloModule& module);
+
+// Returns the unique GTE instruction with the given operand and index. Returns
+// nullptr if no such instruction exists or is not unique.
+HloInstruction* GetUniqueGteInstruction(const HloInstruction* operand,
+                                        int64_t index);
+
+// Gets the computation from the given module with the given name.
+HloComputation* FindComputation(HloModule* module, absl::string_view name);
+
+// Gets the instruction from the given computation with the given instruction
+// name. Returns nullptr if no such instruction can be found.
+HloInstruction* FindInstruction(const HloComputation* computation,
+                                absl::string_view name);
+
+// Gets any instruction from the given computation with the given opcode.
+// Returns nullptr if no such instruction can be found.
+HloInstruction* FindInstruction(const HloComputation* computation,
+                                HloOpcode opcode);
 
 }  // namespace hlo_query
 }  // namespace xla

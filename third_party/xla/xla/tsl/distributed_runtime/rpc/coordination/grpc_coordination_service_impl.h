@@ -18,21 +18,21 @@ limitations under the License.
 
 #include <memory>
 
-#include "grpcpp/alarm.h"
-#include "grpcpp/completion_queue.h"
-#include "grpcpp/server_builder.h"
 #include "absl/base/thread_annotations.h"
 #include "absl/status/status.h"
 #include "absl/synchronization/mutex.h"
+#include "grpcpp/alarm.h"
+#include "grpcpp/completion_queue.h"
+#include "grpcpp/server_builder.h"
 #include "xla/tsl/distributed_runtime/coordination/coordination_service.h"
 #include "xla/tsl/distributed_runtime/coordination/coordination_service_agent.h"
 #include "xla/tsl/distributed_runtime/coordination/coordination_service_rpc_handler.h"
 #include "xla/tsl/distributed_runtime/rpc/async_service_interface.h"
 #include "xla/tsl/distributed_runtime/rpc/grpc_call.h"
 #include "xla/tsl/distributed_runtime/rpc/grpc_util.h"
+#include "xla/tsl/protobuf/coordination_service.grpc.pb.h"
+#include "xla/tsl/protobuf/coordination_service.pb.h"
 #include "tsl/platform/threadpool.h"
-#include "tsl/protobuf/coordination_service.grpc.pb.h"
-#include "tsl/protobuf/coordination_service.pb.h"
 
 namespace tsl {
 
@@ -98,6 +98,7 @@ class GrpcCoordinationServiceImpl : public AsyncServiceInterface {
   HANDLER(DeleteKeyValue);
   HANDLER(Barrier);
   HANDLER(CancelBarrier);
+  HANDLER(PollForError);
 #undef HANDLER
 
   thread::ThreadPool& compute_pool_;

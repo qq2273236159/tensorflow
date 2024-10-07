@@ -16,10 +16,10 @@ limitations under the License.
 #ifndef XLA_PJRT_MLIR_TO_HLO_H_
 #define XLA_PJRT_MLIR_TO_HLO_H_
 
+#include "absl/status/status.h"
 #include "absl/strings/string_view.h"
-#include "mlir/IR/BuiltinOps.h"  // from @llvm-project
-#include "xla/client/xla_computation.h"
-#include "xla/status.h"
+#include "mlir/IR/BuiltinOps.h"
+#include "xla/hlo/builder/xla_computation.h"
 
 namespace xla {
 
@@ -28,20 +28,33 @@ absl::StatusOr<mlir::OwningOpRef<mlir::ModuleOp>> ParseMlirModuleString(
     absl::string_view mlir_module_str, mlir::MLIRContext& context);
 
 // Converts an CHLO/MHLO module to XLA HLO.
+// TODO(b/345414638): Delete `use_shardy` when we move Shardy as the first pass
+// in the XLA pipeline.
 absl::Status MlirToXlaComputation(mlir::ModuleOp module,
                                   XlaComputation& xla_computation,
-                                  bool use_tuple_args, bool return_tuple);
+                                  bool use_tuple_args, bool return_tuple,
+                                  bool use_shardy);
 
 // Converts an MHLO/CHLO module string to an XLA computation.
 absl::Status ParseMlirModuleStringAndConvertToXlaComputation(
     absl::string_view mlir_module_str, XlaComputation& xla_computation,
     bool use_tuple_args, bool return_tuple);
 
+// Returns a version of StableHLO ~12w old, for forward compatibility with PJRT
+// plugins on a quarterly update cycle.
+std::string GetDefaultStablehloVersion(
+    std::optional<int64_t> plugin_version = std::nullopt);
+
 // Serialize using MLIR Bytecode Format which does not guarantee forward or
 // backward compatiblity of the dialects used. If passing StableHLO with forward
 // or backward compatibility requirements, use SerializeUsingVersionedStablehlo.
-absl::StatusOr<std::string> SerializeUsingNativeBytecode(
-    mlir::ModuleOp mlir_module, std::optional<int64_t> plugin_version);
+//
+// VHLO support was added in PJRT plugin version 41.
+//   For plugin_version < 41, returns `SerializeUsingNativeBytecode`.
+//   For plugin_version >= 41, returns `SerializeUsingVersionedStablehlo`.
+absl::StatusOr<std::string> Serialize(mlir::ModuleOp mlir_module,
+                                      absl::string_view target,
+                                      bool inplace = false);
 
 // Serializes an MLIR module to a portable artifact with forward and backward
 // compatibility. Supports modules using StableHLO/MHLO/CHLO/Func dialects.

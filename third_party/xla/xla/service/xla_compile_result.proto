@@ -19,7 +19,7 @@ package xla;
 
 import "google/protobuf/duration.proto";
 import "xla/service/hlo.proto";
-import "tsl/protobuf/status.proto";
+import "xla/tsl/protobuf/status.proto";
 
 // Statistics on how long various parts of compilation took.
 // Not all durations may be relevant for all producers of this message, in
@@ -43,7 +43,7 @@ message CompilationResult {
   // Always set when compilation succeeds. May or may not be set when
   // compilation fails.
   optional CompilerPerfStats perf_stats = 2;
-  // Always set when compilation fails; never set when compilation succeeds.
+  // Always set even when compilation succeeds.
   optional tensorflow.StatusProto status = 3;
   // Collects counters collected during compilation. Not every producer may
   // include counter support at all or any particular counter.

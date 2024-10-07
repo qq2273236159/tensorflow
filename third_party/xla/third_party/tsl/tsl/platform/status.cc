@@ -21,6 +21,7 @@ limitations under the License.
 #include <functional>
 #include <memory>
 #include <ostream>
+#include <sstream>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -38,13 +39,13 @@ limitations under the License.
 #include "absl/strings/str_split.h"
 #include "absl/strings/string_view.h"
 #include "absl/types/optional.h"
+#include "xla/tsl/protobuf/error_codes.pb.h"
 #include "tsl/platform/mutex.h"
 #include "tsl/platform/stack_frame.h"
 #include "tsl/platform/stacktrace.h"
 #include "tsl/platform/str_util.h"
 #include "tsl/platform/strcat.h"
 #include "tsl/platform/stringprintf.h"
-#include "tsl/protobuf/error_codes.pb.h"
 
 namespace tsl {
 
@@ -164,12 +165,11 @@ const char* NullTerminatedMessage(const absl::Status& status) {
 #endif
 
 std::string* TfCheckOpHelperOutOfLine(const absl::Status& v, const char* msg) {
-  std::string r("Non-OK-status: ");
-  r += msg;
-  r += " status: ";
-  r += v.ToString();
+  std::stringstream ss;
+  ss << "Non-OK-status: " << msg << "\nStatus: " << v;
+
   // Leaks string but this is only to be used in a fatal error message
-  return new std::string(r);
+  return new std::string(ss.str());
 }
 
 StatusGroup::StatusGroup() {}

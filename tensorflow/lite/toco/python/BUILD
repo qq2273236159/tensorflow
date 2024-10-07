@@ -39,15 +39,6 @@ cc_library(
     deps = [
         "//tensorflow/c:kernels",
         "//tensorflow/c:tf_status_headers",
-        "//tensorflow/compiler/mlir/lite/debug:debug_options_proto_cc",
-        "//tensorflow/compiler/mlir/lite/metrics:error_collector",
-        "//tensorflow/compiler/mlir/lite/python:flatbuffer_to_mlir",
-        "//tensorflow/compiler/mlir/lite/python:graphdef_to_tfl_flatbuffer",
-        "//tensorflow/compiler/mlir/lite/python:jax_to_tfl_flatbuffer",
-        "//tensorflow/compiler/mlir/lite/python:saved_model_to_tfl_flatbuffer",
-        "//tensorflow/compiler/mlir/lite/quantization/lite:quantize_model",
-        "//tensorflow/compiler/mlir/lite/sparsity:sparsify_model",
-        "//tensorflow/compiler/mlir/quantization/tensorflow/python:py_function_lib",
         "//tensorflow/core:framework",
         "//tensorflow/core:lib",
         "//tensorflow/core:protos_all_cc",
@@ -70,6 +61,7 @@ cc_library(
         "//tensorflow/lite/toco/logging:toco_conversion_log_proto_cc",
         "//third_party/python_runtime:headers",  # build_cleaner: keep; DNR: b/35864863
         "@com_google_absl//absl/container:flat_hash_set",
+        "@com_google_absl//absl/log:absl_log",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/strings:string_view",
         "@com_google_protobuf//:protobuf_headers",

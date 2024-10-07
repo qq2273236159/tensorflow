@@ -15,7 +15,10 @@ limitations under the License.
 
 #include "xla/pjrt/cpu/cpu_client.h"
 
+#define EIGEN_USE_THREADS
+
 #include <algorithm>
+#include <cfenv>  // NOLINT
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -28,12 +31,6 @@ limitations under the License.
 #include <vector>
 
 #include "absl/algorithm/container.h"
-#include "xla/pjrt/cpu/cpu_topology.h"
-#include "xla/pjrt/host_memory_spaces.h"
-#include "xla/pjrt/pjrt_compiler.h"
-
-#define EIGEN_USE_THREADS
-
 #include "absl/base/dynamic_annotations.h"
 #include "absl/container/flat_hash_map.h"
 #include "absl/container/inlined_vector.h"
@@ -46,15 +43,17 @@ limitations under the License.
 #include "absl/strings/str_format.h"
 #include "absl/strings/string_view.h"
 #include "absl/synchronization/mutex.h"
-#include "absl/time/time.h"
 #include "absl/types/span.h"
-#include "unsupported/Eigen/CXX11/Tensor"  // from @eigen_archive
-#include "mlir/IR/BuiltinOps.h"  // from @llvm-project
+#include "unsupported/Eigen/CXX11/Tensor"
+#include "mlir/IR/BuiltinOps.h"
 #include "xla/array.h"
+#include "xla/backends/cpu/runtime/buffer_allocations.h"
+#include "xla/backends/cpu/runtime/thunk.h"
+#include "xla/backends/cpu/runtime/thunk_executor.h"
 #include "xla/client/executable_build_options.h"
-#include "xla/client/xla_computation.h"
 #include "xla/debug_options_flags.h"
 #include "xla/executable_run_options.h"
+#include "xla/hlo/builder/xla_computation.h"
 #include "xla/hlo/ir/hlo_computation.h"
 #include "xla/hlo/ir/hlo_instruction.h"
 #include "xla/hlo/ir/hlo_module.h"
@@ -64,11 +63,14 @@ limitations under the License.
 #include "xla/literal_util.h"
 #include "xla/pjrt/compile_options.pb.h"
 #include "xla/pjrt/cpu/abstract_tfrt_cpu_buffer.h"
+#include "xla/pjrt/cpu/cpu_topology.h"
 #include "xla/pjrt/cpu/tracked_tfrt_cpu_device_buffer.h"
-#include "xla/pjrt/distributed/topology_util.h"
+#include "xla/pjrt/host_memory_spaces.h"
 #include "xla/pjrt/mlir_to_hlo.h"
 #include "xla/pjrt/pjrt_client.h"
 #include "xla/pjrt/pjrt_common.h"
+#include "xla/pjrt/pjrt_compiler.h"
+#include "xla/pjrt/pjrt_device_description.h"
 #include "xla/pjrt/pjrt_executable.h"
 #include "xla/pjrt/pjrt_future.h"
 #include "xla/pjrt/semaphore.h"
@@ -82,9 +84,11 @@ limitations under the License.
 #include "xla/service/cpu/cpu_event.h"
 #include "xla/service/cpu/cpu_executable.h"
 #include "xla/service/cpu/cpu_executable_run_options.h"
+#include "xla/service/cpu/cpu_runtime.h"
 #include "xla/service/cpu/cpu_xfeed.h"
 #include "xla/service/cpu/simple_orc_jit.h"
 #include "xla/service/custom_call_status.h"
+#include "xla/service/custom_call_status_internal.h"
 #include "xla/service/dump.h"
 #include "xla/service/executable.h"
 #include "xla/service/hlo.pb.h"
@@ -92,16 +96,17 @@ limitations under the License.
 #include "xla/service/hlo_module_config.h"
 #include "xla/service/hlo_module_util.h"
 #include "xla/service/hlo_value.h"
+#include "xla/service/maybe_owning_device_memory.h"
 #include "xla/shape.h"
 #include "xla/shape_util.h"
-#include "xla/status.h"
+#include "xla/stream_executor/device_memory.h"
 #include "xla/tsl/concurrency/async_value.h"
 #include "xla/tsl/concurrency/async_value_ref.h"
 #include "xla/tsl/concurrency/ref_count.h"
+#include "xla/tsl/lib/strings/proto_serialization.h"
 #include "xla/util.h"
 #include "xla/xla.pb.h"
 #include "xla/xla_data.pb.h"
-#include "tsl/lib/strings/proto_serialization.h"
 #include "tsl/platform/casts.h"
 #include "tsl/platform/denormal.h"
 #include "tsl/platform/env.h"
@@ -247,13 +252,13 @@ class TfrtCpuAsyncHostToDeviceTransferManager
 
 }  // namespace
 
-TfrtCpuDeviceDescription::TfrtCpuDeviceDescription(int id, int process_index,
-                                                   int local_hardware_id)
-    : id_(id),
-      process_index_(process_index),
-      local_hardware_id_(local_hardware_id) {
-  debug_string_ = absl::StrCat("TFRT_CPU_", id);
-  to_string_ = absl::StrCat("CpuDevice(id=", id, ")");
+TfrtCpuDeviceDescription::TfrtCpuDeviceDescription(int process_id,
+                                                   int local_device_id)
+    : id_(PackCpuDeviceId(process_id, local_device_id)),
+      process_index_(process_id),
+      local_hardware_id_(local_device_id) {
+  debug_string_ = absl::StrCat("TFRT_CPU_", id_.value());
+  to_string_ = absl::StrCat("CpuDevice(id=", id_.value(), ")");
 }
 
 absl::string_view TfrtCpuDeviceDescription::device_kind() const {
@@ -276,8 +281,8 @@ absl::string_view TfrtCpuDeviceDescription::ToString() const {
   std::vector<CpuTopology::CpuDevice> cpu_devices;
   cpu_devices.reserve(devices.size());
   for (auto& device : devices) {
-    cpu_devices.push_back(
-        {device->id(), device->process_index(), device->local_hardware_id()});
+    cpu_devices.push_back(CpuTopology::CpuDevice{
+        device->process_index(), device->local_hardware_id().value()});
   }
   return TfrtCpuTopologyDescription(platform_id, platform_name,
                                     platform_version, cpu_devices,
@@ -298,19 +303,30 @@ absl::StatusOr<std::string> TfrtCpuTopologyDescription::Serialize() const {
   return result;
 }
 
-TfrtCpuDevice::TfrtCpuDevice(int id, int process_index, int local_hardware_id,
+std::vector<std::unique_ptr<const PjRtDeviceDescription>>
+TfrtCpuTopologyDescription::DeviceDescriptions() const {
+  std::vector<std::unique_ptr<const PjRtDeviceDescription>> devices;
+  devices.reserve(cpu_topology_.number_of_devices());
+  for (const CpuTopology::CpuDevice& device : cpu_topology_.devices()) {
+    devices.push_back(std::make_unique<TfrtCpuDeviceDescription>(
+        device.process_id, device.local_device_id));
+  }
+  return devices;
+}
+
+TfrtCpuDevice::TfrtCpuDevice(int process_id, int local_device_id,
                              int max_inflight_computations)
-    : description_(id, process_index, local_hardware_id),
+    : description_(process_id, local_device_id),
       max_inflight_computations_semaphore_(
           /*capacity=*/max_inflight_computations) {}
 
 absl::Status TfrtCpuDevice::TransferToInfeed(const LiteralSlice& literal) {
-  return TransferLiteralToInfeedOnCpu(local_hardware_id(), literal);
+  return TransferLiteralToInfeedOnCpu(local_hardware_id().value(), literal);
 }
 
 absl::Status TfrtCpuDevice::TransferFromOutfeed(
     MutableBorrowingLiteral literal) {
-  return TransferLiteralFromOutfeedOnCpu(local_hardware_id(), literal);
+  return TransferLiteralFromOutfeedOnCpu(local_hardware_id().value(), literal);
 }
 
 void TfrtCpuDevice::AttachMemorySpace(PjRtMemorySpace* memory_space) {
@@ -369,43 +385,23 @@ absl::StatusOr<std::unique_ptr<PjRtClient>> GetTfrtCpuClient(
   int cpu_device_count = options.cpu_device_count.value_or(CpuDeviceCount());
   size_t num_threads = std::max(DefaultThreadPoolSize(), cpu_device_count);
 
-  LocalTopologyProto local_topology;
-  local_topology.set_node_id(options.node_id);
-  std::string boot_id_str;
-  auto boot_id_str_or_status = GetBootIdString();
-  if (!boot_id_str_or_status.ok()) {
-    LOG(INFO) << boot_id_str_or_status.status();
-  } else {
-    boot_id_str = boot_id_str_or_status.value();
-  }
-  local_topology.set_boot_id(boot_id_str);
-  for (int i = 0; i < cpu_device_count; ++i) {
-    DeviceProto* device_proto = local_topology.add_devices();
-    device_proto->set_local_device_ordinal(i);
-    device_proto->set_name("cpu");
-  }
-
-  GlobalTopologyProto global_topology;
-  TF_RETURN_IF_ERROR(ExchangeTopologies(
-      "cpu", options.node_id, options.num_nodes, absl::Minutes(2),
-      absl::Minutes(5), options.kv_store.get(), local_topology,
-      &global_topology));
-
   std::vector<std::unique_ptr<TfrtCpuDevice>> devices;
-  for (const LocalTopologyProto& node : global_topology.nodes()) {
-    for (const DeviceProto& device_proto : node.devices()) {
-      auto device = std::make_unique<TfrtCpuDevice>(
-          /*id=*/device_proto.global_device_id(), node.node_id(),
-          device_proto.local_device_ordinal(),
-          options.max_inflight_computations_per_device);
-      devices.push_back(std::move(device));
-    }
+  for (int i = 0; i < cpu_device_count; ++i) {
+    auto device = std::make_unique<TfrtCpuDevice>(
+        options.process_id, /*local_device_id=*/i,
+        options.max_inflight_computations_per_device);
+    devices.push_back(std::move(device));
   }
 
   return std::unique_ptr<PjRtClient>(std::make_unique<TfrtCpuClient>(
-      /*process_index=*/options.node_id, std::move(devices),
-      std::move(options.collectives), num_threads, options.asynchronous));
+      options.process_id, std::move(devices), std::move(options.collectives),
+      num_threads, options.asynchronous));
 }
+
+// An upper bound on the number of threads to use for intra-op parallelism. It
+// is nearly impossible to utilize efficiently more than 256 threads for compute
+// intensive operations that are supposed to run inside the intra-op threadpool.
+static const size_t kMaxIntraOpThreads = 256;
 
 static tsl::ThreadOptions GetThreadOptions() {
   tsl::ThreadOptions thread_options;
@@ -424,16 +420,17 @@ TfrtCpuClient::TfrtCpuClient(
     : process_index_(process_index),
       owned_devices_(std::move(devices)),
       computation_placer_(std::make_unique<ComputationPlacer>()),
+      eigen_intraop_pool_(new tsl::thread::ThreadPool(
+          tsl::Env::Default(), GetThreadOptions(), "XLAEigen",
+          std::min(num_threads, kMaxIntraOpThreads))),
+      eigen_intraop_device_(
+          new Eigen::ThreadPoolDevice(eigen_intraop_pool_->AsEigenThreadPool(),
+                                      eigen_intraop_pool_->NumThreads())),
       pjrt_client_thread_pool_(
           new tsl::thread::ThreadPool(tsl::Env::Default(), GetThreadOptions(),
                                       "XLATfrtCpuClient", num_threads)),
       async_work_runner_(std::make_unique<ThreadPoolAsyncWorkRunner>(
           pjrt_client_thread_pool_.get())),
-      eigen_intraop_pool_(new tsl::thread::ThreadPool(
-          tsl::Env::Default(), "XLAEigen", DefaultThreadPoolSize())),
-      eigen_intraop_device_(
-          new Eigen::ThreadPoolDevice(eigen_intraop_pool_->AsEigenThreadPool(),
-                                      eigen_intraop_pool_->NumThreads())),
       last_collective_launch_event_(
           tsl::MakeAvailableAsyncValueRef<CpuEvent>()),
       transpose_cache_(1024),
@@ -444,12 +441,13 @@ TfrtCpuClient::TfrtCpuClient(
       asynchronous_(asynchronous) {
   for (const std::unique_ptr<TfrtCpuDevice>& device : owned_devices_) {
     devices_.push_back(device.get());
-    CHECK(id_to_device_.insert({device->id(), device.get()}).second)
-        << "Duplicate device id: " << device->id();
+    CHECK(
+        id_to_device_.insert({device->global_device_id(), device.get()}).second)
+        << "Duplicate device id: " << device->global_device_id();
 
     device->SetClient(this);
     if (device->IsAddressable()) {
-      int idx = device->local_hardware_id();
+      int idx = device->local_hardware_id().value();
       if (idx >= addressable_devices_.size()) {
         addressable_devices_.resize(idx + 1);
       }
@@ -471,24 +469,19 @@ TfrtCpuClient::TfrtCpuClient(
     owned_memory_spaces_.push_back(std::move(memory_space));
   }
 
-  LOG(INFO) << "TfrtCpuClient created.";
+  VLOG(1) << "TfrtCpuClient created.";
 }
 
-TfrtCpuClient::~TfrtCpuClient() { LOG(INFO) << "TfrtCpuClient destroyed."; }
+TfrtCpuClient::~TfrtCpuClient() { VLOG(1) << "TfrtCpuClient destroyed."; }
 
 absl::StatusOr<PjRtDevice*> TfrtCpuClient::LookupDevice(
     xla::PjRtGlobalDeviceId global_device_id) const {
-  auto it = id_to_device_.find(global_device_id.value());
+  auto it = id_to_device_.find(global_device_id);
   if (it != id_to_device_.end()) {
     return it->second;
   }
   return InvalidArgument("No matching device found for device_id %d",
                          global_device_id.value());
-}
-
-absl::StatusOr<PjRtDevice*> TfrtCpuClient::LookupAddressableDevice(
-    int local_hardware_id) const {
-  return LookupAddressableDevice(PjRtLocalDeviceId(local_hardware_id));
 }
 
 absl::StatusOr<PjRtDevice*> TfrtCpuClient::LookupAddressableDevice(
@@ -669,14 +662,12 @@ TfrtCpuClient::DeserializeExecutable(absl::string_view serialized,
     addressable_devices.reserve(num_replicas * num_partitions);
     for (int replica = 0; replica < num_replicas; ++replica) {
       for (int partition = 0; partition < num_partitions; ++partition) {
-        int64_t device_id = (*device_assignment)(replica, partition);
-        PjRtGlobalDeviceId global_device_id(device_id);
-        TF_ASSIGN_OR_RETURN(PjRtDevice * device,
-                            LookupDevice(global_device_id));
-        if (device->process_index() != process_index()) {
+        PjRtGlobalDeviceId device_id((*device_assignment)(replica, partition));
+        if (UnpackCpuProcessIndex(device_id) != process_index()) {
           VLOG(3) << "Non-local device: " << device_id;
           continue;
         }
+        TF_ASSIGN_OR_RETURN(PjRtDevice * device, LookupDevice(device_id));
         PjRtLoadedExecutable::LogicalDeviceIds logica_device_ids;
         logica_device_ids.replica = replica;
         logica_device_ids.partition = partition;
@@ -692,7 +683,7 @@ TfrtCpuClient::DeserializeExecutable(absl::string_view serialized,
 
     if (build_options.device_ordinal() < 0) {
       build_options.set_device_ordinal(
-          addressable_devices.front()->local_hardware_id());
+          addressable_devices.front()->local_hardware_id().value());
     }
   }
 
@@ -746,7 +737,7 @@ static absl::StatusOr<std::unique_ptr<xla::Executable>> JitCompile(
 
 absl::StatusOr<std::unique_ptr<PjRtLoadedExecutable>> TfrtCpuClient::Compile(
     const XlaComputation& computation, CompileOptions options) {
-  tsl::profiler::TraceMe traceme("TfrtCpuClient::Compile");
+  tsl::profiler::TraceMe traceme("TfrtCpuClient::Compile (XlaComputation)");
   auto input_options = options;
   ExecutableBuildOptions& build_options = options.executable_build_options;
 
@@ -768,10 +759,8 @@ absl::StatusOr<std::unique_ptr<PjRtLoadedExecutable>> TfrtCpuClient::Compile(
       for (int computation = 0;
            computation < device_assignment->computation_count();
            ++computation) {
-        int64_t id = (*device_assignment)(replica, computation);
-        PjRtGlobalDeviceId global_device_id(id);
-        TF_ASSIGN_OR_RETURN(auto* device, LookupDevice(global_device_id));
-        if (device->process_index() != process_index()) {
+        PjRtGlobalDeviceId id((*device_assignment)(replica, computation));
+        if (UnpackCpuProcessIndex(id) != process_index()) {
           // TODO(phawkins): improve this error message when we're ready to
           // publicize that multiprocess collectives exist.
           return InvalidArgument(
@@ -795,14 +784,12 @@ absl::StatusOr<std::unique_ptr<PjRtLoadedExecutable>> TfrtCpuClient::Compile(
     addressable_devices.reserve(num_replicas * num_partitions);
     for (int replica = 0; replica < num_replicas; ++replica) {
       for (int partition = 0; partition < num_partitions; ++partition) {
-        int64_t device_id = (*device_assignment)(replica, partition);
-        PjRtGlobalDeviceId global_device_id(device_id);
-        TF_ASSIGN_OR_RETURN(PjRtDevice * device,
-                            LookupDevice(global_device_id));
-        if (device->process_index() != process_index()) {
+        PjRtGlobalDeviceId device_id((*device_assignment)(replica, partition));
+        if (UnpackCpuProcessIndex(device_id) != process_index()) {
           VLOG(3) << "Non-local device: " << device_id;
           continue;
         }
+        TF_ASSIGN_OR_RETURN(PjRtDevice * device, LookupDevice(device_id));
         PjRtLoadedExecutable::LogicalDeviceIds logica_device_ids;
         logica_device_ids.replica = replica;
         logica_device_ids.partition = partition;
@@ -818,7 +805,7 @@ absl::StatusOr<std::unique_ptr<PjRtLoadedExecutable>> TfrtCpuClient::Compile(
 
     if (build_options.device_ordinal() < 0) {
       build_options.set_device_ordinal(
-          addressable_devices.front()->local_hardware_id());
+          addressable_devices.front()->local_hardware_id().value());
     }
   }
 
@@ -869,11 +856,14 @@ absl::StatusOr<std::unique_ptr<PjRtLoadedExecutable>> TfrtCpuClient::Compile(
 
 absl::StatusOr<std::unique_ptr<PjRtLoadedExecutable>> TfrtCpuClient::Compile(
     mlir::ModuleOp module, CompileOptions options) {
+  tsl::profiler::TraceMe traceme("TfrtCpuClient::Compile (mlir::ModuleOp)");
   XlaComputation xla_computation;
+  const ExecutableBuildOptions& exec_build_options =
+      options.executable_build_options;
   TF_RETURN_IF_ERROR(MlirToXlaComputation(
       module, xla_computation,
       /*use_tuple_args=*/options.parameter_is_tupled_arguments,
-      /*return_tuple=*/false));
+      /*return_tuple=*/false, exec_build_options.use_shardy_partitioner()));
   return Compile(xla_computation, options);
 }
 
@@ -1235,6 +1225,7 @@ struct BufferAllocAndCopy {
 // and assemble the buffer pointers in order to call into CpuExecutable.
 static absl::StatusOr<BufferInfo> MemoryForAllocation(
     const BufferAllocation& allocation,
+    absl::Span<const cpu::CpuExecutable::ConstantAllocation> constants,
     absl::Span<std::pair<bool, TrackedTfrtCpuDeviceBuffer*> const> arguments,
     BufferAlloc& buffer_alloc, BufferAllocAndCopy& buffer_alloc_and_copy) {
   BufferInfo buffer_info;
@@ -1266,6 +1257,17 @@ static absl::StatusOr<BufferInfo> MemoryForAllocation(
     buffer_info.owns_buffer = arg->owns_buffers();
     buffer_info.buffer_size = arg->BufferSize(allocation.param_shape_index());
     return buffer_info;
+
+  } else if (allocation.is_constant() &&
+             allocation.index() < constants.size()) {
+    se::DeviceMemoryBase constant =
+        constants[allocation.index()].AsDeviceMemoryBase();
+    buffer_info.buffer = tsl::MakeAvailableAsyncValueRef<MaybeOwningCpuMemory>(
+        constant.opaque(), constant.size());
+    buffer_info.owns_buffer = false;
+    buffer_info.buffer_size = constant.size();
+    return buffer_info;
+
   } else if (allocation.is_constant() || allocation.is_thread_local()) {
     buffer_info.buffer =
         tsl::MakeAvailableAsyncValueRef<MaybeOwningCpuMemory>();
@@ -1288,15 +1290,16 @@ static absl::StatusOr<BufferInfo> MemoryForAllocation(
 
 static absl::StatusOr<std::vector<BufferInfo>> CreateBufferTable(
     const BufferAssignment& assignment,
+    absl::Span<const cpu::CpuExecutable::ConstantAllocation> constants,
     absl::Span<std::pair<bool, TrackedTfrtCpuDeviceBuffer*> const> arguments,
     BufferAlloc& buffer_alloc, BufferAllocAndCopy& buffer_alloc_and_copy) {
   std::vector<BufferInfo> buffer_table(assignment.Allocations().size());
-  for (BufferAllocation::Index i = 0; i < assignment.Allocations().size();
-       ++i) {
+  for (BufferAllocation::Index i = 0; i < buffer_table.size(); ++i) {
     const BufferAllocation& allocation = assignment.GetAllocation(i);
-    TF_ASSIGN_OR_RETURN(buffer_table[i],
-                        MemoryForAllocation(allocation, arguments, buffer_alloc,
-                                            buffer_alloc_and_copy));
+    TF_ASSIGN_OR_RETURN(
+        buffer_table[i],
+        MemoryForAllocation(allocation, constants, arguments, buffer_alloc,
+                            buffer_alloc_and_copy));
   }
   return std::move(buffer_table);
 }
@@ -1494,7 +1497,8 @@ absl::StatusOr<PjRtLoadedExecutable::Result> TfrtCpuExecutable::ExecuteHelper(
   BufferAllocAndCopy buffer_alloc_and_copy;
   TF_ASSIGN_OR_RETURN(
       std::vector<BufferInfo> buffer_table,
-      CreateBufferTable(cpu_executable->buffer_assignment(), tracked_buffers,
+      CreateBufferTable(cpu_executable->buffer_assignment(),
+                        cpu_executable->constants(), tracked_buffers,
                         buffer_alloc, buffer_alloc_and_copy));
   auto result_buffers_info =
       CreateResultBufferInfo(result_buffer_indices_, buffer_table);
@@ -1547,14 +1551,16 @@ absl::StatusOr<PjRtLoadedExecutable::Result> TfrtCpuExecutable::ExecuteHelper(
   }
 
   if (input_deps.empty() && execute_inline) {
-    // Synchronously call generated function.
+    // Synchronously call generated function or thunk sequence.
 
     // Set denormal and rounding behavior to match the default TF
     // ThreadPool behavior.
     tsl::port::ScopedFlushDenormal flush;
     tsl::port::ScopedSetRound round(FE_TONEAREST);
 
-    XlaCustomCallStatus status;
+    // Execution status for XLA:CPU "classic" runtime or thunks.
+    XlaCustomCallStatus compute_function_status;
+    tsl::AsyncValueRef<cpu::Thunk::ExecuteEvent> thunks_execute_event;
 
     // Immediately allocate memory and prepare for computation.
     buffer_alloc.Allocate();
@@ -1570,19 +1576,68 @@ absl::StatusOr<PjRtLoadedExecutable::Result> TfrtCpuExecutable::ExecuteHelper(
     }
     void* result_buffer = buffer_pointers[result_buffer_index_];
 
-    // Call generated function.
-    cpu_executable->compute_function()(result_buffer, &run_options, nullptr,
-                                       buffer_pointers.data(), &status,
-                                       nullptr);
+    if (cpu_executable->has_compute_function()) {
+      // Call jit-compiled function implementing XLA executable.
+      cpu_executable->compute_function()(result_buffer, &run_options, nullptr,
+                                         buffer_pointers.data(),
+                                         &compute_function_status, nullptr);
+
+    } else if (cpu_executable->has_thunks()) {
+      // Call interpreted thunk sequence implementing XLA executable.
+      absl::InlinedVector<MaybeOwningDeviceMemory, 8> buffer_device_mem;
+      buffer_device_mem.reserve(buffer_table.size());
+      for (const auto& buffer_info : buffer_table) {
+        buffer_device_mem.emplace_back(se::DeviceMemoryBase(
+            buffer_info.buffer->data(), buffer_info.buffer->size()));
+      }
+
+      cpu::BufferAllocations allocations(buffer_device_mem);
+
+      TF_ASSIGN_OR_RETURN(
+          cpu::Thunk::CollectiveExecuteParams collective_params,
+          cpu::Thunk::CollectiveExecuteParams::Create(&run_options));
+
+      TF_ASSIGN_OR_RETURN(
+          cpu::Thunk::CustomCallExecuteParams custom_call_execute_params,
+          cpu::Thunk::CustomCallExecuteParams::Create(&run_options));
+
+      cpu::Thunk::TaskRunner task_runner =
+          [&run_options](cpu::Thunk::Task task) {
+            run_options.intra_op_thread_pool()->getPool()->Schedule(
+                std::move(task));
+          };
+
+      cpu::Thunk::ExecuteParams execute_params = {
+          &cpu_executable->function_registry(),
+          &allocations,
+          cpu::runtime::GetXfeedManager(run_options.device_ordinal()),
+          run_options.intra_op_thread_pool(),
+          &task_runner,
+          &collective_params,
+          &custom_call_execute_params};
+
+      thunks_execute_event = cpu_executable->thunks().Execute(execute_params);
+
+      tsl::profiler::TraceMe trace(
+          "ThunkExecutor::Execute (wait for completion)");
+      tsl::BlockUntilReady(thunks_execute_event);
+
+    } else {
+      return Internal("CpuExecutable has no compute function or thunks.");
+    }
 
     for (auto& donation_transaction : donation_transactions) {
       std::move(donation_transaction).Commit();
     }
 
-    std::optional<absl::string_view> error_message =
-        xla::CustomCallStatusGetMessage(&status);
-    if (error_message) {
-      return Internal("Generated function failed: %s", *error_message);
+    // Forward errors (if any) after executing compute function or thunks.
+    if (cpu_executable->has_compute_function()) {
+      if (auto error_message =
+              xla::CustomCallStatusGetMessage(&compute_function_status)) {
+        return Internal("Generated function failed: %s", *error_message);
+      }
+    } else if (thunks_execute_event.IsError()) {
+      return thunks_execute_event.GetError();
     }
 
   } else {
@@ -1614,7 +1669,8 @@ absl::StatusOr<PjRtLoadedExecutable::Result> TfrtCpuExecutable::ExecuteHelper(
          tuplized_arg = std::move(tuplized_arg),
          donation_transactions = std::move(donation_transactions),
          execute_event = std::move(ready_on_exit).Release(),
-         input_deps_avs = std::move(input_deps_avs_copy)]() mutable {
+         input_deps_avs = std::move(input_deps_avs_copy),
+         eigen_device = client()->eigen_intraop_device()]() mutable {
           // Because `input_deps` contains the definition events of all inputs,
           // when it is ready, all input buffers must have been allocated. So,
           // we are safe to allocate and copy memory here. Since `execute_event`
@@ -1650,22 +1706,81 @@ absl::StatusOr<PjRtLoadedExecutable::Result> TfrtCpuExecutable::ExecuteHelper(
           }
           void* result_buffer = buffer_pointers[result_buffer_index];
 
-          // Call generated function.
-          std::optional<absl::string_view> error_message;
-          XlaCustomCallStatus status;
-          cpu_executable->compute_function()(result_buffer, &run_options,
-                                             nullptr, buffer_pointers.data(),
-                                             &status, nullptr);
-          error_message = xla::CustomCallStatusGetMessage(&status);
+          absl::Status status;
+
+          if (cpu_executable->has_compute_function()) {
+            // Call jit-compiled function implementing XLA executable.
+            XlaCustomCallStatus compute_function_status;
+
+            cpu_executable->compute_function()(
+                result_buffer, &run_options, nullptr, buffer_pointers.data(),
+                &compute_function_status, nullptr);
+            if (auto error_message =
+                    xla::CustomCallStatusGetMessage(&compute_function_status)) {
+              status =
+                  Internal("Generated function failed: %s", *error_message);
+            }
+
+          } else if (cpu_executable->has_thunks()) {
+            // Call interpreted thunk sequence implementing XLA executable.
+            absl::InlinedVector<MaybeOwningDeviceMemory, 8> buffer_device_mem;
+            buffer_device_mem.reserve(buffer_table.size());
+            for (const auto& buffer_info : buffer_table) {
+              buffer_device_mem.emplace_back(se::DeviceMemoryBase(
+                  buffer_info.buffer->data(), buffer_info.buffer->size()));
+            }
+
+            cpu::BufferAllocations allocations(buffer_device_mem);
+
+            absl::StatusOr<cpu::Thunk::CollectiveExecuteParams>
+                collective_params =
+                    cpu::Thunk::CollectiveExecuteParams::Create(&run_options);
+
+            absl::StatusOr<cpu::Thunk::CustomCallExecuteParams>
+                custom_call_params =
+                    cpu::Thunk::CustomCallExecuteParams::Create(&run_options);
+
+            cpu::Thunk::TaskRunner task_runner =
+                [&run_options](cpu::Thunk::Task task) {
+                  run_options.intra_op_thread_pool()->getPool()->Schedule(
+                      std::move(task));
+                };
+
+            if (collective_params.ok()) {
+              cpu::Thunk::ExecuteParams execute_params = {
+                  &cpu_executable->function_registry(),
+                  &allocations,
+                  cpu::runtime::GetXfeedManager(run_options.device_ordinal()),
+                  run_options.intra_op_thread_pool(),
+                  &task_runner,
+                  &*collective_params,
+                  &*custom_call_params};
+
+              auto thunks_execute_event =
+                  cpu_executable->thunks().Execute(execute_params);
+
+              tsl::profiler::TraceMe trace(
+                  "ThunkExecutor::Execute (wait for completion)");
+              tsl::BlockUntilReady(thunks_execute_event);
+              status = thunks_execute_event.IsError()
+                           ? thunks_execute_event.GetError()
+                           : absl::OkStatus();
+            } else {
+              status = collective_params.status();
+            }
+
+          } else {
+            status =
+                Internal("CpuExecutable has no compute function or thunks.");
+          }
 
           for (auto& donation_transaction : donation_transactions) {
             std::move(donation_transaction).Commit();
           }
 
-          if (error_message) {
+          if (!status.ok()) {
             // CPU computation fails with an error.
-            execute_event.SetError(absl::StrFormat(
-                "Generated function failed: %s", *error_message));
+            execute_event.SetError(std::move(status));
             return;
           }
 

@@ -22,20 +22,31 @@ limitations under the License.
 #include <vector>
 
 #include "absl/algorithm/container.h"
+#include "absl/container/flat_hash_set.h"
+#include "absl/log/log.h"
+#include "absl/status/status.h"
+#include "absl/status/statusor.h"
+#include "absl/strings/string_view.h"
+#include "absl/types/span.h"
 #include "xla/hlo/ir/dfs_hlo_visitor_with_default.h"
 #include "xla/hlo/ir/hlo_casting_utils.h"
 #include "xla/hlo/ir/hlo_instruction.h"
 #include "xla/hlo/ir/hlo_instructions.h"
 #include "xla/hlo/ir/hlo_module.h"
+#include "xla/hlo/ir/hlo_opcode.h"
+#include "xla/layout.h"
 #include "xla/layout_util.h"
+#include "xla/literal.h"
 #include "xla/permutation_util.h"
 #include "xla/service/hlo_creation_utils.h"
 #include "xla/service/shape_inference.h"
 #include "xla/shape.h"
-#include "xla/statusor.h"
+#include "xla/shape_util.h"
+#include "xla/status_macros.h"
 #include "xla/util.h"
-#include "xla/window_util.h"
 #include "xla/xla_data.pb.h"
+#include "tsl/platform/errors.h"
+#include "tsl/platform/statusor.h"
 
 namespace xla {
 namespace {
@@ -336,7 +347,11 @@ class LayoutNormalizationVisitor : public DfsHloRewriteVisitor {
     auto s = hlo->shape();
     auto a = hlo->mutable_operand(0);
     auto b = hlo->mutable_operand(1);
-    TF_RET_CHECK(a->shape().layout() == s.layout());
+    auto layout_equal = Layout::Equal();
+    if (hlo->opcode() == HloOpcode::kCompare) {
+      layout_equal.IgnoreElementSize();
+    }
+    TF_RET_CHECK(layout_equal(a->shape().layout(), s.layout()));
     TF_ASSIGN_OR_RETURN(auto a0, GetNormalizedInput(a));
     TF_ASSIGN_OR_RETURN(auto b0, GetNormalizedInput(b));
 
@@ -365,7 +380,7 @@ class LayoutNormalizationVisitor : public DfsHloRewriteVisitor {
   // A{I} -> R [S']{I} -> bitcast[S]{L2}
   //
   absl::Status HandleReshape(HloInstruction* hlo) override {
-    const auto& s = hlo->shape();
+    auto s = hlo->shape();
     auto operand = hlo->mutable_operand(0);
     TF_RET_CHECK(ShapeUtil::ReshapeIsBitcast(s, operand->shape()));
     TF_ASSIGN_OR_RETURN(auto a0, GetNormalizedInput(operand));
@@ -374,95 +389,6 @@ class LayoutNormalizationVisitor : public DfsHloRewriteVisitor {
                         MakeReshapeHlo(normalized_reshape_s, a0));
     SetVisited(*new_reshape);
     auto bc_to_orig = MakeBitcastHlo(new_reshape, s);
-    TF_RETURN_IF_ERROR(ReplaceInstruction(hlo, bc_to_orig));
-    return absl::OkStatus();
-  }
-
-  absl::Status HandleGather(HloInstruction* hlo) override {
-    const auto& s = hlo->shape();
-    auto normalized_shape = Normalize(s);
-    auto* gather = Cast<HloGatherInstruction>(hlo);
-    TF_ASSIGN_OR_RETURN(auto* normalized_operand,
-                        GetNormalizedInput(gather->mutable_operand(0)));
-    // Since normalization might reorder the output differently than the
-    // 'start_indices' operand, we have no way to specify the order of the
-    // gather batch dimensions, as that is not an attribute in
-    // GatherDimensionNumbers. Gather implicitly assumes that the batch
-    // dimensions appear in the same order in 'start_indices' and output. So we
-    // require that there is just a single batch dimension. This is ensured by
-    // the GatherSimplifier pass.
-    if (gather->operand(1)->shape().rank() != 2) {
-      return FailedPrecondition(
-          "There should be just a single gather batch dimension. Make sure to "
-          "run GatherSimplifier before LayoutNormalization");
-    }
-    TF_ASSIGN_OR_RETURN(auto* normalized_start_indices,
-                        GetNormalizedInput(gather->mutable_operand(1)));
-
-    auto operand_permutation =
-        ToTransposeDimensions(gather->operand(0)->shape().layout());
-    auto normalized_slice_sizes =
-        ComposePermutations(gather->gather_slice_sizes(), operand_permutation);
-
-    const auto& dims = gather->gather_dimension_numbers();
-    GatherDimensionNumbers normalized_dims;
-    auto start_indices_permutation =
-        ToTransposeDimensions(gather->operand(1)->shape().layout());
-    normalized_dims.set_index_vector_dim(
-        start_indices_permutation[dims.index_vector_dim()]);
-    auto inverse_operand_permutation = InversePermutation(operand_permutation);
-    std::vector<int64_t> normalized_collapsed_slice_dims;
-    normalized_collapsed_slice_dims.reserve(dims.collapsed_slice_dims_size());
-    for (int64_t dim : dims.collapsed_slice_dims()) {
-      normalized_collapsed_slice_dims.push_back(
-          inverse_operand_permutation[dim]);
-    }
-    absl::c_sort(normalized_collapsed_slice_dims);
-    for (int64_t dim : normalized_collapsed_slice_dims) {
-      normalized_dims.add_collapsed_slice_dims(dim);
-    }
-
-    // Compute the permutation that we need to apply to the original
-    // offset_dims. We need to remap the dimensions that are not collapsed to
-    // the range [0, offset_dims.size() - 1], but also insert placeholders for
-    // the collapsed dimensions so that we can apply 'operand_permutation'.
-    std::vector<int64_t> permutation(operand_permutation.size(), -2);
-    for (int64_t collapsed_dim : dims.collapsed_slice_dims()) {
-      permutation[collapsed_dim] = -1;
-    }
-    for (int64_t i = 0, j = 0; i < permutation.size(); ++i) {
-      if (permutation[i] == -2) {
-        permutation[i] = j++;
-      }
-    }
-    permutation = ComposePermutations(permutation, operand_permutation);
-    // Now remove the placeholders.
-    int64_t l = 0;
-    for (int64_t i = 0; i < permutation.size(); ++i) {
-      if (permutation[i] >= 0) {
-        permutation[l++] = permutation[i];
-      }
-    }
-    permutation.erase(permutation.begin() + l, permutation.end());
-    auto normalized_offset_dims =
-        ComposePermutations(dims.offset_dims(), permutation);
-    auto inverse_output_permutation =
-        InversePermutation(ToTransposeDimensions(s.layout()));
-    for (int64_t dim : normalized_offset_dims) {
-      normalized_dims.add_offset_dims(inverse_output_permutation[dim]);
-    }
-
-    for (int64_t dim : dims.start_index_map()) {
-      normalized_dims.add_start_index_map(inverse_operand_permutation[dim]);
-    }
-
-    auto* normalized_gather =
-        gather->AddInstruction(HloInstruction::CreateGather(
-            normalized_shape, normalized_operand, normalized_start_indices,
-            normalized_dims, normalized_slice_sizes,
-            gather->indices_are_sorted()));
-    SetVisited(*normalized_gather);
-    auto* bc_to_orig = MakeBitcastHlo(normalized_gather, s);
     TF_RETURN_IF_ERROR(ReplaceInstruction(hlo, bc_to_orig));
     return absl::OkStatus();
   }
@@ -820,21 +746,31 @@ class LayoutNormalizationVisitor : public DfsHloRewriteVisitor {
     Shape s = hlo->shape();
     HloOpcode opcode = hlo->opcode();
     TF_RET_CHECK(opcode == HloOpcode::kClamp || opcode == HloOpcode::kSelect);
-    HloInstruction* p = hlo->mutable_operand(0);
-    HloInstruction* i1 = hlo->mutable_operand(1);
-    HloInstruction* i2 = hlo->mutable_operand(2);
-    TF_RET_CHECK(p->shape().layout() == s.layout());
-    TF_RET_CHECK(i1->shape().layout() == s.layout());
-    TF_RET_CHECK(i2->shape().layout() == s.layout());
+    HloInstruction* arg0 = hlo->mutable_operand(0);
+    HloInstruction* arg1 = hlo->mutable_operand(1);
+    HloInstruction* arg2 = hlo->mutable_operand(2);
+    if (opcode == HloOpcode::kClamp) {
+      TF_RET_CHECK(arg1->shape().layout() == s.layout());
+    } else if (opcode == HloOpcode::kSelect) {
+      TF_RET_CHECK(arg1->shape().layout() == s.layout());
+      TF_RET_CHECK(arg2->shape().layout() == s.layout());
+    } else {
+      TF_RET_CHECK(false);
+    }
 
-    TF_ASSIGN_OR_RETURN(HloInstruction * p_0, GetNormalizedInput(p));
-    TF_ASSIGN_OR_RETURN(HloInstruction * i1_0, GetNormalizedInput(i1));
-    TF_ASSIGN_OR_RETURN(HloInstruction * i2_0, GetNormalizedInput(i2));
+    TF_ASSIGN_OR_RETURN(HloInstruction * normalized_arg0,
+                        GetNormalizedInput(arg0));
+    TF_ASSIGN_OR_RETURN(HloInstruction * normalized_arg1,
+                        GetNormalizedInput(arg1));
+    TF_ASSIGN_OR_RETURN(HloInstruction * normalized_arg2,
+                        GetNormalizedInput(arg2));
 
     TF_ASSIGN_OR_RETURN(Shape new_shape, ShapeInference::InferTernaryOpShape(
-                                             opcode, p_0, i1_0, i2_0));
+                                             opcode, normalized_arg0,
+                                             normalized_arg1, normalized_arg2));
     HloInstruction* normalized = hlo->parent()->AddInstruction(
-        HloInstruction::CreateTernary(new_shape, opcode, p_0, i1_0, i2_0));
+        HloInstruction::CreateTernary(new_shape, opcode, normalized_arg0,
+                                      normalized_arg1, normalized_arg2));
     hlo->SetupDerivedInstruction(normalized);
     SetVisited(*normalized);
 

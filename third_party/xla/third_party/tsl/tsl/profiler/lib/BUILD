@@ -1,16 +1,16 @@
 load("@local_tsl//tsl/platform:rules_cc.bzl", "cc_library")
 load("@local_xla//xla/tsl:tsl.bzl", "if_not_android", "internal_visibility", "nvtx_headers")
-load("@local_xla//xla/tsl:tsl.default.bzl", "filegroup")
+load("@local_xla//xla/tsl:tsl.default.bzl", "filegroup", "get_compatible_with_portable")
+load(
+    "@local_xla//xla/tsl/profiler/builds:build_config.bzl",
+    "tf_profiler_copts",
+    "tf_profiler_pybind_cc_library_wrapper",
+)
 load("//tsl/platform:build_config.bzl", "tsl_cc_test")
 load("//tsl/platform:build_config_root.bzl", "if_static")
 load(
     "//tsl/platform/default:cuda_build_defs.bzl",
     "if_cuda_is_configured",
-)
-load(
-    "//tsl/profiler/builds:build_config.bzl",
-    "tf_profiler_copts",
-    "tf_profiler_pybind_cc_library_wrapper",
 )
 
 # copybara:uncomment package(default_applicable_licenses = ["//tensorflow:license"])
@@ -38,7 +38,9 @@ filegroup(
         "scoped_memory_debug_annotation.h",
         "traceme.h",
         "traceme_encode.h",
+        "@local_xla//xla/tsl/profiler/utils:mobile_srcs_no_runtime",
     ],
+    compatible_with = get_compatible_with_portable(),
     visibility = ["//visibility:public"],
 )
 
@@ -56,7 +58,7 @@ cc_library(
     srcs = ["profiler_controller.cc"],
     hdrs = ["profiler_controller.h"],
     visibility = internal_visibility([
-        "//tsl/profiler:internal",
+        "@local_xla//xla/tsl/profiler:internal",
     ]),
     deps = [
         ":profiler_interface",
@@ -72,8 +74,8 @@ cc_library(
     name = "profiler_factory",
     hdrs = ["profiler_factory.h"],
     visibility = internal_visibility([
-        "//tsl/profiler:internal",
-        "//tsl/profiler:xla_profiler_backends",
+        "@local_xla//xla/tsl/profiler:internal",
+        "@local_xla//xla/tsl/profiler:xla_profiler_backends",
         "@local_xla//xla/python:__pkg__",
         "//learning/brain/tfrc/executor/stream_executor:__pkg__",
     ]),
@@ -93,7 +95,7 @@ cc_library(
     ],
     copts = tf_profiler_copts(),
     visibility = internal_visibility([
-        "//tsl/profiler:internal",
+        "@local_xla//xla/tsl/profiler:internal",
         "//learning/brain/tfrc/executor/stream_executor:__pkg__",
     ]),
     deps = [
@@ -128,8 +130,8 @@ cc_library(
     copts = tf_profiler_copts(),
     visibility = internal_visibility([
         "@local_xla//xla/tsl:internal",
-        "//tsl/profiler:internal",
-        "//tsl/profiler:xla_profiler_backends",
+        "@local_xla//xla/tsl/profiler:internal",
+        "@local_xla//xla/tsl/profiler:xla_profiler_backends",
     ]),
     deps = [
         "//tsl/platform:status",
@@ -143,8 +145,8 @@ cc_library(
     hdrs = ["profiler_lock.h"],
     copts = tf_profiler_copts(),
     visibility = internal_visibility([
-        "//tsl/profiler:internal",
-        "//tsl/profiler:xla_internal",
+        "@local_xla//xla/tsl/profiler:internal",
+        "@local_xla//xla/tsl/profiler:xla_internal",
     ]),
     deps = [
         "//tsl/platform:errors",
@@ -198,7 +200,7 @@ cc_library(
     copts = tf_profiler_copts(),
     visibility = internal_visibility([
         "//tensorflow/python:__pkg__",
-        "//tsl/profiler:internal",
+        "@local_xla//xla/tsl/profiler:internal",
     ]),
     deps = [
         "//tsl/platform:errors",
@@ -218,8 +220,8 @@ cc_library(
         "//tsl/platform",
         "//tsl/platform:platform_port",
         "//tsl/platform:status",
-        "//tsl/profiler/convert:post_process_single_host_xplane",
-        "//tsl/profiler/utils:time_utils",
+        "@local_xla//xla/tsl/profiler/convert:post_process_single_host_xplane",
+        "@local_xla//xla/tsl/profiler/utils:time_utils",
     ]),
     alwayslink = True,
 )
@@ -253,7 +255,7 @@ tsl_cc_test(
 tf_profiler_pybind_cc_library_wrapper(
     name = "traceme_for_pybind",
     actual = ":traceme",
-    visibility = internal_visibility(["//tsl/profiler:xla_internal"]),
+    visibility = internal_visibility(["@local_xla//xla/tsl/profiler:xla_internal"]),
 )
 
 cc_library(
@@ -267,14 +269,15 @@ cc_library(
         "//tsl/platform:macros",
         "//tsl/platform:types",
         "@com_google_absl//absl/strings",
+        "@local_xla//xla/tsl/profiler/utils:no_init",
     ] + if_not_android([
-        "//tsl/profiler/backends/cpu:traceme_recorder",
-        "//tsl/profiler/utils:time_utils",
+        "@local_xla//xla/tsl/profiler/backends/cpu:traceme_recorder",
+        "@local_xla//xla/tsl/profiler/utils:time_utils",
     ]),
 )
 
 cc_library(
-    name = "nvtx_utils",
+    name = "nvtx_utils_impl",
     srcs = if_cuda_is_configured(
         ["nvtx_utils.cc"],
         ["nvtx_utils_stub.cc"],
@@ -298,22 +301,31 @@ config_setting(
 )
 
 cc_library(
+    name = "nvtx_utils",
+    hdrs = ["nvtx_utils.h"],
+    visibility = ["//visibility:public"],
+    deps = select({
+        # Remove this once we clean up all the CUDA specific deps.
+        "libtpu_on_gce": [":nvtx_utils_libtpu"],
+        "//conditions:default": [":nvtx_utils_impl"],
+    }),
+)
+
+cc_library(
     name = "scoped_annotation",
     hdrs = [
         "scoped_annotation.h",
     ],
     visibility = ["//visibility:public"],
     deps = [
+        ":nvtx_utils",
+        "//tsl/platform",
         "//tsl/platform:macros",
         "//tsl/platform:types",
         "@com_google_absl//absl/strings",
     ] + if_not_android([
-        "//tsl/profiler/backends/cpu:annotation_stack",
-    ]) + select({
-        # Remove this once we clean up all the CUDA specific deps.
-        "libtpu_on_gce": [":nvtx_utils_libtpu"],
-        "//conditions:default": [":nvtx_utils"],
-    }),
+        "@local_xla//xla/tsl/profiler/backends/cpu:annotation_stack",
+    ]),
 )
 
 tsl_cc_test(
@@ -325,9 +337,9 @@ tsl_cc_test(
         "//tsl/platform:test",
         "//tsl/platform:test_benchmark",
         "//tsl/platform:test_main",
-        "//tsl/profiler/backends/cpu:annotation_stack",
-        "//tsl/profiler/backends/cpu:annotation_stack_impl",
         "@com_google_absl//absl/strings",
+        "@local_xla//xla/tsl/profiler/backends/cpu:annotation_stack",
+        "@local_xla//xla/tsl/profiler/backends/cpu:annotation_stack_impl",
     ],
 )
 
@@ -339,6 +351,7 @@ cc_library(
         ":context_types_hdrs",
         ":traceme",
         ":traceme_encode",
+        "//tsl/platform:types",
         "@com_google_absl//absl/strings",
         "@com_google_absl//absl/types:optional",
     ],

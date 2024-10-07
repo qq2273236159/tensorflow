@@ -34,7 +34,7 @@ limitations under the License.
 #include "tensorflow/compiler/mlir/tf2xla/transforms/passes.h"
 #include "tensorflow/compiler/mlir/tf2xla/transforms/test_utils.h"
 #include "tensorflow/compiler/tf2xla/xla_op_registry.h"
-#include "tsl/lib/core/status_test_util.h"
+#include "xla/tsl/lib/core/status_test_util.h"
 #include "tsl/platform/status.h"
 #include "tsl/platform/statusor.h"
 
@@ -135,8 +135,8 @@ TEST_F(LegalizationOpConfigTest, CountLoweringsSet) {
   // from MLIR to TF2XLA), these numbers should change. Or if TF Dialect adds
   // a new op, we should expect these to change too.
   EXPECT_EQ(mlir_lowering_count, 67);
-  EXPECT_EQ(tf2xla_fallback_count, 322);
-  EXPECT_EQ(non_categorized_count, 428);
+  EXPECT_EQ(tf2xla_fallback_count, 323);
+  EXPECT_EQ(non_categorized_count, 430);
 }
 
 // Just a counter test to see which ops have duplicate lowerings. This isn't a
@@ -187,7 +187,7 @@ TEST_F(LegalizationOpConfigTest, CountAllMlirLoweringPatterns) {
     }
   }
 
-  EXPECT_EQ(mlir_only_patterns, 64);
+  EXPECT_EQ(mlir_only_patterns, 63);
 }
 
 // Counts which ops have lowerings without XlaOpKernels. This isn't a

@@ -27,6 +27,7 @@ from absl import flags
 from absl import logging
 from absl.testing import absltest
 from absl.testing import parameterized
+import ml_dtypes
 import numpy as np
 
 from xla.python import xla_client
@@ -54,6 +55,9 @@ xla_client._xla.jax_jit.set_thread_local_state_initialization_callback(
 xla_client._xla.jax_jit.global_state().enable_memories = False
 
 bfloat16 = xla_client.bfloat16
+# TODO(reedwm): Uncomment once the minimum ml_dtypes in JAX is >= 0.5.0.
+# float8_e3m4 = xla_client.float8_e3m4
+# float8_e4m3 = xla_client.float8_e4m3
 float8_e4m3fn = xla_client.float8_e4m3fn
 float8_e4m3fnuz = xla_client.float8_e4m3fnuz
 float8_e4m3b11fnuz = xla_client.float8_e4m3b11fnuz
@@ -64,9 +68,24 @@ xla_computation_to_mlir_module = (
     xla_client._xla.mlir.xla_computation_to_mlir_module)
 
 
+def execute_with_python_values(executable, arguments, backend):  # pylint: disable=invalid-name
+  """Execute on one replica with Python values as arguments and output."""
+
+  def put(arg):  # pylint: disable=invalid-name
+    return backend.buffer_from_pyval(arg, device=executable.local_devices()[0])
+
+  arguments = [put(arg) for arg in arguments]
+  outputs = executable.execute(arguments)
+  return [np.asarray(x) for x in outputs]
+
+
 # pylint: disable=invalid-name
-def jax_array_convert_to_array(self):
-  return self._single_device_array_to_np_array()
+def jax_array_convert_to_array(self, dtype=None, copy=None):
+  del copy
+  out = self._single_device_array_to_np_array()
+  if dtype is not None:
+    out = out.astype(dtype)
+  return out
 
 
 def jax_array_device(self):
@@ -96,6 +115,28 @@ FLAGS = flags.FLAGS
 _CUSTOM_CALLS_REGISTERED = False
 
 
+# Return a copy of `x` with the given alignment. Does nothing if `x` is already
+# aligned. We do this manually, because numpy doesn't support custom alignment
+# value.
+def _Aligned(x, alignment=128):
+  if (x.ctypes.data % alignment) == 0:
+    return x
+
+  # Create temporary buffer with extra space for alignment.
+  assert alignment % x.itemsize == 0
+  extra = alignment // x.itemsize
+  buf = np.empty(x.size + extra, dtype=x.dtype)
+
+  # Create a view of the temporary buffer with such an offset, that the result
+  # buffer is aligned.
+  offset = (-buf.ctypes.data % alignment) // x.itemsize
+  result = buf[offset : offset + x.size].reshape(x.shape)
+
+  # Copy the data to the result buffer and return it.
+  np.copyto(result, x)
+  return result
+
+
 def TestFactory(xla_backend,
                 cloud_tpu=False,
                 tfrt_tpu=False,
@@ -112,7 +153,10 @@ def TestFactory(xla_backend,
   # TODO(zhangqiaorjc): test fp8 types when XLA support is complete.
   # standard_dtypes is only used for BufferProtocolTest so we only test fp8
   # round trip tests.
-  standard_dtypes += [float8_e4m3b11fnuz, float8_e4m3fn, float8_e5m2]
+  fp8_dtypes = [float8_e4m3b11fnuz, float8_e4m3fn, float8_e5m2]
+  standard_dtypes += fp8_dtypes
+  # TODO(reedwm): Uncomment once the minimum ml_dtypes in JAX is >= 0.5.0.
+  # standard_dtypes += [float8_e3m4, float8_e4m3]
   dlpack_dtypes = int_dtypes + float_dtypes + [np.bool_] + complex_dtypes
 
   class ComputationTest(parameterized.TestCase):
@@ -126,7 +170,7 @@ def TestFactory(xla_backend,
       if self.backend.platform == "cpu" and not _CUSTOM_CALLS_REGISTERED:
         for name, fn in custom_calls_testlib.registrations().items():
           xla_client.register_custom_call_target(
-              name, fn, platform="cpu", api_version=1
+              name, {"execute": fn}, platform="cpu", api_version=1
           )
         _CUSTOM_CALLS_REGISTERED = True
 
@@ -138,7 +182,7 @@ def TestFactory(xla_backend,
     def _Execute(self, c, arguments):
       compiled_c = self.backend.compile(
           xla_computation_to_mlir_module(c.build()))
-      return xla_client.execute_with_python_values(
+      return execute_with_python_values(
           compiled_c, arguments, backend=self.backend)
 
     def _ExecuteAndAssertWith(self, assert_func, c, arguments, expected):
@@ -458,7 +502,7 @@ def TestFactory(xla_backend,
           .API_VERSION_STATUS_RETURNING_UNIFIED,
       )
       with self.assertRaisesRegex(
-          xla_client.XlaRuntimeError, expected_regex="INVALID_ARGUMENT"
+          xla_client.XlaRuntimeError, expected_regex="NOT_FOUND"
       ):
         self._Execute(c, arguments=())
 
@@ -570,7 +614,7 @@ def TestFactory(xla_backend,
       # Load and execute the proto
       c = xla_client.XlaComputation(serialized_proto)
       m = xla_computation_to_mlir_module(c)
-      ans, = xla_client.execute_with_python_values(
+      ans, = execute_with_python_values(
           self.backend.compile(m), (), backend=self.backend)
       np.testing.assert_equal(ans, np.int32(3))
 
@@ -586,7 +630,10 @@ def TestFactory(xla_backend,
     def testScalarTimesVector(self, dtype):
       c = self._NewComputation()
       arg0 = np.array(3, dtype=dtype)
-      arg1 = np.array([10, 15, -2, 7], dtype=dtype)
+      if np.issubdtype(dtype, np.unsignedinteger):
+        arg1 = np.array([10, 15, 2, 7], dtype=dtype)
+      else:
+        arg1 = np.array([10, 15, -2, 7], dtype=dtype)
       p0 = ops.Parameter(c, 0, xla_client.shape_from_pyval(arg0))
       p1 = ops.Parameter(c, 1, xla_client.shape_from_pyval(arg1))
       ops.Mul(p0, p1)
@@ -1216,7 +1263,7 @@ module @jit__lambda_ attributes {mhlo.num_partitions = 1 : i32,
       ops.ConvertElementType(
           ops.Constant(c, x), xla_client.dtype_to_etype(dst_dtype))
 
-      result = xla_client.execute_with_python_values(
+      result = execute_with_python_values(
           self.backend.compile(xla_computation_to_mlir_module(c.build())), (),
           backend=self.backend)
       self.assertLen(result, 1)
@@ -1246,7 +1293,7 @@ module @jit__lambda_ attributes {mhlo.num_partitions = 1 : i32,
       ops.BitcastConvertType(
           ops.Constant(c, x), xla_client.dtype_to_etype(dst_dtype))
 
-      result = xla_client.execute_with_python_values(
+      result = execute_with_python_values(
           self.backend.compile(xla_computation_to_mlir_module(c.build())), (),
           backend=self.backend)
       self.assertLen(result, 1)
@@ -1830,7 +1877,7 @@ module @jit__lambda_ attributes {mhlo.num_partitions = 1 : i32,
           ops.Constant(c, NumpyArrayF32([1.0, 2.0])),
           ops.Constant(c, NumpyArrayBool([True, False, False, True]))
       ])
-      result = xla_client.execute_with_python_values(
+      result = execute_with_python_values(
           self.backend.compile(xla_computation_to_mlir_module(c.build())), (),
           backend=self.backend)
       self.assertLen(result, 3)
@@ -1870,7 +1917,7 @@ module @jit__lambda_ attributes {mhlo.num_partitions = 1 : i32,
           ops.Constant(c, NumpyArrayF32(1.)),
           shape=xla_client.Shape.array_shape(xla_client.PrimitiveType.F32,
                                              shape))
-      result = xla_client.execute_with_python_values(
+      result = execute_with_python_values(
           self.backend.compile(xla_computation_to_mlir_module(c.build())), (),
           backend=self.backend)
       # since the result is random, we just check shape and uniqueness
@@ -1887,7 +1934,7 @@ module @jit__lambda_ attributes {mhlo.num_partitions = 1 : i32,
           ops.Constant(c, NumpyArrayF32(hi)),
           shape=xla_client.Shape.array_shape(xla_client.PrimitiveType.F32,
                                              shape))
-      result = xla_client.execute_with_python_values(
+      result = execute_with_python_values(
           self.backend.compile(xla_computation_to_mlir_module(c.build())), (),
           backend=self.backend)
       # since the result is random, we just check shape, uniqueness, and range
@@ -1906,7 +1953,7 @@ module @jit__lambda_ attributes {mhlo.num_partitions = 1 : i32,
           ops.Constant(c, NumpyArrayS32(hi)),
           shape=xla_client.Shape.array_shape(xla_client.PrimitiveType.S32,
                                              shape))
-      result = xla_client.execute_with_python_values(
+      result = execute_with_python_values(
           self.backend.compile(xla_computation_to_mlir_module(c.build())), (),
           backend=self.backend)
       # since the result is random, we just check shape, integrality, and range
@@ -1936,7 +1983,7 @@ module @jit__lambda_ attributes {mhlo.num_partitions = 1 : i32,
       values = np.array([[0, 1, 2, 3], [4, 5, 6, 7]], dtype=np.int32)
       c = self._NewComputation()
       ops.Sort(c, (ops.Constant(c, keys), ops.Constant(c, values)), dimension=0)
-      result = xla_client.execute_with_python_values(
+      result = execute_with_python_values(
           self.backend.compile(xla_computation_to_mlir_module(c.build())), (),
           backend=self.backend)
       self.assertLen(result, 2)
@@ -1959,7 +2006,7 @@ module @jit__lambda_ attributes {mhlo.num_partitions = 1 : i32,
           c, (ops.Constant(c, keys), ops.Constant(c, values)),
           dimension=1,
           comparator=comparator)
-      result = xla_client.execute_with_python_values(
+      result = execute_with_python_values(
           self.backend.compile(xla_computation_to_mlir_module(c.build())), (),
           backend=self.backend)
       self.assertLen(result, 2)
@@ -2146,15 +2193,36 @@ module @jit__lambda_ attributes {mhlo.num_partitions = 1 : i32,
           c, expected=[np.fft.irfftn(a, axes=(1, 2, 3))], rtol=2e-4
       )
 
-    def testNextAfter(self):
+    @parameterized.named_parameters({
+        "testcase_name": "_{}".format(dtype.__name__),
+        "dtype": dtype,
+    } for dtype in float_dtypes + fp8_dtypes)
+    def testNextAfter(self, dtype):
+      if dtype == np.float64 and self.backend.platform == "tpu":
+        self.skipTest("TPU doesn't support float64")
+      if dtype == bfloat16 and self.backend.platform == "tpu":
+        self.skipTest("b/371119032: Test fails on TPUs with bfloat16")
+      finfo = ml_dtypes.finfo(dtype)
+      eps = finfo.eps
       c = self._NewComputation()
-      ops.NextAfter(
-          ops.Constant(c, np.array([1, 2], dtype=np.float32)),
-          ops.Constant(c, np.array([2, 1], dtype=np.float32)))
+      # Each row is (value, direction, expected), where
+      # 'nextafter(value, direction)' should be 'expected'.
+      data = np.array(
+          [
+              [1, 2, 1 + finfo.eps],
+              [2, 1, 2 - eps],
+              [-0., 1, finfo.smallest_subnormal],
+              [0., -1, -finfo.smallest_subnormal],
+              [-finfo.smallest_subnormal, 1, -0.],
+              [finfo.smallest_subnormal, 1, 2 * finfo.smallest_subnormal],
+              [finfo.smallest_subnormal, -1, 0],
+          ],
+          dtype=dtype,
+      )
+
+      ops.NextAfter(ops.Constant(c, data[:, 0]), ops.Constant(c, data[:, 1]))
       out, = self._Execute(c, ())
-      eps = np.finfo(np.float32).eps
-      np.testing.assert_equal(
-          np.array([eps + 1, 2 - eps], dtype=np.float32), out)
+      np.testing.assert_equal(out, data[:, 2])
 
     @parameterized.named_parameters({
         "testcase_name": "_{}".format(dtype.__name__),
@@ -2549,7 +2617,7 @@ module @jit__lambda_ attributes {mhlo.num_partitions = 1 : i32,
         device.transfer_to_infeed(item)
 
       for item in to_infeed:
-        result, = xla_client.execute_with_python_values(
+        result, = execute_with_python_values(
             compiled_c, (), backend=self.backend)
         self.assertEqual(result, item)
 
@@ -2568,7 +2636,7 @@ module @jit__lambda_ attributes {mhlo.num_partitions = 1 : i32,
       device = self.backend.local_devices()[0]
       device.transfer_to_infeed(to_infeed)
 
-      result = xla_client.execute_with_python_values(
+      result = execute_with_python_values(
           compiled_c, (), backend=self.backend)
       self.assertLen(result, 2)
       np.testing.assert_equal(result[0], to_infeed[0])
@@ -2712,7 +2780,7 @@ module @jit__lambda_ attributes {mhlo.num_partitions = 1 : i32,
       c.clear_op_metadata()
 
       def TestFun():
-        return xla_client.execute_with_python_values(
+        return execute_with_python_values(
             self.backend.compile(xla_computation_to_mlir_module(c.build())),
             [self.f32_scalar_2], self.backend)
 
@@ -2734,7 +2802,7 @@ module @jit__lambda_ attributes {mhlo.num_partitions = 1 : i32,
       arg = NumpyArrayF32(1.0)
       compiled_c = self.backend.compile(
           xla_computation_to_mlir_module(c.build(result)))
-      ans, = xla_client.execute_with_python_values(
+      ans, = execute_with_python_values(
           compiled_c, [arg], backend=self.backend)
       np.testing.assert_allclose(ans, 4.14)
 
@@ -2758,7 +2826,7 @@ module @jit__lambda_ attributes {mhlo.num_partitions = 1 : i32,
       arg = NumpyArrayF32(1.0)
       compiled_c = self.backend.compile(
           xla_computation_to_mlir_module(c.build(result)))
-      ans, = xla_client.execute_with_python_values(
+      ans, = execute_with_python_values(
           compiled_c, [arg], backend=self.backend)
       np.testing.assert_allclose(ans, 4.14)
 
@@ -2879,15 +2947,20 @@ module @jit__lambda_ attributes {mhlo.num_partitions = 1 : i32,
                                     for shape in testcase_shapes)
     def testRoundTrip(self, dtype, shape):
       x = np.array(np.random.rand(*shape) * 100, dtype=dtype)
+
+      # XLA' alignment is 16 bytes at the moment, but it should match what Eigen
+      # supports, and that can go up to 128 bytes on hardware with HVX. Align
+      # the input buffer to 128 bytes to be safe.
+      x = _Aligned(x, alignment=128)
       x_ptr = x.__array_interface__["data"][0]
       buffer = self.backend.buffer_from_pyval(
           x, host_buffer_semantics=xla_client.HostBufferSemantics.ZERO_COPY)
       y = np.array(buffer, copy=False)
       y_ptr = y.__array_interface__["data"][0]
       np.testing.assert_array_equal(x, y)
-      # If the input was sufficiently aligned, the input and output should
-      # alias.
-      self.assertTrue((x_ptr & 15) != 0 or x_ptr == y_ptr)
+
+      # The input was sufficiently aligned, so input and output should alias.
+      self.assertEqual(x_ptr, y_ptr)
       self.assertEqual(y_ptr, buffer.unsafe_buffer_pointer())
 
       during_call = xla_client.HostBufferSemantics.IMMUTABLE_ONLY_DURING_CALL
@@ -2990,6 +3063,49 @@ module @jit__lambda_ attributes {mhlo.num_partitions = 1 : i32,
       for frame, _ in traceback.walk_tb(python_tb):
         _ = frame.f_locals  # should not crash
 
+    def testTracebackFromFrames(self):
+      def FooFn(x):
+        return x + 1
+
+      def BarFn(y):
+        y = y + 1
+        y = y + 2
+        return y * 2
+
+      frame_foo = xla_client.Frame(
+          __file__,
+          FooFn.__code__.co_name,
+          FooFn.__code__.co_firstlineno,
+          FooFn.__code__.co_firstlineno + 1,
+      )
+      frame_bar = xla_client.Frame(
+          __file__,
+          BarFn.__code__.co_name,
+          BarFn.__code__.co_firstlineno,
+          BarFn.__code__.co_firstlineno + 2,
+      )
+      frames = [frame_foo, frame_bar]
+      tb = xla_client.Traceback.traceback_from_frames(frames)
+
+      with self.subTest("WalkDoesNotError"):
+        for frame, _ in traceback.walk_tb(tb):
+          _ = frame.f_locals  # should not crash
+
+      with self.subTest("TracebackCorrectness"):
+        tb_string = traceback.format_tb(tb)
+        # The traceback should have the format:
+        # File <this file>, line N in BarFn
+        #   y = y + 2
+        # File <this file>, line N in FooFn
+        #   return x + 1
+        self.assertLen(tb_string, len(frames))
+        bar_frame = tb_string[0].split("\n")
+        self.assertEndsWith(bar_frame[0], "BarFn")
+        self.assertEqual(bar_frame[1].strip(), "y = y + 2")
+        foo_frame = tb_string[1].split("\n")
+        self.assertEndsWith(foo_frame[0], "FooFn")
+        self.assertEqual(foo_frame[1].strip(), "return x + 1")
+
   tests.append(TracebackTest)
 
   class ClientTest(ComputationTest):
@@ -3051,7 +3167,7 @@ module @jit__lambda_ attributes {mhlo.num_partitions = 1 : i32,
       )
 
       compiled_c = self.backend.compile_ifrt_program(program, options)
-      results = xla_client.execute_with_python_values(
+      results = execute_with_python_values(
           compiled_c, arguments=(), backend=self.backend
       )
 
@@ -3077,10 +3193,8 @@ module @jit__lambda_ attributes {mhlo.num_partitions = 1 : i32,
       serialized = self.backend.serialize_executable(executable)
       deserialized = self.backend.deserialize_executable(serialized, options)
 
-      expected, = xla_client.execute_with_python_values(executable, (),
-                                                        self.backend)
-      actual, = xla_client.execute_with_python_values(deserialized, (),
-                                                      self.backend)
+      expected, = execute_with_python_values(executable, (), self.backend)
+      actual, = execute_with_python_values(deserialized, (), self.backend)
       self.assertTrue(np.all(actual == expected))
 
     def testCompileOptionsSerialization(self):
@@ -3092,8 +3206,12 @@ module @jit__lambda_ attributes {mhlo.num_partitions = 1 : i32,
       options.compile_portable_executable = True
       executable_build_options.num_replicas = 3
       executable_build_options.num_partitions = 2
-      executable_build_options.debug_options.xla_cpu_enable_fast_math = True
-      executable_build_options.debug_options.xla_test_all_input_layouts = True
+      deb_opt = executable_build_options.debug_options
+      deb_opt.xla_cpu_enable_fast_math = True
+      deb_opt.xla_test_all_input_layouts = True
+      deb_opt.xla_gpu_kernel_cache_file = "/foo/bar"
+      deb_opt.xla_gpu_enable_llvm_module_compilation_parallelism = True
+      deb_opt.xla_gpu_per_fusion_autotune_cache_dir = "/bar/foo/"
 
       b = options.SerializeAsString()
       restored = xla_client.CompileOptions.ParseFromString(b)
@@ -3108,7 +3226,13 @@ module @jit__lambda_ attributes {mhlo.num_partitions = 1 : i32,
                          getattr(restored.executable_build_options, name),
                          msg=name)
 
-      for name in ("xla_cpu_enable_fast_math", "xla_test_all_input_layouts"):
+      for name in (
+          "xla_cpu_enable_fast_math",
+          "xla_test_all_input_layouts",
+          "xla_gpu_kernel_cache_file",
+          "xla_gpu_enable_llvm_module_compilation_parallelism",
+          "xla_gpu_per_fusion_autotune_cache_dir",
+      ):
         self.assertEqual(
             getattr(options.executable_build_options.debug_options, name),
             getattr(restored.executable_build_options.debug_options, name),
@@ -3260,8 +3384,9 @@ module @jit__lambda_ attributes {mhlo.num_partitions = 1 : i32,
       options.num_replicas = num_replicas
       compiled_c = self.backend.compile(
           xla_computation_to_mlir_module(c.build()), compile_options=options)
-      results, sharded_token = compiled_c.execute_sharded_on_local_devices_with_tokens(
-          [])
+      results, sharded_token = (
+          compiled_c.execute_sharded_on_local_devices_with_tokens([])
+      )
       sharded_token.block_until_ready()
       self.assertLen(results, 1)
       self.assertLen(results[0], 1)

@@ -22,8 +22,8 @@ limitations under the License.
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 #include "llvm/Support/Casting.h"
-#include "mlir/Dialect/Quant/QuantOps.h"  // from @llvm-project
-#include "mlir/Dialect/Quant/QuantTypes.h"  // from @llvm-project
+#include "mlir/Dialect/Quant/IR/Quant.h"  // from @llvm-project
+#include "mlir/Dialect/Quant/IR/QuantTypes.h"  // from @llvm-project
 #include "mlir/Dialect/SparseTensor/IR/SparseTensor.h"  // from @llvm-project
 #include "mlir/IR/BuiltinTypes.h"  // from @llvm-project
 #include "mlir/IR/MLIRContext.h"  // from @llvm-project
@@ -34,11 +34,11 @@ limitations under the License.
 #include "tensorflow/compiler/mlir/tensorflow/ir/tf_types.h"
 #include "tensorflow/compiler/mlir/tensorflow/utils/mangling_util.h"
 #include "xla/mlir_hlo/mhlo/IR/hlo_ops.h"
+#include "xla/tsl/framework/numeric_types.h"
 #include "tensorflow/core/framework/tensor.h"
 #include "tensorflow/core/framework/tensor.pb.h"
 #include "tensorflow/core/framework/types.pb.h"
 #include "tensorflow/core/ir/types/dialect.h"
-#include "tsl/framework/numeric_types.h"
 
 namespace mlir::quant::tensorflow {
 namespace {
@@ -85,7 +85,7 @@ std::unique_ptr<MLIRContext> CreateContext() {
   RegisterCommonToolingDialects(mlir_registry);
   context->appendDialectRegistry(mlir_registry);
   context->getOrLoadDialect<tf_type::TFTypeDialect>();
-  context->getOrLoadDialect<quant::QuantizationDialect>();
+  context->getOrLoadDialect<quant::QuantDialect>();
   context->getOrLoadDialect<mlir::mhlo::MhloDialect>();
   context->getOrLoadDialect<sparse_tensor::SparseTensorDialect>();
   return context;

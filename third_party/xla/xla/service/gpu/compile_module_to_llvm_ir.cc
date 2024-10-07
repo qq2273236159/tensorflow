@@ -18,7 +18,6 @@ limitations under the License.
 #include <stdlib.h>
 
 #include <cstdint>
-#include <functional>
 #include <memory>
 #include <optional>
 #include <string>
@@ -26,7 +25,10 @@ limitations under the License.
 #include <variant>
 #include <vector>
 
+#include "absl/status/status.h"
 #include "absl/strings/str_cat.h"
+#include "absl/strings/str_format.h"
+#include "absl/strings/string_view.h"
 #include "llvm/AsmParser/Parser.h"
 #include "llvm/IR/DiagnosticInfo.h"
 #include "llvm/IR/DiagnosticPrinter.h"
@@ -35,41 +37,39 @@ limitations under the License.
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Verifier.h"
 #include "llvm/Transforms/Utils/SplitModule.h"
-#include "mlir/IR/Diagnostics.h"  // from @llvm-project
-#include "mlir/IR/DialectRegistry.h"  // from @llvm-project
-#include "mlir/Pass/PassManager.h"  // from @llvm-project
-#include "mlir/Support/LLVM.h"  // from @llvm-project
-#include "mlir/Support/LogicalResult.h"  // from @llvm-project
+#include "mlir/IR/Diagnostics.h"
+#include "mlir/IR/DialectRegistry.h"
+#include "mlir/Pass/PassManager.h"
+#include "mlir/Support/LLVM.h"
+#include "mlir/Support/LogicalResult.h"
 #include "xla/hlo/ir/hlo_instruction.h"
 #include "xla/hlo/ir/hlo_module.h"
 #include "xla/service/buffer_assignment.h"
 #include "xla/service/buffer_value.h"
 #include "xla/service/dump.h"
+#include "xla/service/gpu/execution_stream_assignment.h"
 #include "xla/service/gpu/gpu_constants.h"
 #include "xla/service/gpu/gpu_executable.h"
 #include "xla/service/gpu/gpu_memory_space_assignment.h"
 #include "xla/service/gpu/ir_emitter_context.h"
 #include "xla/service/gpu/ir_emitter_unnested.h"
 #include "xla/service/gpu/metrics.h"
-#include "xla/service/gpu/runtime/conditional_thunk.h"
-#include "xla/service/gpu/runtime/sequential_thunk.h"
-#include "xla/service/gpu/runtime/thunk.h"
-#include "xla/service/gpu/runtime/while_thunk.h"
 #include "xla/service/hlo_dataflow_analysis.h"
 #include "xla/service/hlo_ordering.h"
 #include "xla/service/logical_buffer.h"
 #include "xla/shape.h"
-#include "xla/status.h"
+#include "xla/status_macros.h"
 #include "xla/stream_executor/device_description.h"
 #include "xla/stream_executor/platform.h"
 #include "xla/stream_executor/rocm/rocm_platform_id.h"
 #include "xla/util.h"
 #include "xla/xla_data.pb.h"
-#include "tsl/platform/casts.h"
 #include "tsl/platform/env.h"
 #include "tsl/platform/errors.h"
 #include "tsl/platform/logging.h"
+#include "tsl/platform/path.h"
 #include "tsl/platform/statusor.h"
+#include "tsl/profiler/lib/scoped_annotation.h"
 
 namespace xla::gpu {
 
@@ -102,18 +102,64 @@ void RemoveUnusedAndUninitializedGlobals(
 
 }  // namespace
 
+absl::Status LoadCache(IrEmitterContext& ir_emitter_context,
+                       absl::string_view cache_file_path) {
+  std::string resolved_path;
+  if (!tsl::io::ResolveTestPrefixes(cache_file_path, resolved_path)) {
+    return FailedPrecondition("File path can not be resolved: %s",
+                              cache_file_path);
+  }
+  if (tsl::Env::Default()->FileExists(resolved_path).ok()) {
+    std::string serialized;
+    TF_RETURN_IF_ERROR(
+        tsl::ReadFileToString(tsl::Env::Default(), resolved_path, &serialized));
+    CompilationCacheProto proto;
+    if (!proto.ParseFromString(serialized)) {
+      return Internal("Failed to parse serialized CompilationCacheProto.");
+    }
+    // Register all cached kernel names with the name uniquer to avoid
+    // naming conflicts.
+    for (const auto& [name, _] : proto.entries()) {
+      TF_RET_CHECK(ir_emitter_context.name_uniquer()->GetUniqueName(name) ==
+                   name)
+          << "Failed registering " << name << "in NameUniquer.";
+    }
+    TF_RETURN_IF_ERROR(ir_emitter_context.kernel_cache().Load(proto));
+  } else {
+    VLOG(1) << "Compilation cache file does not exist: " << resolved_path;
+  }
+  return absl::OkStatus();
+}
+
 absl::StatusOr<CompileModuleResults> CompileModuleToLlvmIr(
     HloModule* hlo_module, llvm::LLVMContext* llvm_context,
     const std::string& target_triple, const std::string& data_layout,
     const std::string& platform_name, se::Platform::Id platform_id,
     const se::DeviceDescription& gpu_device_info,
     const HloDataflowAnalysis::CanShareBuffer& can_share_buffer_function,
-    const BufferValue::SizeFunction& buffer_size_bytes_function) {
+    const BufferValue::SizeFunction& buffer_size_bytes_function,
+    bool split_constants_module) {
   CompileModuleResults results;
   results.llvm_module =
       std::make_unique<llvm::Module>(hlo_module->name(), *llvm_context);
   results.llvm_module->setTargetTriple(target_triple);
   results.llvm_module->setDataLayout(data_layout);
+
+  absl::string_view cache_file_path =
+      hlo_module->config().debug_options().xla_gpu_kernel_cache_file();
+  const bool use_cache =
+      !cache_file_path.empty() && split_constants_module &&
+      hlo_module->config()
+          .debug_options()
+          .xla_gpu_enable_llvm_module_compilation_parallelism();
+
+  if (split_constants_module) {
+    // Constants are emitted into a separate module to avoid caching them.
+    results.llvm_module_constants = std::make_unique<llvm::Module>(
+        absl::StrCat(hlo_module->name(), "_consts"), *llvm_context);
+    results.llvm_module_constants->setTargetTriple(target_triple);
+    results.llvm_module_constants->setDataLayout(data_layout);
+  }
 
   {
     tsl::profiler::ScopedAnnotation annotation([&] {
@@ -135,11 +181,23 @@ absl::StatusOr<CompileModuleResults> CompileModuleToLlvmIr(
                     .xla_gpu_enable_nccl_user_buffers()
                 ? CollectiveColorer()
                 : BufferAssigner::DefaultColorer(),
-            /*must_not_live_out=*/{}, can_share_buffer_function));
+            /*must_not_live_out=*/{},
+            /*can_share_buffer*/ can_share_buffer_function,
+            /*preset_assignments*/ {},
+            /*private_stack*/ {}, /*heap_buffer_interval_compare*/ nullptr,
+            /*isolation_options*/ std::nullopt,
+            hlo_module->config()
+                    .debug_options()
+                    .xla_gpu_temp_buffer_use_separate_color()
+                ? std::optional<BufferValue::Color>(kTempBufferMemorySpaceColor)
+                : std::nullopt));
   }
-
   VLOG(1) << "Buffer Assignment Stats for " << hlo_module->name() << "\n"
           << results.buffer_assignment->GetStats().ToString();
+
+  results.execution_stream_assignment =
+      std::make_unique<ExecutionStreamAssignment>(hlo_module);
+
   struct GetCcStr {
     std::string operator()(const se::CudaComputeCapability& cc) const {
       return absl::StrCat("sm_", cc.ToString());
@@ -173,9 +231,14 @@ absl::StatusOr<CompileModuleResults> CompileModuleToLlvmIr(
                            hlo_module->name(), hlo_module->unique_id());
   });
   IrEmitterContext ir_emitter_context(
-      hlo_module, results.buffer_assignment.get(), platform_name,
-      gpu_device_info, mlir_context.get(), results.llvm_module.get(),
-      /*emit_kernels=*/true);
+      hlo_module, results.buffer_assignment.get(),
+      results.execution_stream_assignment.get(), platform_name, gpu_device_info,
+      mlir_context.get(), results.llvm_module.get(),
+      results.llvm_module_constants.get(), /*emit_kernels=*/true);
+
+  if (use_cache) {
+    TF_RETURN_IF_ERROR(LoadCache(ir_emitter_context, cache_file_path));
+  }
 
   std::vector<BufferAllocation*> allocations;
   results.output_shape = hlo_module->result_shape();
@@ -199,8 +262,9 @@ absl::StatusOr<CompileModuleResults> CompileModuleToLlvmIr(
     if (supports_runtime_managed_constants) {
       // Remove these globals from the generated code to indicate that XLA is
       // responsible for allocating and initializing them.
-      RemoveUnusedAndUninitializedGlobals(ir_emitter_context.llvm_module(),
-                                          ir_emitter_context.constants());
+      RemoveUnusedAndUninitializedGlobals(
+          ir_emitter_context.llvm_module_constants(),
+          ir_emitter_context.constants());
     }
 
     results.constants = std::move(ir_emitter_context.constants());
@@ -212,6 +276,10 @@ absl::StatusOr<CompileModuleResults> CompileModuleToLlvmIr(
   }
 
   results.executable = ir_emitter->ConsumeThunkSequence();
+  if (use_cache) {
+    results.kernel_compilation_cache =
+        ir_emitter_context.kernel_cache().Export();
+  }
 
   return results;
 }

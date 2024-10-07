@@ -22,7 +22,7 @@ limitations under the License.
 #include "absl/strings/string_view.h"
 #include "xla/hlo/ir/hlo_instruction.h"
 #include "xla/hlo/ir/hlo_module.h"
-#include "xla/service/hlo_pass_interface.h"
+#include "xla/hlo/pass/hlo_pass_interface.h"
 
 namespace xla {
 
@@ -45,7 +45,7 @@ class CallInliner : public HloModulePass {
                        bool update_domain = false)
       : single_call_site_(single_call_site), update_domain_(update_domain) {}
   ~CallInliner() override = default;
-  absl::string_view name() const override { return "CallInliner"; }
+  absl::string_view name() const override { return "call-inliner"; }
 
   using HloPassInterface::Run;
   absl::StatusOr<bool> Run(

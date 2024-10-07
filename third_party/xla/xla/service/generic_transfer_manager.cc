@@ -26,13 +26,13 @@ limitations under the License.
 #include "absl/status/status.h"
 #include "absl/strings/str_format.h"
 #include "absl/types/span.h"
+#include "xla/layout_util.h"
 #include "xla/literal.h"
 #include "xla/primitive_util.h"
 #include "xla/service/shaped_buffer.h"
 #include "xla/service/transfer_manager.h"
 #include "xla/shape.h"
 #include "xla/shape_util.h"
-#include "xla/status.h"
 #include "xla/status_macros.h"
 #include "xla/stream_executor/device_memory.h"
 #include "xla/stream_executor/event.h"
@@ -75,7 +75,7 @@ absl::Status GenericTransferManager::WriteSingleTupleIndexTable(
 
 void GenericTransferManager::TransferLiteralFromDevice(
     se::Stream* stream, const ShapedBuffer& device_buffer,
-    MutableBorrowingLiteral literal, std::function<void(Status)> done,
+    MutableBorrowingLiteral literal, std::function<void(absl::Status)> done,
     const TransferMetadata* transfer_metadata) {
   VLOG(2) << "transferring literal from device ordinal "
           << stream->parent()->device_ordinal()
@@ -83,7 +83,7 @@ void GenericTransferManager::TransferLiteralFromDevice(
 
   absl::Status status = [&]() -> absl::Status {
     TF_RET_CHECK(stream->parent()->device_ordinal() ==
-                 device_buffer.device_ordinal());
+                 device_buffer.physical_device_ordinal());
 
     TF_RETURN_IF_ERROR(ShapeUtil::ForEachSubshapeWithStatus(
         device_buffer.on_device_shape(),
@@ -155,7 +155,7 @@ absl::Status GenericTransferManager::TransferLiteralToDeviceAsync(
   TF_RET_CHECK(
       ShapeUtil::Compatible(literal.shape(), device_buffer.on_device_shape()));
   TF_RET_CHECK(stream->parent()->device_ordinal() ==
-               device_buffer.device_ordinal());
+               device_buffer.physical_device_ordinal());
 
   TF_RETURN_IF_ERROR(WriteTupleIndexTablesAsync(stream, device_buffer));
 
@@ -299,6 +299,17 @@ Shape GenericTransferManager::HostShapeToDeviceShape(
         primitive_util::BitWidth(device_shape.element_type()));
   }
   return device_shape;
+}
+
+absl::StatusOr<Shape> GenericTransferManager::ChooseCompactLayoutForShape(
+    const Shape& host_shape) const {
+  Shape compact_shape = LayoutUtil::GetWithDefaultLayout(host_shape);
+  if (PackSubbyteTypes() &&
+      primitive_util::IsSubByteNonPredType(compact_shape.element_type())) {
+    compact_shape.mutable_layout()->set_element_size_in_bits(
+        primitive_util::BitWidth(compact_shape.element_type()));
+  }
+  return compact_shape;
 }
 
 }  // namespace xla

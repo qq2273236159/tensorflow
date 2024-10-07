@@ -74,26 +74,8 @@ def Ifrt_ShardingParamAttr : AttrDef<Ifrt_Dialect, "IfrtShardingParam", [
   let mnemonic = "sharding_param";
   let summary = "ShardingParam as an attribute.";
 
-  let parameters = (ins
-    Ifrt_ShardingParameter:$sharding,
-    OptionalParameter<"::mlir::StringAttr">:$memory_kind
-  );
-  let assemblyFormat = [{
-    `<` $sharding (`,` `memory_kind` `=` $memory_kind^)? `>`
-  }];
-
-  let builders = [
-    AttrBuilder<(ins "::xla::ifrt::ShardingParam":$sharding), [{
-      return $_get($_ctxt, sharding, /*memory_kind=*/nullptr);
-    }]>,
-    AttrBuilder<(ins
-      "::xla::ifrt::ShardingParam":$sharding,
-      "::mlir::StringRef":$memory_kind), [{
-        return $_get($_ctxt,
-                     sharding,
-                     ::mlir::StringAttr::get($_ctxt,  memory_kind));
-    }]>
-  ];
+  let parameters = (ins Ifrt_ShardingParameter:$sharding);
+  let assemblyFormat = "`<` $sharding `>`";
 
   let genVerifyDecl = 1;
 }
@@ -113,7 +95,7 @@ def Ifrt_UnspecifiedShardingAttr : AttrDef<Ifrt_Dialect,
 
 def Ifrt_IntervalAttr : AttrDef<Ifrt_Dialect, "IfrtInterval"> {
   let mnemonic = "interval";
-  let summary = [{
+  let description = [{
     Half-open interval attribute using the Python slice format
     `[start:end:step]`. Reverse iteration is not supported for simplicity.
     Therefore, `start` and `end` must be zero or positive, and `step`
@@ -151,7 +133,7 @@ def Ifrt_MappingAttrArrayAttr :
 
 def Ifrt_ArrayMappingAttr : AttrDef<Ifrt_Dialect, "IfrtArrayMapping"> {
   let mnemonic = "array_mapping";
-  let summary = [{
+  let description = [{
     Mapping of shards from an input array to an output array. The shards are
     chosen from input array with index `in_array_index` and are used to assemble
     the output array with index `out_array_index`.
@@ -179,9 +161,10 @@ def Ifrt_ArrayType : TypeDef<Ifrt_Dialect, "IfrtArray"> {
   let summary = "An Ifrt array sharded on a set of devices.";
 
   let parameters = (ins
-    Builtin_RankedTensor:$shape,
+    "::mlir::RankedTensorType":$shape,
     "::xla::ifrt::IfrtShardingAttrInterface":$sharding_attr,
-    Ifrt_DevicesAttr:$devices_attr);
+    Ifrt_DevicesAttr:$devices_attr,
+    OptionalParameter<"::mlir::StringAttr">:$memory_kind_attr);
 
   let builders = [
     TypeBuilder<(ins
@@ -190,14 +173,16 @@ def Ifrt_ArrayType : TypeDef<Ifrt_Dialect, "IfrtArray"> {
       "::llvm::ArrayRef<int>":$devices), [{
         return Base::get(
           $_ctxt, shape, sharding_attr,
-          ::xla::ifrt::IfrtDevicesAttr::get($_ctxt, devices));
+          ::xla::ifrt::IfrtDevicesAttr::get($_ctxt, devices),
+          /*memory_kind=*/nullptr);
       }]>,
     TypeBuilder<(ins
       "::mlir::RankedTensorType":$shape,
       "::llvm::ArrayRef<int>":$devices), [{
         return Base::get(
           $_ctxt, shape, ::xla::ifrt::IfrtUnspecifiedShardingAttr::get($_ctxt),
-          ::xla::ifrt::IfrtDevicesAttr::get($_ctxt, devices));
+          ::xla::ifrt::IfrtDevicesAttr::get($_ctxt, devices),
+          /*memory_kind=*/nullptr);
       }]>,
     TypeBuilder<(ins
       "::mlir::RankedTensorType":$shape,
@@ -206,17 +191,34 @@ def Ifrt_ArrayType : TypeDef<Ifrt_Dialect, "IfrtArray"> {
         return Base::get(
           $_ctxt, shape,
           ::xla::ifrt::IfrtShardingParamAttr::get($_ctxt, sharding),
-          ::xla::ifrt::IfrtDevicesAttr::get($_ctxt, devices));
+          ::xla::ifrt::IfrtDevicesAttr::get($_ctxt, devices),
+          /*memory_kind=*/nullptr);
+      }]>,
+    TypeBuilder<(ins
+      "::mlir::RankedTensorType":$shape,
+      "::xla::ifrt::ShardingParam":$sharding,
+      "::llvm::ArrayRef<int>":$devices,
+      "::std::string":$memory_kind), [{
+        return Base::get(
+          $_ctxt, shape,
+          ::xla::ifrt::IfrtShardingParamAttr::get($_ctxt, sharding),
+          ::xla::ifrt::IfrtDevicesAttr::get($_ctxt, devices),
+          ::mlir::StringAttr::get($_ctxt, memory_kind));
       }]>
   ];
 
-  let assemblyFormat = "`<` $shape`,` $sharding_attr`,` $devices_attr`>`";
+  let assemblyFormat = [{
+    `<` $shape`,` $sharding_attr `,` $devices_attr
+    (`,` `memory_kind` `=` $memory_kind_attr^)? `>`
+  }];
 
   let genVerifyDecl = 1;
 
   let extraClassDeclaration = [{
     // Get logical device ids from `devices_attr`.
     ::llvm::ArrayRef<int> getDevices() const;
+    // Get the memory kind from `memory_kind`.
+    ::xla::ifrt::MemoryKind MemoryKind() const;
   }];
 }
 

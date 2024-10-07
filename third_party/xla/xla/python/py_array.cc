@@ -28,12 +28,15 @@ limitations under the License.
 #include <optional>
 #include <string>
 #include <string_view>
+#include <tuple>
 #include <type_traits>
 #include <utility>
 #include <vector>
 
 #include "absl/algorithm/container.h"
 #include "absl/base/casts.h"
+#include "absl/container/flat_hash_map.h"
+#include "absl/container/flat_hash_set.h"
 #include "absl/status/status.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_format.h"
@@ -41,12 +44,12 @@ limitations under the License.
 #include "absl/strings/string_view.h"
 #include "absl/types/span.h"
 #include "llvm/Support/Casting.h"
-#include "third_party/nanobind/include/nanobind/nanobind.h"
-#include "third_party/nanobind/include/nanobind/stl/optional.h"  // IWYU pragma: keep
-#include "third_party/nanobind/include/nanobind/stl/string.h"  // IWYU pragma: keep
-#include "third_party/nanobind/include/nanobind/stl/string_view.h"  // IWYU pragma: keep
-#include "third_party/nanobind/include/nanobind/stl/unique_ptr.h"  // IWYU pragma: keep
-#include "third_party/nanobind/include/nanobind/stl/vector.h"  // IWYU pragma: keep
+#include "nanobind/nanobind.h"
+#include "nanobind/stl/optional.h"  // IWYU pragma: keep
+#include "nanobind/stl/string.h"  // IWYU pragma: keep
+#include "nanobind/stl/string_view.h"  // IWYU pragma: keep
+#include "nanobind/stl/unique_ptr.h"  // IWYU pragma: keep
+#include "nanobind/stl/vector.h"  // IWYU pragma: keep
 #include "xla/layout.h"
 #include "xla/layout_util.h"
 #include "xla/pjrt/exceptions.h"
@@ -59,6 +62,7 @@ limitations under the License.
 #include "xla/primitive_util.h"
 #include "xla/python/ifrt/array.h"
 #include "xla/python/ifrt/device.h"
+#include "xla/python/ifrt/device_list.h"
 #include "xla/python/ifrt/dtype.h"
 #include "xla/python/ifrt/future.h"
 #include "xla/python/ifrt/memory.h"
@@ -71,7 +75,7 @@ limitations under the License.
 #include "xla/python/pjrt_ifrt/pjrt_array.h"
 #include "xla/python/pjrt_ifrt/pjrt_client.h"
 #include "xla/python/pjrt_ifrt/pjrt_device.h"
-#include "xla/python/pjrt_ifrt/xla_sharding.h"
+#include "xla/python/pjrt_ifrt/pjrt_dtype.h"
 #include "xla/python/py_client.h"
 #include "xla/python/py_device.h"
 #include "xla/python/py_values.h"
@@ -83,17 +87,10 @@ limitations under the License.
 #include "xla/python/util.h"
 #include "xla/shape.h"
 #include "xla/shape_util.h"
-#include "xla/status.h"
 #include "xla/status_macros.h"
-#include "xla/statusor.h"
-#include "xla/xla_data.pb.h"
-// TODO(b/324133505): remove this GOOGLE_CUDA block after JAX OSS migrates
-// to cuda plugin.
-#if GOOGLE_CUDA
-#include "xla/stream_executor/cuda/cuda_driver.h"
-#endif
 #include "xla/tsl/concurrency/ref_count.h"
 #include "xla/util.h"
+#include "xla/xla_data.pb.h"
 #include "tsl/platform/errors.h"
 #include "tsl/platform/logging.h"
 #include "tsl/platform/statusor.h"
@@ -147,8 +144,10 @@ tsl::RCReference<ifrt::Array> CreateIfRtArrayFromSingleDeviceShardedPyArrays(
   }
   std::vector<tsl::RCReference<ifrt::Array>> ifrt_arrays;
   ifrt_arrays.reserve(py_arrays.size());
-  ifrt::DeviceList::Devices devices;
+  ifrt::BasicDeviceList::Devices devices;
   devices.reserve(py_arrays.size());
+  absl::flat_hash_set<ifrt::Device*> device_set;
+  device_set.reserve(py_arrays.size());
   std::vector<ifrt::Shape> shapes;
   shapes.reserve(py_arrays.size());
 
@@ -157,25 +156,47 @@ tsl::RCReference<ifrt::Array> CreateIfRtArrayFromSingleDeviceShardedPyArrays(
   // TODO(hyeontaek): Canonicalize every `ifrt::MemoryKind` at creation time to
   // skip canonicalization here once JAX begins to do it for JAX shardings.
   const ifrt::MemoryKind canonical_first_memory_kind =
-      ifrt::CanonicalizeMemoryKind(
-          first_memory_kind,
-          py_arrays.front().ifrt_array()->sharding().devices().front());
+      ifrt::CanonicalizeMemoryKind(first_memory_kind, py_arrays.front()
+                                                          .ifrt_array()
+                                                          ->sharding()
+                                                          .devices()
+                                                          ->devices()
+                                                          .front());
   for (const auto& py_array : py_arrays) {
-    DCHECK_EQ(py_array.num_shards(), 1);
+    if (py_array.num_shards() != 1) {
+      throw nb::value_error(
+          absl::StrFormat(
+              "When making an array from single-device arrays the input arrays "
+              "must have one shard each. An argument array had %d shard(s).",
+              py_array.num_shards())
+              .c_str());
+    }
     ifrt_arrays.push_back(tsl::FormRef(py_array.ifrt_array()));
-    devices.push_back(ifrt_arrays.back()->sharding().devices().front());
+    ifrt::Device* const device =
+        ifrt_arrays.back()->sharding().devices()->devices().front();
+    devices.push_back(device);
+    device_set.insert(device);
     shapes.push_back(ifrt_arrays.back()->shape());
     if (canonical_first_memory_kind !=
         ifrt::CanonicalizeMemoryKind(
-            ifrt_arrays.back()->sharding().memory_kind(), devices.back())) {
+            ifrt_arrays.back()->sharding().memory_kind(), device)) {
       throw nb::value_error(
           absl::StrFormat(
               "Memory kind mismatch between PjRtBuffers. Got one buffer with "
-              "memory kind '%s' and another with memory_kind '%s'",
-              first_memory_kind.DebugString(),
-              ifrt_arrays.back()->sharding().memory_kind().DebugString())
+              "memory kind '%v' and another with memory_kind '%v'",
+              first_memory_kind, ifrt_arrays.back()->sharding().memory_kind())
               .c_str());
     }
+  }
+  tsl::RCReference<ifrt::DeviceList> device_list =
+      ifrt::BasicDeviceList::Create(std::move(devices));
+  if (device_set.size() != device_list->size()) {
+    throw nb::value_error(
+        absl::StrFormat(
+            "When making an array from single-device arrays, the input arrays "
+            "must be from distinct devices, but got %v",
+            *device_list)
+            .c_str());
   }
   ifrt::Client* client = ifrt_arrays.front()->client();
 
@@ -186,8 +207,7 @@ tsl::RCReference<ifrt::Array> CreateIfRtArrayFromSingleDeviceShardedPyArrays(
   }
   auto ifrt_array = client->AssembleArrayFromSingleDeviceArrays(
       ifrt::Shape(shape),
-      ifrt::ConcreteSharding::Create(ifrt::DeviceList(std::move(devices)),
-                                     first_memory_kind,
+      ifrt::ConcreteSharding::Create(std::move(device_list), first_memory_kind,
                                      /*shape=*/ifrt::Shape(shape),
                                      /*shard_shapes=*/std::move(shapes)),
       absl::MakeSpan(ifrt_arrays), ifrt::ArrayCopySemantics::kReuseInput);
@@ -232,6 +252,7 @@ struct PyArrayObject {
   PyObject* weakrefs;
   PyObject* dict;
 #endif  // PY_VERSION_HEX < 0x030B0000
+  bool initialized;
   alignas(PyArray::Storage) char array_storage[sizeof(PyArray::Storage)];
 };
 static_assert(std::is_standard_layout<PyArrayObject>::value);
@@ -243,6 +264,8 @@ PyArray::Storage* GetPyArrayStorageFromObject(PyArrayObject* py_array_object) {
 
 extern "C" PyObject* PyArray_tp_new(PyTypeObject* type, PyObject*, PyObject*) {
   PyObject* self = type->tp_alloc(type, 0);
+  auto* obj = reinterpret_cast<PyArrayObject*>(self);
+  obj->initialized = false;
   return self;
 }
 
@@ -251,7 +274,9 @@ extern "C" void PyArray_tp_dealloc(PyObject* self) {
   PyTypeObject* tp = Py_TYPE(self);
   auto* obj = reinterpret_cast<PyArrayObject*>(self);
 
-  GetPyArrayStorageFromObject(obj)->~PyArray_Storage();
+  if (obj->initialized) {
+    GetPyArrayStorageFromObject(obj)->~PyArray_Storage();
+  }
 
   PyObject_ClearWeakRefs(self);
 #if PY_VERSION_HEX < 0x030C0000
@@ -298,8 +323,10 @@ extern "C" int PyArray_tp_clear(PyObject* self) {
 
 template <typename... Args>
 PyArray::Storage* Construct(PyArrayObject* self, Args&&... args) {
-  return new (self->array_storage)
-      PyArray::Storage(std::forward<Args>(args)...);
+  PyArray::Storage* out =
+      new (self->array_storage) PyArray::Storage(std::forward<Args>(args)...);
+  self->initialized = true;
+  return out;
 }
 
 struct ShapedArrayCacheKey {
@@ -355,6 +382,29 @@ nb::object MakeShapedArrayCached(const ShapedArrayCacheKey& key) {
   }
   return **value;
 }
+
+// Grouping key used by BatchedCopyToDeviceWithSharding.
+// Defined outside of the function as required by templatized function
+// `AbslHashValue`.
+struct BatchedCopyToDeviceWithShardingKey {
+  tsl::RCReference<ifrt::DeviceList> src_devices;
+  ifrt::MemoryKind src_memory_kind;
+  tsl::RCReference<ifrt::DeviceList> dst_devices;
+  ifrt::MemoryKind dst_memory_kind;
+
+  bool operator==(const BatchedCopyToDeviceWithShardingKey& other) const {
+    return *src_devices == *other.src_devices &&
+           src_memory_kind == other.src_memory_kind &&
+           *dst_devices == *other.dst_devices &&
+           dst_memory_kind == other.dst_memory_kind;
+  }
+
+  template <typename H>
+  friend H AbslHashValue(H h, const BatchedCopyToDeviceWithShardingKey& key) {
+    return H::combine(std::move(h), key.src_devices, key.src_memory_kind,
+                      key.dst_devices, key.dst_memory_kind);
+  }
+};
 
 }  // namespace
 
@@ -574,7 +624,7 @@ absl::Status PyArray::set_arrays(nb::object obj) {
   py_arrays().clear();
   std::vector<tsl::RCReference<ifrt::Array>> ifrt_arrays;
   ifrt_arrays.reserve(list.size());
-  ifrt::DeviceList::Devices devices;
+  ifrt::BasicDeviceList::Devices devices;
   devices.reserve(list.size());
   std::vector<ifrt::Shape> shapes;
   shapes.reserve(list.size());
@@ -589,7 +639,8 @@ absl::Status PyArray::set_arrays(nb::object obj) {
                                py_array.num_shards());
       }
       ifrt_arrays.push_back(tsl::FormRef(py_array.ifrt_array()));
-      devices.push_back(ifrt_arrays.back()->sharding().devices().front());
+      devices.push_back(
+          ifrt_arrays.back()->sharding().devices()->devices().front());
       shapes.push_back(ifrt_arrays.back()->shape());
     } else {
       return InvalidArgument("Unsupported arg when setting Array._arrays: %s",
@@ -602,19 +653,18 @@ absl::Status PyArray::set_arrays(nb::object obj) {
   // skip canonicalization here once JAX begins to do it for JAX shardings.
   const ifrt::MemoryKind canonical_first_memory_kind =
       ifrt::CanonicalizeMemoryKind(
-          first_memory_kind, ifrt_arrays.front()->sharding().devices().front());
+          first_memory_kind,
+          ifrt_arrays.front()->sharding().devices()->devices().front());
   for (const auto& ifrt_array : ifrt_arrays) {
     if (canonical_first_memory_kind !=
         ifrt::CanonicalizeMemoryKind(
             ifrt_array->sharding().memory_kind(),
-            ifrt_array->sharding().devices().front())) {
+            ifrt_array->sharding().devices()->devices().front())) {
       throw nb::value_error(
           absl::StrFormat(
               "Memory kind mismatch between single-device arrays. Got one "
-              "array "
-              "with memory kind '%s' and another with memory_kind '%s'",
-              first_memory_kind.DebugString(),
-              ifrt_array->sharding().memory_kind().DebugString())
+              "array with memory kind '%v' and another with memory_kind '%v'",
+              first_memory_kind, ifrt_array->sharding().memory_kind())
               .c_str());
     }
   }
@@ -623,10 +673,11 @@ absl::Status PyArray::set_arrays(nb::object obj) {
       auto array,
       py_client()->ifrt_client()->AssembleArrayFromSingleDeviceArrays(
           ifrt::Shape(shape()),
-          ifrt::ConcreteSharding::Create(ifrt::DeviceList(std::move(devices)),
-                                         first_memory_kind,
-                                         /*shape=*/ifrt::Shape(shape()),
-                                         /*shard_shapes=*/std::move(shapes)),
+          ifrt::ConcreteSharding::Create(
+              ifrt::BasicDeviceList::Create(std::move(devices)),
+              first_memory_kind,
+              /*shape=*/ifrt::Shape(shape()),
+              /*shard_shapes=*/std::move(shapes)),
           absl::MakeSpan(ifrt_arrays), ifrt::ArrayCopySemantics::kReuseInput));
   SetIfrtArray(std::move(array));
   return absl::OkStatus();
@@ -838,19 +889,6 @@ absl::StatusOr<nb::object> CudaArrayInterfaceToBuffer(
       PrimitiveType element_type,
       DtypeToPrimitiveType(nb_dtype::from_args(cai["typestr"])));
 
-  // TODO(b/324133505): remove this GOOGLE_CUDA block after JAX OSS migrates
-  // to cuda plugin.
-#ifdef GOOGLE_CUDA
-  if (!device_id.has_value()) {
-    // cannot determine device_id/stream when device pointer is NULL.
-    device_id.emplace(
-        (data_value == 0
-             ? 0
-             : stream_executor::gpu::CreatedContexts::GetDeviceOrdinal(
-                   data_ptr)));
-  }
-#endif  // GOOGLE_CUDA
-
   if (!device_id.has_value()) {
     throw XlaRuntimeError(
         "This operation requires CUDA support from jaxlib or jax cuda plugin.");
@@ -938,7 +976,17 @@ absl::Status PyArray::Delete() {
   }
   py_arrays().clear();
   if (ifrt_array() != nullptr) {
-    TF_RETURN_IF_ERROR(ifrt_array()->Delete().Await());
+    // We do not wait for the deletion to complete here.
+    //
+    // (1) Skipping blocking does not affect the correctness of deletion as long
+    // as the runtime preserves dispatch ordering of deletion w.r.t. other
+    // operations.
+    //
+    // (2) Synchronously waiting for the deletion to complete is very expensive
+    // when the deletion can return a status only after the underlying physical
+    // buffer has been deleted or a request must be processed via RPC,
+    // especially as this deletion is done per array.
+    ifrt_array()->Delete();
     SetIfrtArray(tsl::RCReference<ifrt::Array>());
   }
   return absl::OkStatus();
@@ -953,11 +1001,15 @@ bool PyArray::IsDeleted() const {
 }
 
 PyArray PyArray::Clone() const {
+  auto array = tsl::FormRef(ifrt_array());
+  auto* ifrt_client = py_client()->ifrt_client();
   tsl::RCReference<ifrt::Array> out =
-      ifrt_array()
-          ->Reshard(ifrt_array()->shared_ptr_sharding(),
-                    ifrt::ArrayCopySemantics::kReuseInput)
-          .value();
+      ifrt_client
+          ->CopyArrays(absl::MakeSpan(&array, 1), /*devices=*/std::nullopt,
+                       /*memory_kind=*/std::nullopt,
+                       ifrt::ArrayCopySemantics::kReuseInput)
+          .value()
+          .front();
   return PyArray(aval(), weak_type(), dtype(),
                  std::vector<int64_t>(shape().begin(), shape().end()),
                  sharding(), py_client(), traceback(), std::move(out),
@@ -971,7 +1023,7 @@ nb::handle PyArray::Storage::AsHandle() {
 
 PyArray::Storage::~PyArray_Storage() {
   CHECK(PyGILState_Check());
-  if (py_client->arrays_ == this) {
+  if (py_client && py_client->arrays_ == this) {
     py_client->arrays_ = next;
   }
   if (prev) {
@@ -987,86 +1039,99 @@ PyArray::Storage::~PyArray_Storage() {
   ifrt_array.reset();
 }
 
-absl::StatusOr<PyArray> PyArray::CopyToDeviceWithSharding(
-    ifrt::DeviceList devices, nb::object dst_sharding) {
-  auto* ifrt_array_ptr = ifrt_array();
-  ifrt::MemoryKind dst_memory_kind =
-      CreateIfRtMemoryKindFromSharding(dst_sharding);
-  if (ifrt_array_ptr->sharding().devices().devices() == devices.devices() &&
-      (!dst_memory_kind.memory_kind().has_value() ||
-       !ifrt_array_ptr->sharding().memory_kind().memory_kind().has_value() ||
-       ifrt_array_ptr->sharding().memory_kind() == dst_memory_kind)) {
-    return *this;
+absl::StatusOr<std::vector<PyArray>> PyArray::BatchedCopyToDeviceWithSharding(
+    absl::Span<const PyArray> py_arrays,
+    absl::Span<const tsl::RCReference<ifrt::DeviceList>> dst_device_lists,
+    absl::Span<const nb::object> dst_shardings) {
+  if (py_arrays.empty()) {
+    return std::vector<PyArray>();
   }
-  tsl::RCReference<ifrt::Array> out_array;
-  {
-    auto transfer_guard_formatter = [this, &dst_sharding] {
+
+  TF_RET_CHECK(py_arrays.size() == dst_device_lists.size());
+  TF_RET_CHECK(py_arrays.size() == dst_shardings.size());
+
+  ifrt::Client* const client = py_arrays.front().ifrt_array()->client();
+  std::vector<PyArray> results(py_arrays.size());
+
+  // Arrays to be copied, grouped by source/destination devices and memory
+  // kinds. The grouping is enforced by `ifrt::Client::CopyArrays()`.
+  struct Batch {
+    std::vector<int> indexes;
+    std::vector<tsl::RCReference<ifrt::Array>> ifrt_arrays;
+  };
+  absl::flat_hash_map<BatchedCopyToDeviceWithShardingKey, Batch> batches;
+
+  for (int i = 0; i < py_arrays.size(); ++i) {
+    const auto& py_array = py_arrays[i];
+    const auto& dst_sharding = dst_shardings[i];
+
+    auto* ifrt_array_ptr = py_array.ifrt_array();
+    const tsl::RCReference<ifrt::DeviceList>& src_devices =
+        ifrt_array_ptr->sharding().devices();
+    const tsl::RCReference<ifrt::DeviceList>& dst_devices = dst_device_lists[i];
+
+    ifrt::MemoryKind src_memory_kind =
+        ifrt::CanonicalizeMemoryKind(ifrt_array_ptr->sharding().memory_kind(),
+                                     src_devices->devices().front());
+    ifrt::MemoryKind dst_memory_kind = ifrt::CanonicalizeMemoryKind(
+        CreateIfRtMemoryKindFromSharding(dst_sharding),
+        dst_devices->devices().front());
+
+    if (*src_devices == *dst_devices && src_memory_kind == dst_memory_kind) {
+      results[i] = py_arrays[i];
+      continue;
+    }
+
+    auto transfer_guard_formatter = [&py_array, &dst_sharding] {
       return absl::StrCat(
-          "aval=", nb::cast<std::string_view>(nb::repr(aval())),
-          ", sharding=", nb::cast<std::string_view>(nb::repr(sharding())),
+          "aval=", nb::cast<std::string_view>(nb::repr(py_array.aval())),
+          ", sharding=",
+          nb::cast<std::string_view>(nb::repr(py_array.sharding())),
           ", dst_sharding=",
           nb::cast<std::string_view>(nb::repr(dst_sharding)));
     };
     TF_RETURN_IF_ERROR(
         jax::ApplyTransferGuardToDeviceToDevice(transfer_guard_formatter));
+
+    Batch& batch = batches[BatchedCopyToDeviceWithShardingKey{
+        src_devices, src_memory_kind, dst_devices, dst_memory_kind}];
+    batch.indexes.push_back(i);
+    batch.ifrt_arrays.push_back(tsl::FormRef(ifrt_array_ptr));
+  }
+
+  std::vector<std::pair<int, tsl::RCReference<ifrt::Array>>> ifrt_arrays;
+  {
     GlobalPyRefManager()->CollectGarbage();
     nb::gil_scoped_release gil_release;
-    std::shared_ptr<const ifrt::Sharding> ifrt_sharding;
-    // The sharding conversions are tried in the order of narrowness (e.g.,
-    // ShardingParamSharding is an IFRT-level sharding, whereas HloSharding is
-    // a IFRT-XLA level sharding).
-    if (llvm::isa<ifrt::SingleDeviceSharding>(ifrt_array_ptr->sharding())) {
-      ifrt_sharding =
-          ifrt::SingleDeviceSharding::Create(devices[0], dst_memory_kind);
-    } else if (const auto* in_sharding = llvm::dyn_cast<ifrt::OpaqueSharding>(
-                   &ifrt_array_ptr->sharding());
-               in_sharding != nullptr) {
-      ifrt_sharding =
-          ifrt::OpaqueSharding::Create(std::move(devices), dst_memory_kind);
-    } else if (const auto* in_sharding = llvm::dyn_cast<ifrt::ConcreteSharding>(
-                   &ifrt_array_ptr->sharding());
-               in_sharding != nullptr) {
-      ifrt_sharding = ifrt::ConcreteSharding::Create(
-          std::move(devices), dst_memory_kind, in_sharding->shape(),
-          in_sharding->shard_shapes());
-    } else if (const auto* in_sharding =
-                   llvm::dyn_cast<ifrt::ConcreteEvenSharding>(
-                       &ifrt_array_ptr->sharding());
-               in_sharding != nullptr) {
-      ifrt_sharding = ifrt::ConcreteEvenSharding::Create(
-          std::move(devices), dst_memory_kind, in_sharding->shape(),
-          in_sharding->shard_shape());
-    } else if (const auto* in_sharding =
-                   llvm::dyn_cast<ifrt::ShardingParamSharding>(
-                       &ifrt_array_ptr->sharding());
-               in_sharding != nullptr) {
-      TF_ASSIGN_OR_RETURN(ifrt_sharding,
-                          ifrt::ShardingParamSharding::Create(
-                              in_sharding->sharding_param(), std::move(devices),
-                              dst_memory_kind));
-    } else if (const auto* in_sharding = llvm::dyn_cast<ifrt::HloSharding>(
-                   &ifrt_array_ptr->sharding());
-               in_sharding != nullptr) {
-      ifrt_sharding = ifrt::HloSharding::Create(
-          std::move(devices), dst_memory_kind, in_sharding->xla_hlo_sharding());
-    } else {
-      return InvalidArgument(
-          "resharding only supported for ifrt::SingleDeviceSharding, "
-          "ifrt::OpaqueSharding, ifrt::ConcreteSharding, "
-          "ifrt::ConcreteEvenSharding, ifrt::ShardingParamSharding, and "
-          "ifrt::HloSharding.");
+
+    for (auto& [key, batch] : batches) {
+      TF_ASSIGN_OR_RETURN(
+          auto copied,
+          client->CopyArrays(
+              absl::MakeSpan(batch.ifrt_arrays),
+              // All arrays in `batch` have the same `key.dst_devices` and
+              // `key.dst_memory_kind` due to the grouping above.
+              key.dst_devices, key.dst_memory_kind,
+              ifrt::ArrayCopySemantics::kReuseInput));
+      for (int i = 0; i < batch.indexes.size(); ++i) {
+        ifrt_arrays.push_back(
+            std::make_pair(batch.indexes[i], std::move(copied[i])));
+      }
     }
-    TF_ASSIGN_OR_RETURN(out_array, ifrt_array_ptr->Reshard(
-                                       std::move(ifrt_sharding),
-                                       ifrt::ArrayCopySemantics::kReuseInput));
   }
+
   auto traceback = Traceback::Get();
-  absl::Span<const int64_t> shape_span = shape();
-  return PyArray(aval(), weak_type(), dtype(),
-                 std::vector<int64_t>(shape_span.begin(), shape_span.end()),
-                 dst_sharding, py_client(), std::move(traceback),
-                 std::move(out_array), committed(),
-                 /*skip_checks=*/true, result_status());
+  for (auto& [i, ifrt_array] : ifrt_arrays) {
+    const auto& py_array = py_arrays[i];
+    absl::Span<const int64_t> shape_span = py_array.shape();
+    results[i] =
+        PyArray(py_array.aval(), py_array.weak_type(), py_array.dtype(),
+                std::vector<int64_t>(shape_span.begin(), shape_span.end()),
+                dst_shardings[i], py_array.py_client(), traceback,
+                std::move(ifrt_array), py_array.committed(),
+                /*skip_checks=*/true, py_array.result_status());
+  }
+  return results;
 }
 
 absl::StatusOr<PyArray> PyArray::BatchedDevicePut(
@@ -1105,7 +1170,7 @@ absl::StatusOr<PyArray> PyArray::BatchedDevicePut(
   nb::list owning_pylist;
   std::vector<tsl::RCReference<ifrt::Array>> ifrt_arrays;
 
-  xla::ifrt::DeviceList::Devices devices;
+  xla::ifrt::BasicDeviceList::Devices devices;
   devices.reserve(n_devices);
   std::vector<xla::ifrt::Shape> shapes;
   shapes.reserve(n_devices);
@@ -1140,7 +1205,8 @@ absl::StatusOr<PyArray> PyArray::BatchedDevicePut(
   }
   for (auto& device_put : device_puts) {
     ifrt_arrays.push_back(std::move(device_put.ifrt_array));
-    devices.push_back(ifrt_arrays.back()->sharding().devices().front());
+    devices.push_back(
+        ifrt_arrays.back()->sharding().devices()->devices().front());
     shapes.push_back(ifrt_arrays.back()->shape());
     if (device_put.owning_pybuffer) {
       owning_pylist.append(device_put.owning_pybuffer);
@@ -1158,7 +1224,8 @@ absl::StatusOr<PyArray> PyArray::BatchedDevicePut(
       ifrt_arrays.front()->client()->AssembleArrayFromSingleDeviceArrays(
           ifrt::Shape(shape),
           xla::ifrt::ConcreteSharding::Create(
-              xla::ifrt::DeviceList(std::move(devices)), dst_memory_kind,
+              xla::ifrt::BasicDeviceList::Create(std::move(devices)),
+              dst_memory_kind,
               /*shape=*/ifrt::Shape(shape),
               /*shard_shapes=*/std::move(shapes)),
           absl::MakeSpan(ifrt_arrays),
@@ -1480,8 +1547,8 @@ absl::Status PyHostValue::CopyToHostAsync(
   auto transfer_guard_formatter = [ifrt_array] {
     return absl::StrCat(
         "shape=(", absl::StrJoin(ifrt_array->shape().dims(), ","),
-        "), dtype=", ifrt_array->dtype().DebugString(),
-        ", device=", ifrt_array->sharding().devices().front()->DebugString());
+        "), dtype=", ifrt_array->dtype().DebugString(), ", device=",
+        ifrt_array->sharding().devices()->devices().front()->DebugString());
   };
   TF_RETURN_IF_ERROR(
       jax::ApplyTransferGuardToDeviceToHost(transfer_guard_formatter));
@@ -1668,16 +1735,23 @@ absl::Status PyArray::RegisterTypes(nb::module_& m) {
   type.attr("clone") = nb::cpp_function(&PyArray::Clone, nb::is_method());
   type.attr("__module__") = m.attr("__name__");
 
-  m.attr("copy_array_to_devices_with_sharding") = nb::cpp_function(
-      [](PyArray self, absl::Span<const PyDevice* const> dst_devices,
-         nb::object sharding) {
-        ifrt::DeviceList::Devices devices;
-        devices.reserve(dst_devices.size());
-        for (auto& d : dst_devices) {
-          devices.push_back(d->device());
+  m.attr("batched_copy_array_to_devices_with_sharding") = nb::cpp_function(
+      [](absl::Span<const PyArray> arrays,
+         absl::Span<const std::vector<const PyDevice*>> dst_device_lists,
+         absl::Span<const nb::object> shardings) {
+        std::vector<tsl::RCReference<ifrt::DeviceList>> device_lists;
+        device_lists.reserve(dst_device_lists.size());
+        for (const auto& dst_devices : dst_device_lists) {
+          ifrt::BasicDeviceList::Devices devices;
+          devices.reserve(dst_devices.size());
+          for (auto& d : dst_devices) {
+            devices.push_back(d->device());
+          }
+          device_lists.push_back(
+              ifrt::BasicDeviceList::Create(std::move(devices)));
         }
-        return xla::ValueOrThrow(self.CopyToDeviceWithSharding(
-            ifrt::DeviceList(devices), std::move(sharding)));
+        return xla::ValueOrThrow(PyArray::BatchedCopyToDeviceWithSharding(
+            arrays, device_lists, shardings));
       });
   m.attr("array_result_handler") = nb::cpp_function(
       [](nb::object aval, nb::object sharding, bool committed,

@@ -26,6 +26,12 @@ limitations under the License.
 
 namespace xla::gpu {
 
+struct ExecutionStreamAssignmentOptions {
+  // The `ExecutionStreamAssignment` will round-robin across this many
+  // `ExecutionStreams`.
+  int number_of_execution_streams = 4;
+};
+
 // `ExecutionStreamAssignments` represent a mapping from `HloInstructions` to
 // `ExecutionStreamIds`. Asynchronous calls (`async-start`, `async-update`, and
 // `async-done`) result in the target computations being assigned new
@@ -37,17 +43,19 @@ class ExecutionStreamAssignment {
   // pass the module through the `FlattenCallGraph` pass.
   //
   // The ExecutionStreamAssignment does not take ownership of the `HloModule`.
-  explicit ExecutionStreamAssignment(const HloModule* module);
+  explicit ExecutionStreamAssignment(
+      const HloModule* module, ExecutionStreamAssignmentOptions options = {});
 
   // Returns the `ExecutionStreamId` for the given instruction, which *must* be
-  // synchronous. Returns an error if the instruction is not reachable
-  // from the module's entrypoint.
+  // synchronous. Returns an error if the instruction is either not reachable
+  // from the module's entrypoint, or is only reachable through embedded calls.
   absl::StatusOr<ExecutionStreamId> GetSyncExecutionStreamId(
       const HloInstruction* instruction) const;
 
   // Returns the source and destination `ExecutionStreamIds` for the given
   // instruction, which *must* be asynchronous. Returns an error if the
-  // instruction is not reachable from the module's entrypoint.
+  // instruction is either not reachable from the module's entrypoint, or is
+  // only reachable through embedded calls.
   struct AsyncExecutionStreamIds {
     // The `ExecutionStreamId` for the calling instruction (e.g. the computation
     // that invokes `async-start`).
@@ -57,12 +65,12 @@ class ExecutionStreamAssignment {
     ExecutionStreamId destination_stream_id;
   };
   absl::StatusOr<AsyncExecutionStreamIds> GetAsyncExecutionStreamIds(
-      const HloAsyncInstruction* instruction) const;
+      const HloInstruction* instruction) const;
 
  private:
   // Maps from `HloInstructions` to `ExecutionStreamIds` for synchronous and
-  // asynchronous instructions, respectively. Instructions that are not
-  // reachable from the module's entrypoint will not be present.
+  // asynchronous instructions, respectively. All instructions reachable through
+  // non-embedded calls must be present.
   absl::flat_hash_map<HloInstruction*, ExecutionStreamId> sync_instructions_;
   absl::flat_hash_map<HloInstruction*, AsyncExecutionStreamIds>
       async_instructions_;

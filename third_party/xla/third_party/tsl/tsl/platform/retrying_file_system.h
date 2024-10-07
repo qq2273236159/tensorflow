@@ -151,6 +151,12 @@ class RetryingFileSystem : public FileSystem {
     return base_file_system_->HasAtomicMove(path, has_atomic_move);
   }
 
+  absl::Status CanCreateTempFile(const std::string& fname,
+                                 bool* can_create_temp_file) override {
+    // this method does not need to be retried
+    return base_file_system_->CanCreateTempFile(fname, can_create_temp_file);
+  }
+
   absl::Status DeleteRecursively(const string& dirname, TransactionToken* token,
                                  int64_t* undeleted_files,
                                  int64_t* undeleted_dirs) override {
@@ -184,11 +190,11 @@ class RetryingRandomAccessFile : public RandomAccessFile {
                            const RetryConfig& retry_config)
       : base_file_(std::move(base_file)), retry_config_(retry_config) {}
 
-  absl::Status Name(StringPiece* result) const override {
+  absl::Status Name(absl::string_view* result) const override {
     return base_file_->Name(result);
   }
 
-  absl::Status Read(uint64 offset, size_t n, StringPiece* result,
+  absl::Status Read(uint64 offset, size_t n, absl::string_view* result,
                     char* scratch) const override {
     return RetryingUtils::CallWithRetries(
         [this, offset, n, result, scratch]() {
@@ -213,7 +219,7 @@ class RetryingWritableFile : public WritableFile {
     Close().IgnoreError();
   }
 
-  absl::Status Append(StringPiece data) override {
+  absl::Status Append(absl::string_view data) override {
     return RetryingUtils::CallWithRetries(
         [this, &data]() { return base_file_->Append(data); }, retry_config_);
   }
@@ -225,7 +231,7 @@ class RetryingWritableFile : public WritableFile {
     return RetryingUtils::CallWithRetries(
         [this]() { return base_file_->Flush(); }, retry_config_);
   }
-  absl::Status Name(StringPiece* result) const override {
+  absl::Status Name(absl::string_view* result) const override {
     return base_file_->Name(result);
   }
   absl::Status Sync() override {

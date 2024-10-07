@@ -25,15 +25,17 @@ limitations under the License.
 #include "tensorflow/compiler/mlir/tfrt/translate/tfrt_compile_options.h"
 #include "xla/python/ifrt/client.h"
 #include "xla/python/ifrt/test_util.h"
+#include "xla/tsl/framework/test_util/mock_serving_device_selector.h"
+#include "xla/tsl/lib/core/status_test_util.h"
 #include "tensorflow/core/framework/tensor.h"
 #include "tensorflow/core/platform/resource_loader.h"
+#include "tensorflow/core/tfrt/ifrt/checkpoint_loader.h"
 #include "tensorflow/core/tfrt/ifrt/ifrt_model_context.h"
+#include "tensorflow/core/tfrt/ifrt/ifrt_model_restore_context.h"
 #include "tensorflow/core/tfrt/ifrt/ifrt_serving_core_selector.h"
 #include "tensorflow/core/tfrt/runtime/runtime.h"
 #include "tensorflow/core/tfrt/saved_model/saved_model.h"
 #include "tensorflow/core/tfrt/saved_model/saved_model_testutil.h"
-#include "tsl/framework/test_util/mock_serving_device_selector.h"
-#include "tsl/lib/core/status_test_util.h"
 #include "tsl/platform/env.h"
 #include "tsl/platform/statusor.h"
 #include "tsl/platform/threadpool.h"
@@ -66,7 +68,8 @@ TEST(SavedModelIfrt, Basic) {
       /*num_threads=*/4, /*num_blocking_threads=*/4);
 
   tsl::test_util::MockServingDeviceSelector selector;
-  ifrt_serving::IfrtServingCoreSelector core_selector(&selector);
+  ifrt_serving::IfrtServingCoreSelector core_selector(
+      &selector, client->addressable_device_count());
 
   // Use IFRT compiler
   runtime->AddCreateRuntimeResourceFn(
@@ -76,10 +79,17 @@ TEST(SavedModelIfrt, Basic) {
                 "IfrtModelContext", client, &core_selector, &GetThreadPool(),
                 /*compilation_environment_proto=*/nullptr);
 
-        (*model_context.resource_context()
-              .GetResource<tensorflow::ifrt_serving::IfrtModelContext>(
-                  "IfrtModelContext"))
-            ->set_checkpoint_loader_queue(work_queue.get());
+        tensorflow::ifrt_serving::IfrtModelContext* ifrt_model_context =
+            (*model_context.resource_context()
+                  .GetResource<tensorflow::ifrt_serving::IfrtModelContext>(
+                      "IfrtModelContext"));
+        ifrt_model_context->set_checkpoint_loader_queue(work_queue.get());
+        model_context.resource_context()
+            .CreateResource<tensorflow::ifrt_serving::IfrtModelRestoreContext>(
+                ifrt_serving::kIfrtModelRestoreContextName,
+                std::make_unique<tensorflow::ifrt_serving::CheckpointLoader>(
+                    &ifrt_model_context->GetRestoreTensorRegistry(),
+                    ifrt_model_context->checkpoint_loader_queue()));
 
         return absl::OkStatus();
       });

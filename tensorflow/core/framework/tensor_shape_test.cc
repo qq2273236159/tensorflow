@@ -18,6 +18,7 @@ limitations under the License.
 #include <cstdint>
 #include <limits>
 
+#include "xla/tsl/lib/core/status_test_util.h"
 #include "tensorflow/core/framework/tensor_shape.pb.h"
 #include "tensorflow/core/lib/core/status_test_util.h"
 #include "tensorflow/core/lib/random/simple_philox.h"
@@ -28,7 +29,6 @@ limitations under the License.
 #include "tensorflow/core/platform/test.h"
 #include "tensorflow/core/platform/test_benchmark.h"
 #include "tensorflow/core/protobuf/error_codes.pb.h"
-#include "tsl/lib/core/status_test_util.h"
 
 namespace tensorflow {
 class TensorShapeTestHelper {
@@ -629,7 +629,7 @@ class TensorShapeOld {
 
   // TODO(josh11b): Maybe use something from the Eigen Tensor library
   // for the sizes.
-  gtl::InlinedVector<int64_t, 4> dim_sizes_;
+  absl::InlinedVector<int64_t, 4UL> dim_sizes_;
 
   // total number of elements (avoids recomputing it each time).
   int64_t num_elements_;

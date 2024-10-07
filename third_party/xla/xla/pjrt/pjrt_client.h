@@ -31,13 +31,17 @@ limitations under the License.
 #include "absl/container/flat_hash_map.h"
 #include "absl/container/inlined_vector.h"
 #include "absl/functional/any_invocable.h"
+#include "absl/log/check.h"
+#include "absl/log/log.h"
+#include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
 #include "absl/synchronization/mutex.h"
 #include "absl/synchronization/notification.h"
 #include "absl/types/span.h"
-#include "mlir/IR/BuiltinOps.h"  // from @llvm-project
-#include "xla/client/xla_computation.h"
+#include "mlir/IR/BuiltinOps.h"
+#include "xla/hlo/builder/xla_computation.h"
 #include "xla/layout.h"
 #include "xla/literal.h"
 #include "xla/pjrt/pjrt_common.h"
@@ -50,12 +54,11 @@ limitations under the License.
 #include "xla/service/hlo_cost_analysis.h"
 #include "xla/shape.h"
 #include "xla/shape_util.h"
-#include "xla/status.h"
-#include "xla/statusor.h"
+#include "xla/tsl/framework/allocator.h"
 #include "xla/util.h"
 #include "xla/xla_data.pb.h"
-#include "tsl/framework/allocator.h"
 #include "tsl/platform/errors.h"
+#include "tsl/platform/statusor.h"
 
 // API notes:
 // PjRt stands for "Pretty much Just another RunTime".
@@ -150,12 +153,13 @@ class PjRtDevice {
   virtual PjRtLocalDeviceId local_device_id() const {
     // By default, local_device_id is the same as local_hardware_id when there
     // is only one PJRT device on a physical device.
-    return PjRtLocalDeviceId(local_hardware_id_typed().value());
+    return PjRtLocalDeviceId(local_hardware_id().value());
   }
 
-  // TODO(b/314368788): Remove `int local_hardware_id()` and rename this
-  // function to `local_hardware_id()`.
-  virtual PjRtLocalHardwareId local_hardware_id_typed() const = 0;
+  // Opaque hardware ID, e.g., the CUDA device number, useful for identifying
+  // which GPU when interacting with non-JAX code. In general, not guaranteed to
+  // be dense, and -1 if undefined.
+  virtual PjRtLocalHardwareId local_hardware_id() const = 0;
 
   // The index of the process that this device belongs to, i.e. is addressable
   // from. This is not always identical to PjRtClient::process_index() in a
@@ -163,14 +167,6 @@ class PjRtDevice {
   // processes, but only a subset of them are addressable and have the same
   // process_index as the client.
   virtual int process_index() const { return description().process_index(); }
-
-  // Opaque hardware ID, e.g., the CUDA device number, useful for identifying
-  // which GPU when interacting with non-JAX code. In general, not guaranteed to
-  // be dense, and -1 if undefined.
-  ABSL_DEPRECATED("Use local_hardware_id_typed() instead")
-  virtual int local_hardware_id() const {
-    return local_hardware_id_typed().value();
-  }
 
   // A vendor-dependent string that uniquely identifies the kind of device,
   // e.g., "Tesla V100-SXM2-16GB". May be used to determine whether two GPUs are
@@ -290,7 +286,7 @@ struct PjRtCrossHostRecvDescriptors {
 // hang indefinitely.
 using PjRtCrossHostSendCancelNotifier = std::function<void(
     absl::string_view serialized_descriptor, absl::Status reason,
-    std::function<void(Status)> on_canceled)>;
+    std::function<void(absl::Status)> on_canceled)>;
 // State asynchronously returned by MakeCrossHostReceiveBuffers. "descriptors"
 // will match the returned PjRtBuffer objects 1:1. Specifically, each PjRtBuffer
 // returned by MakeCrossHostReceiveBuffers will have one
@@ -300,7 +296,7 @@ struct PjRtCrossHostRecvState {
   PjRtCrossHostSendCancelNotifier cancel_notifier;
 };
 using PjRtCrossHostRecvNotifier =
-    std::function<void(StatusOr<PjRtCrossHostRecvState>)>;
+    std::function<void(absl::StatusOr<PjRtCrossHostRecvState>)>;
 
 // A sized chunk of host data. The host data can be either in host layout or in
 // device layout, and it can be one part of the entire buffer. The PjRt
@@ -498,6 +494,11 @@ struct PjRtPluginAttributes {
 // will eventually be able to make progress.
 class PjRtClient {
  public:
+  struct ShapeSpec {
+    PrimitiveType element_type;
+    DimensionVector dims;
+  };
+
   PjRtClient() = default;
   explicit PjRtClient(std::unique_ptr<PjRtHostMemoryForDeviceManager>
                           host_memory_for_device_manager)
@@ -531,12 +532,7 @@ class PjRtClient {
       PjRtGlobalDeviceId global_device_id) const = 0;
 
   // Return an addressable PjRtDevice for a given
-  // PjRtDevice::local_hardware_id().
-  ABSL_DEPRECATED("Use LookupAddressableDevice(PjRtLocalDeviceId) instead")
-  virtual absl::StatusOr<PjRtDevice*> LookupAddressableDevice(
-      int local_hardware_id) const {
-    return LookupAddressableDevice(PjRtLocalDeviceId(local_hardware_id));
-  }
+  // PjRtDevice::local_device_id().
   virtual absl::StatusOr<PjRtDevice*> LookupAddressableDevice(
       PjRtLocalDeviceId local_device_id) const = 0;
 
@@ -649,7 +645,8 @@ class PjRtClient {
 
   // Creates buffer in the given device that carries an error future without
   // allocating memory.
-  ABSL_DEPRECATED("Use CreateErrorBuffer(Status, Shape, PjRtMemorySpace*)")
+  ABSL_DEPRECATED(
+      "Use CreateErrorBuffer(absl::Status, Shape, PjRtMemorySpace*)")
   virtual absl::StatusOr<std::unique_ptr<PjRtBuffer>> CreateErrorBuffer(
       absl::Status error, const Shape& shape, PjRtDevice* device) {
     auto default_memory_space = device->default_memory_space();
@@ -678,12 +675,18 @@ class PjRtClient {
   // buffers' definition events will automatically become ready, unblocking
   // downstream consumers of the buffers.
   //
-  // A single call to CreateBuffersForAsyncHostToDevice creates a "batch" of
-  // buffers that share a single definition event, which may amortize some
-  // performance overheads, but means that none of the buffers are available to
-  // downstream consumers until all the transfers have completed. Multiple calls
-  // to CreateBuffersForAsyncHostToDevice should be made if it is desirable for
-  // buffers to become available as soon as transfers into them complete.
+  // Depending on the backend's implementation, a single call to
+  // CreateBuffersForAsyncHostToDevice may either:
+  //   - Create a "batch" of buffers that share a single definition event, which
+  //   may amortize some performance overheads, but means that none of the
+  //   buffers are available to downstream consumers until all the transfers
+  //   have completed, in which case multiple calls to
+  //   CreateBuffersForAsyncHostToDevice should be made if it is desirable for
+  //   buffers to become available as soon as transfers into them complete.
+  //
+  //   - Create a "batch" of buffers with multiple underlying definitions
+  //   events, and individual buffers become available to downstream consumers
+  //   as soon as transfers into them complete.
 
   // Helper class to all clients to asynchronously transfer data into buffers
   // that are created uninitialized, see comments immediately above.
@@ -754,6 +757,32 @@ class PjRtClient {
     using TransferMetadata = absl::flat_hash_map<std::string, std::string>;
     virtual void AddTransferMetadata(const TransferMetadata& metadata) = 0;
   };
+
+  // Returns a manager for async transfers into a set of buffers with on-host
+  // shapes defined by 'shape_specs' and optional `device_layouts`. The
+  // `device_layout` is used when non-compact layouts are preferred.
+  virtual absl::StatusOr<std::unique_ptr<AsyncHostToDeviceTransferManager>>
+  CreateBuffersForAsyncHostToDevice(
+      absl::Span<const ShapeSpec> shape_specs,
+      std::optional<absl::Span<const Layout>> device_layouts,
+      PjRtDevice* device) {
+    return absl::UnimplementedError(absl::StrCat(
+        "CreateBuffersForAsyncHostToDevice with ShapeSpec and Layout is "
+        "not implemented on platform: ",
+        platform_name()));
+  }
+
+  // Variant of CreateBuffersForAsyncHostToDevice with PjRtMemorySpace.
+  virtual absl::StatusOr<std::unique_ptr<AsyncHostToDeviceTransferManager>>
+  CreateBuffersForAsyncHostToDevice(
+      absl::Span<const ShapeSpec> shape_specs,
+      std::optional<absl::Span<const Layout>> device_layouts,
+      PjRtMemorySpace* memory_space) {
+    return absl::UnimplementedError(absl::StrCat(
+        "CreateBuffersForAsyncHostToDevice with ShapeSpec and Layout is "
+        "not implemented on platform: ",
+        platform_name()));
+  }
 
   // Returns a manager for async transfers into a set of buffers with on-host
   // shapes 'shapes'.
@@ -895,6 +924,19 @@ class PjRtClient {
   virtual absl::StatusOr<std::unique_ptr<PjRtBuffer>> BufferFromHostLiteral(
       const LiteralSlice& literal, PjRtDevice* device) = 0;
 
+  virtual absl::StatusOr<std::unique_ptr<PjRtBuffer>> BufferFromHostLiteral(
+      const LiteralSlice& literal, PjRtDevice* device,
+      const Layout* device_layout) {
+    if (device_layout) {
+      return absl::UnimplementedError(absl::StrCat(
+          "BufferFromHostLiteral with device_layout is not implemented on "
+          "platform: ",
+          platform_name()));
+    }
+
+    return this->BufferFromHostLiteral(literal, device);
+  }
+
   // TODO(b/277820585): remove BufferFromHostLiteral with PjRtDevice after the
   // migration is done.
   virtual absl::StatusOr<std::unique_ptr<PjRtBuffer>> BufferFromHostLiteral(
@@ -903,6 +945,18 @@ class PjRtClient {
         "BufferFromHostLiteral with PjRtMemorySpace is not implemented on "
         "platform: ",
         platform_name());
+  }
+
+  virtual absl::StatusOr<std::unique_ptr<PjRtBuffer>> BufferFromHostLiteral(
+      const LiteralSlice& literal, PjRtMemorySpace* memory_space,
+      const Layout* device_layout) {
+    if (device_layout) {
+      return absl::UnimplementedError(absl::StrCat(
+          "BufferFromHostLiteral with device_layout is not implemented on "
+          "platform: ",
+          platform_name()));
+    }
+    return this->BufferFromHostLiteral(literal, memory_space);
   }
 
   // Creates a PjRtBuffer that is a non-owned view of an on-device
@@ -987,7 +1041,6 @@ class PjRtClient {
   // Create ChannelHandles for XLA send/recv.
   virtual absl::StatusOr<ChannelHandle> CreateChannelHandle() = 0;
   virtual absl::StatusOr<ChannelHandle> CreateDeviceToHostChannelHandle() = 0;
-  virtual absl::StatusOr<ChannelHandle> CreateHostToDeviceChannelHandle() = 0;
 
   // TODO(zhangqiaorjc): Experimental API to be removed.
   // Defragment device memory.

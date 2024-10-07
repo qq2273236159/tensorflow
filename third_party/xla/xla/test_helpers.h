@@ -16,8 +16,8 @@ limitations under the License.
 #ifndef XLA_TEST_HELPERS_H_
 #define XLA_TEST_HELPERS_H_
 
-#include "xla/status.h"
-#include "xla/statusor.h"
+#include "absl/status/status.h"
+#include "absl/status/statusor.h"
 #include "tsl/platform/test.h"
 
 // This module contains a minimal subset of gmock functionality just

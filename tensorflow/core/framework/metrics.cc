@@ -22,12 +22,12 @@ limitations under the License.
 
 #include "absl/container/flat_hash_map.h"
 #include "absl/strings/str_cat.h"
+#include "xla/tsl/lib/monitoring/counter.h"
+#include "xla/tsl/lib/monitoring/gauge.h"
+#include "xla/tsl/lib/monitoring/sampler.h"
+#include "xla/tsl/protobuf/error_codes.pb.h"
 #include "tensorflow/core/protobuf/data_service.pb.h"
-#include "tsl/lib/monitoring/counter.h"
-#include "tsl/lib/monitoring/gauge.h"
-#include "tsl/lib/monitoring/sampler.h"
 #include "tsl/platform/types.h"
-#include "tsl/protobuf/error_codes.pb.h"
 
 namespace tensorflow {
 namespace metrics {
@@ -444,7 +444,7 @@ auto* eager_client_error_counter = tsl::monitoring::Counter<2>::New(
     "error_type");
 
 auto* mlir_bridge_first_phase_counter = tsl::monitoring::Counter<5>::New(
-    "/tensorflow/core/tf_mlir_bridge_first_phase_count",
+    "/tensorflow/core/tf_mlir_bridge_first_phase_v2_count",
     "Tracks processing state in first phase of mlir bridge", "bridge",
     "version", "device", "fallback", "result");
 

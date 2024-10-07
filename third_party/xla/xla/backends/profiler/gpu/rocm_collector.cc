@@ -24,6 +24,11 @@ limitations under the License.
 #include "absl/strings/str_join.h"
 #include "absl/types/optional.h"
 #include "xla/stream_executor/rocm/roctracer_wrapper.h"
+#include "xla/tsl/profiler/backends/cpu/annotation_stack.h"
+#include "xla/tsl/profiler/utils/parse_annotation.h"
+#include "xla/tsl/profiler/utils/xplane_builder.h"
+#include "xla/tsl/profiler/utils/xplane_schema.h"
+#include "xla/tsl/profiler/utils/xplane_utils.h"
 #include "xla/tsl/util/env_var.h"
 #include "tsl/platform/abi.h"
 #include "tsl/platform/env_time.h"
@@ -33,13 +38,8 @@ limitations under the License.
 #include "tsl/platform/status.h"
 #include "tsl/platform/thread_annotations.h"
 #include "tsl/platform/types.h"
-#include "tsl/profiler/backends/cpu/annotation_stack.h"
 #include "tsl/profiler/lib/profiler_factory.h"
 #include "tsl/profiler/lib/profiler_interface.h"
-#include "tsl/profiler/utils/parse_annotation.h"
-#include "tsl/profiler/utils/xplane_builder.h"
-#include "tsl/profiler/utils/xplane_schema.h"
-#include "tsl/profiler/utils/xplane_utils.h"
 
 namespace xla {
 namespace profiler {
@@ -146,8 +146,10 @@ static void DumpRocmTracerEvent(const RocmTracerEvent& event,
     case RocmTracerEventType::MemoryAlloc:
       oss << ",num_bytes=" << event.memalloc_info.num_bytes;
       break;
+    case RocmTracerEventType::MemcpyOther:
+    case RocmTracerEventType::MemoryFree:
+    case RocmTracerEventType::Memset:
     case RocmTracerEventType::Synchronization:
-      break;
     case RocmTracerEventType::Generic:
       break;
     default:
@@ -613,7 +615,8 @@ class RocmTraceCollectorImpl : public profiler::RocmTraceCollector {
   absl::flat_hash_map<uint32_t, RocmTracerEvent> auxiliary_api_events_map_
       TF_GUARDED_BY(event_maps_mutex_);
 
-  const std::vector<RocmTracerEvent> ApiActivityInfoExchange();
+  const std::vector<RocmTracerEvent> ApiActivityInfoExchange()
+      TF_EXCLUSIVE_LOCKS_REQUIRED(event_maps_mutex_);
 
   absl::node_hash_map<uint32_t, PerDeviceCollector> per_device_collector_;
 };
@@ -730,7 +733,6 @@ RocmTraceCollectorImpl::ApiActivityInfoExchange() {
   std::vector<RocmTracerEvent> aggregated_events;
 
   // Copy info from activity events to API callback events
-  mutex_lock lock{event_maps_mutex_};
   for (auto& api_iter : api_events_map_) {
     RocmTracerEvent& api_event = api_iter.second;
     auto activity_event =

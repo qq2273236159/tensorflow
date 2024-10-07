@@ -1,10 +1,19 @@
 load("@bazel_skylib//:bzl_library.bzl", "bzl_library")
 load("@bazel_skylib//lib:selects.bzl", "selects")
 load("@bazel_skylib//rules:common_settings.bzl", "bool_flag", "bool_setting")
-load("tsl.bzl", "if_google", "if_oss")
-load("tsl.default.bzl", "tsl_google_bzl_deps")
+load("@local_tsl//tsl/platform:rules_cc.bzl", "cc_library")
+load("//xla/tsl:package_groups.bzl", "tsl_package_groups")
+load("//xla/tsl:tsl.bzl", "if_google", "if_oss", "internal_visibility")
+load(
+    "//xla/tsl:tsl.default.bzl",
+    "tsl_extra_config_settings",
+    "tsl_extra_config_settings_targets",
+    "tsl_google_bzl_deps",
+)
 
 # copybara:uncomment package(default_applicable_licenses = ["//tensorflow:license"])
+
+tsl_package_groups()
 
 # Config setting to use in select()s to distinguish open source build from
 # google internal build on configurable attributes.
@@ -30,7 +39,7 @@ alias(
     name = "is_cuda_enabled",
     actual = if_oss(
         "@local_config_cuda//:is_cuda_enabled",
-        "@local_config_cuda//cuda:using_clang",
+        "@local_config_cuda//cuda:using_config_cuda",
     ),
     visibility = ["//visibility:public"],
 )
@@ -42,6 +51,24 @@ selects.config_setting_group(
         ":oss",
     ],
     visibility = ["//visibility:public"],
+)
+
+# Config setting that is satisfied when CUDA device code should be compiled
+# with nvcc. It does not imply that CUDA support has been enabled.
+alias(
+    name = "is_cuda_compiler_nvcc",
+    actual = if_oss(
+        "@local_config_cuda//:is_cuda_compiler_nvcc",
+        "@local_config_cuda//cuda:FALSE",
+    ),
+)
+
+selects.config_setting_group(
+    name = "is_cuda_nvcc",
+    match_all = [
+        ":is_cuda_enabled",
+        ":is_cuda_compiler_nvcc",
+    ],
 )
 
 # Crosses between framework_shared_object and a bunch of other configurations
@@ -429,6 +456,8 @@ config_setting(
     visibility = ["//visibility:public"],
 )
 
+tsl_extra_config_settings()
+
 selects.config_setting_group(
     name = "arm_any",
     match_any = [
@@ -438,7 +467,7 @@ selects.config_setting_group(
         ":arm64-v8a",
         ":linux_aarch64",
         ":linux_armhf",
-    ],
+    ] + tsl_extra_config_settings_targets(),
     visibility = ["//visibility:public"],
 )
 
@@ -489,42 +518,21 @@ config_setting(
 )
 
 config_setting(
-    name = "no_nccl_support",
+    name = "using_no_nccl_support_define",
     define_values = dict(
-        if_google({"GOOGLE_CUDA_COMPILER": "clang"}),
         no_nccl_support = "true",
     ),
-    visibility = ["//visibility:public"],
+    visibility = internal_visibility(["//visibility:private"]),
 )
 
-# DO NOT ADD ANY NEW EXCEPTIONS TO THIS LIST!
-# Instead, please use public APIs or public build rules TF provides.
-# If you need functionality that is not exposed, we will work with you to expand our public APIs.
-# TODO(b/173549186): Move Google-internal TF code out of learning/brain
-# TODO(jakeharmon): Prune this for use in TSL
-package_group(
-    name = "internal",
-    packages = [
-        "//devtools/python/indexer/...",
-        "//learning/brain/keras/...",
-        "//learning/brain/mlir/...",
-        "//learning/brain/tfrt/...",
-        "//learning/lib/ami/simple_ml/...",
-        "//learning/pathways/...",
-        "//smartass/brain/configure/...",
-        "//tensorflow/...",
-        "//tensorflow_decision_forests/...",
-        "//tensorflow_federated/...",
-        "//third_party/cloud_tpu/convergence_tools/sdc_monitoring/...",
-        "//third_party/cloud_tpu/inference_converter/...",
-        "//third_party/py/cloud_ml_autoflow/...",
-        "//third_party/py/envlogger/...",
-        "//third_party/yggdrasil_decision_forests/...",
+selects.config_setting_group(
+    name = "no_nccl_support",
+    match_all = [
+        ":using_no_nccl_support_define",
     ] + if_google([
-        # Needed in OSS, where bazel won't allow a package group to refer to an
-        # external repo.
-        "@local_tsl//tsl/...",
+        "@local_config_cuda//cuda:using_config_cuda",
     ]),
+    visibility = ["//visibility:public"],
 )
 
 bzl_library(
@@ -538,14 +546,13 @@ bzl_library(
         "@local_config_cuda//cuda:build_defs_bzl",
         "@local_config_rocm//rocm:build_defs_bzl",
         "@local_config_tensorrt//:build_defs_bzl",
-        "@local_tsl//third_party/mkl_dnn:build_defs_bzl",
         "@local_tsl//tsl/platform:rules_cc_bzl",
     ],
 )
 
 bzl_library(
     name = "tsl_google_bzl",
-    srcs = if_google(["tsl.default.bzl"]),
+    srcs = if_google(["tsl.google.bzl"]),
     visibility = ["//visibility:public"],
     deps = [
         ":tsl_bzl",
@@ -562,3 +569,29 @@ cc_library(
     }),
 )
 # copybara:comment_end
+
+cc_library(
+    name = "empty",
+    visibility = ["//visibility:public"],
+)
+
+# Needed to workaround https://github.com/bazelbuild/bazel/issues/21519
+alias(
+    name = "bazel_issue_21519",
+    actual = ":empty",
+    visibility = ["//visibility:public"],
+)
+
+# Flag indicating if the target requires pre-built wheel.
+# TODO(ybaturina): move to tsl repository.
+bool_flag(
+    name = "wheel_dependency",
+    build_setting_default = False,
+)
+
+config_setting(
+    name = "enable_wheel_dependency",
+    flag_values = {
+        ":wheel_dependency": "True",
+    },
+)

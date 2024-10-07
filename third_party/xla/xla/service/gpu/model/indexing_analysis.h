@@ -18,7 +18,6 @@ limitations under the License.
 #define XLA_SERVICE_GPU_MODEL_INDEXING_ANALYSIS_H_
 
 #include <cstdint>
-#include <functional>
 #include <ostream>
 #include <string>
 #include <vector>
@@ -27,13 +26,11 @@ limitations under the License.
 #include "absl/container/flat_hash_set.h"
 #include "absl/types/span.h"
 #include "llvm/ADT/SmallVector.h"
-#include "mlir/IR/AffineExpr.h"  // from @llvm-project
-#include "mlir/IR/AffineMap.h"  // from @llvm-project
-#include "mlir/IR/MLIRContext.h"  // from @llvm-project
+#include "mlir/IR/AffineExpr.h"
+#include "mlir/IR/AffineMap.h"
+#include "mlir/IR/MLIRContext.h"
 #include "xla/hlo/ir/hlo_instruction.h"
-#include "xla/service/gpu/fusions/tiling_util.h"
 #include "xla/service/gpu/hlo_traversal.h"
-#include "xla/service/gpu/model/affine_map_printer.h"
 #include "xla/service/gpu/model/indexing_map.h"
 #include "xla/shape.h"
 
@@ -45,9 +42,7 @@ using IndexingMapSet = absl::flat_hash_set<IndexingMap>;
 // Contains indexing maps for all N-dimensional tensor input operands that
 // correspond to a particular output.
 struct HloInstructionIndexing {
-  std::string ToString(
-      const AffineMapPrinter& printer = AffineMapPrinter()) const;
-  void Print(std::ostream& out, const AffineMapPrinter& printer) const;
+  std::string ToString() const;
 
   // Returns true if the indexing was simplified.
   bool Simplify();
@@ -63,8 +58,6 @@ struct HloInstructionIndexing {
 };
 std::ostream& operator<<(std::ostream& out,
                          const HloInstructionIndexing& instr_indexing);
-
-std::string ToString(const mlir::AffineMap& affine_map);
 
 // Computes indexing maps for all input operands necessary to compute an element
 // of the `output_id` instruction output.
@@ -133,6 +126,12 @@ bool FuseProducerConsumerOutputToInputIndexing(
 // to output_shape.
 IndexingMap GetBitcastMap(const Shape& input_shape, const Shape& output_shape,
                           mlir::MLIRContext* mlir_context);
+IndexingMap GetBitcastMap(absl::Span<const int64_t> input_shape,
+                          const Shape& output_shape,
+                          mlir::MLIRContext* mlir_context);
+IndexingMap GetBitcastMap(absl::Span<const int64_t> input_shape,
+                          absl::Span<const int64_t> output_shape,
+                          mlir::MLIRContext* mlir_context);
 
 // Creates an indexing map from the physical layout of the tensor to its logical
 // layout.
@@ -143,27 +142,6 @@ IndexingMap GetIndexingMapFromPhysicalLayoutToLogical(
 // layout.
 IndexingMap GetIndexingMapFromLogicalToPhysicalLayout(
     const Shape& shape, mlir::MLIRContext* mlir_context);
-
-// Creates an indexing map from thread and block IDs to elements of the tiled
-// shape. Uses the same convention as KernelFusionInterface: dimensions 0 to 2
-// are thread indices (currently only 0 is used), dimensions 3 to 5 are block
-// indices (currently only 3 is used).
-mlir::AffineMap GetBlockOffsetsForTiling(const Tiling& tiling,
-                                         mlir::MLIRContext* mlir_context);
-mlir::AffineMap GetThreadOffsetsForTiling(const Tiling& tiling,
-                                          mlir::MLIRContext* mlir_context);
-
-// Convenience functions for the two functions above
-// (`GetBlockOffsestsForTiling` + `GetThreadOffsetsForTiling`). Also sets up
-// the ranges of dimensions and symbols.
-IndexingMap GetIndexingMapForTiling(const Tiling& tiling,
-                                    mlir::MLIRContext* mlir_context);
-IndexingMap GetIndexingMapForTiling(mlir::AffineMap block_offsets,
-                                    mlir::AffineMap thread_offsets,
-                                    int64_t threads_per_block,
-                                    int64_t num_blocks,
-                                    absl::Span<const int64_t> thread_tile_sizes,
-                                    absl::Span<const int64_t> tiled_shape);
 
 // Returns the shape of the output of the instruction.
 const Shape& GetOutputShape(const HloInstruction* instr, int64_t output_id);
@@ -182,14 +160,11 @@ std::vector<mlir::AffineExpr> DelinearizeIndex(absl::Span<const int64_t> dims,
 // Creates an identity indexing map corresponding to the parameter shape.
 IndexingMap CreateIdentityMap(const Shape& shape,
                               mlir::MLIRContext* mlir_context);
+IndexingMap CreateIdentityMap(absl::Span<const int64_t> dimensions,
+                              mlir::MLIRContext* mlir_context);
 
 llvm::SmallVector<mlir::AffineExpr, 4> DelinearizeInBoundsIndex(
     mlir::AffineExpr linear, absl::Span<const int64_t> sizes);
-
-// Returns the output-to-input indexing map of the first output of `instr`
-IndexingMap GetIndexingMapForInstruction(const HloInstruction* instr,
-                                         int64_t operand_idx,
-                                         mlir::MLIRContext* mlir_context);
 
 }  // namespace gpu
 }  // namespace xla

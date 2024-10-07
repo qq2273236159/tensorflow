@@ -21,9 +21,9 @@ limitations under the License.
 #include <random>
 #include <string>
 
+#include "absl/status/status.h"
 #include "xla/hlo/ir/hlo_module.h"
 #include "xla/service/hlo_runner.h"
-#include "xla/status.h"
 #include "xla/tools/run_hlo_module.pb.h"
 #include "tsl/platform/status.h"
 
@@ -40,6 +40,7 @@ struct RunHloModuleOptions {
   bool flatten_control_flow{false};
   bool run_test_hlo_passes{true};
   bool run_reference_hlo_passes{true};
+  bool force_use_cpu_thunk_runtime_for_test{false};
   // Using small float range by default, as otherwise all reductions
   // miscompare vs. the interpreter with inf/nan.
   bool use_large_float_range{false};
@@ -47,7 +48,6 @@ struct RunHloModuleOptions {
   float abs_error_bound{1e-3};
   float rel_error_bound{1e-3};
   std::string input_format;
-  std::string input_module;
   bool use_buffer_assignment_from_proto{false};
   // The format and the usage of the option is platform-dependent.
   std::string input_compilation_environments;
@@ -92,6 +92,13 @@ absl::Status RunAndCompare(
     std::function<absl::Status(const RunHloModuleOptions& options,
                                HloModule& module)>
         compilation_env_modifier_hook = {});
+
+// Read the input literals from 'file_path'. The file can be either a binary
+// proto or a text proto. If it doesn't contain a RunHloModuleLiterals proto, it
+// will fallback to reading a RunHloModuleIterationLiterals proto and use that
+// for the first entry in 'iterations'.
+void ReadInputLiteralsFromFile(const std::string& file_path,
+                               xla::RunHloModuleLiterals* input_literals_proto);
 }  // namespace xla
 
 #endif  // XLA_TOOLS_RUN_HLO_MODULE_H_

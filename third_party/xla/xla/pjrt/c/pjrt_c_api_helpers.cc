@@ -45,7 +45,6 @@ limitations under the License.
 #include "xla/pjrt/pjrt_future.h"
 #include "xla/primitive_util.h"
 #include "xla/shape_util.h"
-#include "xla/status.h"
 #include "xla/util.h"
 #include "xla/xla_data.pb.h"
 #include "tsl/platform/errors.h"
@@ -296,6 +295,8 @@ PJRT_Buffer_Type ConvertToPjRtBufferType(xla::PrimitiveType type) {
       return PJRT_Buffer_Type::PJRT_Buffer_Type_F64;
     case xla::PrimitiveType::F8E5M2:
       return PJRT_Buffer_Type::PJRT_Buffer_Type_F8E5M2;
+    case xla::PrimitiveType::F8E4M3:
+      return PJRT_Buffer_Type::PJRT_Buffer_Type_F8E4M3;
     case xla::PrimitiveType::F8E4M3FN:
       return PJRT_Buffer_Type::PJRT_Buffer_Type_F8E4M3FN;
     case xla::PrimitiveType::F8E4M3B11FNUZ:
@@ -304,6 +305,8 @@ PJRT_Buffer_Type ConvertToPjRtBufferType(xla::PrimitiveType type) {
       return PJRT_Buffer_Type::PJRT_Buffer_Type_F8E5M2FNUZ;
     case xla::PrimitiveType::F8E4M3FNUZ:
       return PJRT_Buffer_Type::PJRT_Buffer_Type_F8E4M3FNUZ;
+    case xla::PrimitiveType::F8E3M4:
+      return PJRT_Buffer_Type::PJRT_Buffer_Type_F8E3M4;
     case xla::PrimitiveType::C64:
       return PJRT_Buffer_Type::PJRT_Buffer_Type_C64;
     case xla::PrimitiveType::C128:
@@ -359,6 +362,8 @@ xla::PrimitiveType ConvertFromPjRtBufferType(PJRT_Buffer_Type type) {
       return xla::PrimitiveType::C128;
     case PJRT_Buffer_Type::PJRT_Buffer_Type_F8E5M2:
       return xla::PrimitiveType::F8E5M2;
+    case PJRT_Buffer_Type::PJRT_Buffer_Type_F8E4M3:
+      return xla::PrimitiveType::F8E4M3;
     case PJRT_Buffer_Type::PJRT_Buffer_Type_F8E4M3FN:
       return xla::PrimitiveType::F8E4M3FN;
     case PJRT_Buffer_Type::PJRT_Buffer_Type_F8E4M3B11FNUZ:
@@ -367,6 +372,8 @@ xla::PrimitiveType ConvertFromPjRtBufferType(PJRT_Buffer_Type type) {
       return xla::PrimitiveType::F8E5M2FNUZ;
     case PJRT_Buffer_Type::PJRT_Buffer_Type_F8E4M3FNUZ:
       return xla::PrimitiveType::F8E4M3FNUZ;
+    case PJRT_Buffer_Type::PJRT_Buffer_Type_F8E3M4:
+      return xla::PrimitiveType::F8E3M4;
     case PJRT_Buffer_Type::PJRT_Buffer_Type_INVALID:
       CHECK(false) << "Buffer type is not supported in C API layer.";
   }
@@ -604,7 +611,7 @@ const std::vector<PJRT_NamedValue>& GetXlaPluginCAttributes() {
   c_value.name_size = kXlaVersion.size();
   c_value.type = PJRT_NamedValue_Type::PJRT_NamedValue_kInt64;
   // TODO(b/327203806): figure out where to keep the xla_version.
-  c_value.int64_value = 1;
+  c_value.int64_value = 2;
   c_value.value_size = 1;
   static const std::vector<PJRT_NamedValue>* c_values =
       new std::vector<PJRT_NamedValue>({c_value});
@@ -995,13 +1002,6 @@ absl::Span<PJRT_DeviceDescription* const> DeviceDescriptions(
 
 absl::StatusOr<xla::CompiledMemoryStats> GetCompiledMemoryStats(
     const PJRT_Api* api, PJRT_Executable* executable) {
-  // TODO(jieying): To be removed after 03/2024.
-  if (api->pjrt_api_version.major_version == 0 &&
-      api->pjrt_api_version.minor_version < 40) {
-    return absl::UnimplementedError(
-        "GetCompiledMemoryStats requires a plugin with PJRT C API version >= "
-        "0.40");
-  }
   PJRT_Executable_GetCompiledMemoryStats_Args args;
   args.struct_size = PJRT_Executable_GetCompiledMemoryStats_Args_STRUCT_SIZE;
   args.extension_start = nullptr;

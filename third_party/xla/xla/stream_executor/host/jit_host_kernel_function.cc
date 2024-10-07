@@ -38,6 +38,7 @@ limitations under the License.
 #include "llvm/ExecutionEngine/ObjectCache.h"
 #include "llvm/ExecutionEngine/Orc/CompileUtils.h"
 #include "llvm/ExecutionEngine/Orc/Core.h"
+#include "llvm/ExecutionEngine/Orc/ExecutorProcessControl.h"
 #include "llvm/ExecutionEngine/Orc/IRCompileLayer.h"
 #include "llvm/ExecutionEngine/Orc/JITTargetMachineBuilder.h"
 #include "llvm/ExecutionEngine/Orc/LLJIT.h"
@@ -454,5 +455,5 @@ static void RegisterJitKernelFunctionLoader() {
 }  // namespace stream_executor::host
 
 STREAM_EXECUTOR_REGISTER_MODULE_INITIALIZER(
-    jot_kernel_function_loader,
+    jit_kernel_function_loader,
     stream_executor::host::RegisterJitKernelFunctionLoader());

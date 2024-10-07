@@ -112,7 +112,6 @@ py_strict_library(
 tf_proto_library(
     name = "test_example_proto",
     srcs = ["test_example.proto"],
-    cc_api_version = 2,
     protodeps = tf_additional_all_protos(),
 )
 
@@ -156,7 +155,6 @@ tf_py_strict_test(
 # copybara:uncomment_begin(google-only)
 # py_proto_library(
 #     name = "test_example_proto_py",
-#     api_version = 2,
 #     deps = [":test_example_proto"],
 # )
 # copybara:uncomment_end

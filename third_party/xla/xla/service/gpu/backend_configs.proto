@@ -3,8 +3,8 @@ syntax = "proto3";
 package xla.gpu;
 
 import "xla/autotuning.proto";
+import "xla/tsl/protobuf/dnn.proto";
 import "xla/xla_data.proto";
-import "tsl/protobuf/dnn.proto";
 
 // Backend configs for XLA:GPU.
 //
@@ -148,10 +148,25 @@ message ReificationCost {
 // fusion computation).
 message CustomFusionConfig {
   string name = 1;
+
+  // When a custom fusion has multiple kernels, this field specifies which
+  // kernel to use. Default value is to select the first kernel, i.e.
+  // kernel_index = 0.
+  int32 kernel_index = 2;
 }
 
 message CuDnnFusionConfig {
   int64 plan_id = 1;
+}
+
+// Block-level parameters for a fusion.
+message BlockLevelFusionConfig {
+  // The output tile sizes of the associated instruction. The length of this
+  // field is expected to be the rank of the output shape.
+  repeated int64 output_tile_sizes = 1;
+
+  // The number of warps to use for the kernel.
+  int64 num_warps = 2;
 }
 
 message FusionBackendConfig {
@@ -169,6 +184,10 @@ message FusionBackendConfig {
   // Only valid when kind == "__triton_gemm".  Even then it's optional: If not
   // present, we use the default Triton config.
   AutotuneResult.TritonGemmKey triton_gemm_config = 2;
+
+  // Only valid when kind == "__triton" for now. Code generation of such
+  // fusions will fail if this field is not set.
+  BlockLevelFusionConfig block_level_fusion_config = 6;
 
   // Only valid when kind == "__custom_fusion".
   CustomFusionConfig custom_fusion_config = 4;
@@ -239,6 +258,13 @@ message CudnnfMHABackendConfig {
     ALIBI = 4;
   }
   MaskType mask_type = 22;
+
+  // Whether force deterministic for bwd
+  bool force_deterministic = 23;
+
+  // Sliding window length
+  // ignored if the value <= 0
+  int32 sliding_window_length = 24;
 }
 
 // Generic backend config for XLA:GPU

@@ -16,13 +16,17 @@ limitations under the License.
 #include "xla/hlo/utils/hlo_query.h"
 
 #include <algorithm>
+#include <cstdint>
+#include <utility>
 
 #include "absl/algorithm/container.h"
+#include "absl/strings/string_view.h"
 #include "xla/hlo/ir/hlo_casting_utils.h"
 #include "xla/hlo/ir/hlo_instruction.h"
 #include "xla/hlo/ir/hlo_instructions.h"
 #include "xla/hlo/ir/hlo_opcode.h"
 #include "xla/literal.h"
+#include "xla/service/pattern_matcher.h"
 #include "xla/shape_util.h"
 
 namespace xla {
@@ -245,6 +249,51 @@ bool HasX64TransformedHostTransfer(const HloModule& module) {
     }
   }
   return false;
+}
+
+HloInstruction* GetUniqueGteInstruction(const HloInstruction* operand,
+                                        int64_t index) {
+  HloInstruction* gte = nullptr;
+  for (HloInstruction* instr : operand->parent()->MakeInstructionPostOrder()) {
+    if (!Match(instr, match::GetTupleElement().WithTupleIndex(index))) {
+      continue;
+    }
+    if (instr->operand(0) != operand) {
+      continue;
+    }
+    // If gte is not unique, return nullptr.
+    if (gte != nullptr) {
+      return nullptr;
+    }
+    gte = instr;
+  }
+  return gte;
+}
+
+HloComputation* FindComputation(HloModule* module, absl::string_view name) {
+  auto computations = module->computations();
+  auto it = absl::c_find_if(
+      computations, [&](HloComputation* c) { return c->name() == name; });
+  if (it == computations.end()) {
+    return nullptr;
+  }
+  return *it;
+}
+
+HloInstruction* FindInstruction(const HloComputation* computation,
+                                absl::string_view name) {
+  for (HloInstruction* instruction : computation->instructions()) {
+    if (instruction->name() == name) return instruction;
+  }
+  return nullptr;
+}
+
+HloInstruction* FindInstruction(const HloComputation* computation,
+                                HloOpcode opcode) {
+  for (auto* instruction : computation->instructions()) {
+    if (instruction->opcode() == opcode) return instruction;
+  }
+  return nullptr;
 }
 
 }  // namespace hlo_query

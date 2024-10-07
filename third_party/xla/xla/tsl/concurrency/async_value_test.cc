@@ -104,7 +104,7 @@ TEST(AsyncValueTest, AddAndDropRef) {
 TEST(AsyncValueTest, KeepPayloadOnError) {
   int payload_value = 0;
 
-  struct Payload : internal::KeepAsyncValuePayloadOnError {
+  struct Payload : AsyncPayload::KeepOnError {
     explicit Payload(int* value) : value{value} { *value = 1; }
     ~Payload() { *value = 2; }
 
@@ -132,7 +132,7 @@ TEST(AsyncValueTest, KeepPayloadOnError) {
 
     EXPECT_TRUE(!value.IsError());
 
-    value.SetError("error");
+    value.SetError(absl::InternalError("error"));
 
     EXPECT_EQ(1, *value->value);
     EXPECT_TRUE(value.IsError());

@@ -28,6 +28,8 @@ limitations under the License.
 #include "absl/algorithm/container.h"
 #include "absl/container/flat_hash_set.h"
 #include "absl/log/log.h"
+#include "absl/status/status.h"
+#include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_format.h"
 #include "absl/strings/str_join.h"
@@ -53,9 +55,7 @@ limitations under the License.
 #include "xla/shape.h"
 #include "xla/shape_layout.h"
 #include "xla/shape_util.h"
-#include "xla/status.h"
 #include "xla/status_macros.h"
-#include "xla/statusor.h"
 #include "xla/util.h"
 #include "xla/xla_data.pb.h"
 #include "tsl/platform/errors.h"
@@ -85,7 +85,7 @@ BufferLayoutConstraint::BufferLayoutConstraint(const Layout& layout,
                                                bool mandatory, bool dfs,
                                                int64_t priority)
     : LayoutConstraint(mandatory, dfs, priority), buffer_(&buffer) {
-  CHECK(LayoutUtil::ValidateLayoutForShape(layout, buffer.shape()).ok());
+  CHECK_OK(LayoutUtil::ValidateLayoutForShape(layout, buffer.shape()));
   layout_.push_back(layout);
 }
 
@@ -482,7 +482,8 @@ absl::Status LayoutAssignment::SetInstructionLayout(
 
 absl::Status LayoutAssignment::SetInstructionLayout(
     const Shape& shape_with_layout, const HloInstruction* instruction,
-    bool mandatory, bool dfs, bool allow_alias, int64_t priority) {
+    bool mandatory, bool dfs, bool allow_alias, int64_t priority,
+    ShapeIndexView subshape_index) {
   VLOG(3) << "SetInstructionLayout : " << instruction->name() << ", "
           << ShapeUtil::HumanStringWithLayout(shape_with_layout)
           << ": priority = " << priority << " : mandatory = " << mandatory
@@ -499,8 +500,12 @@ absl::Status LayoutAssignment::SetInstructionLayout(
   // instruction.
   TF_RETURN_IF_ERROR(ShapeUtil::ForEachSubshapeWithStatus(
       shape_with_layout,
-      [this, dfs, instruction, mandatory, allow_alias, priority](
-          const Shape& subshape, const ShapeIndex& index) -> absl::Status {
+      [this, dfs, instruction, mandatory, allow_alias, priority,
+       subshape_index](const Shape& subshape,
+                       const ShapeIndex& index) -> absl::Status {
+        if (!subshape_index.empty() && index != subshape_index) {
+          return absl::OkStatus();
+        }
         auto buffers =
             points_to_analysis_->GetPointsToSet(instruction).element(index);
         CHECK_EQ(1, buffers.size());
@@ -743,14 +748,18 @@ absl::Status LayoutAssignment::AddMandatoryConstraints(
       TF_RETURN_IF_ERROR(SetInstructionLayout(custom_call->shape(), custom_call,
                                               /*mandatory=*/true, /*dfs=*/true,
                                               /*allow_alias=*/true));
-
-      for (int64_t i = 0; i < custom_call->operand_count(); ++i) {
-        if (AnyOperandBufferForwarded(custom_call, i)) {
-          TF_RET_CHECK(AllOperandBuffersForwarded(custom_call, i))
-              << "Partial alias of an operand is not supported";
-        } else {
-          TF_RETURN_IF_ERROR(SetOperandLayout(
-              custom_call->operand_shapes_with_layout()[i], custom_call, i));
+      if (custom_call->IsCustomCall("LayoutConstraint")) {
+        TF_RETURN_IF_ERROR(
+            SetOperandLayout(custom_call->shape(), custom_call, 0));
+      } else {
+        for (int64_t i = 0; i < custom_call->operand_count(); ++i) {
+          if (AnyOperandBufferForwarded(custom_call, i)) {
+            TF_RET_CHECK(AllOperandBuffersForwarded(custom_call, i))
+                << "Partial alias of an operand is not supported";
+          } else {
+            TF_RETURN_IF_ERROR(SetOperandLayout(
+                custom_call->operand_shapes_with_layout()[i], custom_call, i));
+          }
         }
       }
     } else if (IsLayoutConstrainedCollective(instruction)) {
@@ -766,7 +775,8 @@ absl::Status LayoutAssignment::AddMandatoryConstraints(
         TF_RETURN_IF_ERROR(SetOperandLayout(shape, instruction, i,
                                             /*mandatory=*/true, /*dfs=*/true));
       }
-    } else if (instruction->IsCrossModuleAllReduce()) {
+    } else if (instruction->IsCrossModuleAllReduce() &&
+               !instruction->GetModule()->config().use_spmd_partitioning()) {
       CHECK(get_channel_constraints(instruction))
           << "Multi-module layout assignment requires ChannelLayoutConstraints";
       int64_t channel_id = instruction->channel_id().value();
@@ -964,7 +974,8 @@ bool LayoutsInShapesEqual(const Shape& lhs, const Shape& rhs) {
 // Operands of layout-constrained custom calls must match the expected
 // constrained layouts.
 absl::Status CheckCustomCallLayout(HloInstruction* instruction) {
-  if (IsLayoutConstrainedCustomCall(instruction)) {
+  if (IsLayoutConstrainedCustomCall(instruction) &&
+      !instruction->IsCustomCall("LayoutConstraint")) {
     const HloCustomCallInstruction* custom_call =
         DynCast<HloCustomCallInstruction>(instruction);
     for (int64_t i = 0; i < custom_call->operand_count(); ++i) {
@@ -2902,7 +2913,6 @@ bool LayoutAssignment::InstructionCanChangeLayout(
     case HloOpcode::kCopy:
     case HloOpcode::kCopyStart:
     case HloOpcode::kCopyDone:
-    case HloOpcode::kCustomCall:
     case HloOpcode::kDomain:
     case HloOpcode::kDot:
     case HloOpcode::kFusion:
@@ -2929,6 +2939,8 @@ bool LayoutAssignment::InstructionCanChangeLayout(
     case HloOpcode::kTuple:
     case HloOpcode::kGetDimensionSize:
       return true;
+    case HloOpcode::kCustomCall:
+      return !instruction->IsCustomCall("LayoutConstraint");
   }
 }
 

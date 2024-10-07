@@ -1,6 +1,6 @@
 load("@local_tsl//tsl/platform:build_config.bzl", "tf_proto_library")
 load("//xla:xla.bzl", "xla_cc_test")
-load("//xla/tsl:tsl.bzl", "internal_visibility")
+load("//xla/tsl:tsl.bzl", "if_google", "internal_visibility")
 load("//xla/tsl:tsl.default.bzl", "get_compatible_with_portable")
 
 package_group(
@@ -46,17 +46,20 @@ cc_library(
     compatible_with = get_compatible_with_portable(),
     deps = [
         ":xla_compiler_proto_cc",
+        "//xla:shape_util",
         "//xla:util",
         "//xla:xla_data_proto_cc",
         "//xla/hlo/ir:hlo",
         "//xla/pjrt:pjrt_executable",
         "//xla/python/ifrt",
         "//xla/python/ifrt:serdes",
+        "//xla/tsl/concurrency:ref_count",
         "@com_google_absl//absl/log",
         "@com_google_absl//absl/log:check",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/strings:str_format",
         "@com_google_absl//absl/types:span",
         "@llvm-project//llvm:Support",
         "@llvm-project//mlir:IR",
@@ -67,8 +70,9 @@ cc_library(
 tf_proto_library(
     name = "xla_host_callback_proto",
     srcs = ["xla_host_callback.proto"],
-    cc_api_version = 2,
-    protodeps = ["//xla:xla_data_proto"],
+    protodeps = [
+        "//xla:xla_data_proto",
+    ] + if_google(["@com_google_protobuf//:any"]),
 )
 
 tf_proto_library(
@@ -113,9 +117,9 @@ xla_cc_test(
         ":xla_sharding_serdes",
         "//xla/hlo/ir:hlo",
         "//xla/python/ifrt",
+        "//xla/python/ifrt:device_test_util",
         "//xla/python/ifrt:serdes",
         "//xla/python/ifrt:sharding_serdes",
-        "//xla/python/ifrt:sharding_test_util",
         "@com_google_absl//absl/functional:bind_front",
         "@com_google_absl//absl/types:span",
         "@com_google_googletest//:gtest_main",
@@ -136,11 +140,11 @@ cc_library(
         "//xla/python/ifrt",
         "//xla/python/ifrt:test_util",
         "//xla/python/ifrt/hlo:hlo_program",
+        "//xla/tsl/lib/core:status_test_util",
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings",
         "@com_google_absl//absl/types:span",
         "@llvm-project//mlir:IR",
-        "@local_tsl//tsl/lib/core:status_test_util",
         "@local_tsl//tsl/platform:statusor",
         "@local_tsl//tsl/platform:test",
     ],
@@ -167,12 +171,17 @@ xla_cc_test(
         ":tfrt_cpu_client_test_lib",
         ":xla_ifrt",
         "//xla:xla_data_proto_cc",
+        "//xla/hlo/ir:hlo",
+        "//xla/hlo/ir:tile_assignment",
         "//xla/python/ifrt",
-        "//xla/python/ifrt:sharding_test_util",
+        "//xla/python/ifrt:device_test_util",
         "//xla/python/ifrt:tuple_impl_test_lib",
+        "//xla/tsl/concurrency:ref_count",
+        "@com_google_absl//absl/types:span",
         "@com_google_googletest//:gtest_main",
         "@local_tsl//tsl/platform:errors",
         "@local_tsl//tsl/platform:status_matchers",
+        "@local_tsl//tsl/platform:statusor",
     ],
 )
 
@@ -187,6 +196,7 @@ cc_library(
         "pjrt_host_callback.cc",
         "pjrt_memory.cc",
         "pjrt_remap.cc",
+        "pjrt_topology.cc",
         "pjrt_tuple.cc",
     ],
     hdrs = [
@@ -198,33 +208,40 @@ cc_library(
         "pjrt_host_callback.h",
         "pjrt_memory.h",
         "pjrt_remap.h",
+        "pjrt_topology.h",
         "pjrt_tuple.h",
     ],
     compatible_with = get_compatible_with_portable(),
     deps = [
         ":basic_string_array",
+        ":pjrt_attribute_map_util",
+        ":pjrt_dtype",
         ":xla_ifrt",
         "//xla:literal",
         "//xla:shape_util",
-        "//xla:status",
         "//xla:status_macros",
-        "//xla:statusor",
         "//xla:util",
         "//xla:xla_data_proto_cc",
         "//xla/hlo/ir:hlo",
+        "//xla/hlo/translate/mhlo_to_hlo:type_to_shape",
         "//xla/pjrt:host_callback",
         "//xla/pjrt:pjrt_client",
+        "//xla/pjrt:pjrt_common",
         "//xla/pjrt:pjrt_compiler",
         "//xla/pjrt:pjrt_device_description",
         "//xla/pjrt:pjrt_executable",
         "//xla/pjrt:pjrt_future",
         "//xla/pjrt:pjrt_layout",
         "//xla/pjrt:utils",
+        "//xla/pjrt/distributed:key_value_store_interface",
+        "//xla/pjrt/distributed:protocol_proto_cc",
+        "//xla/pjrt/distributed:topology_util",
         "//xla/python/ifrt",
+        "//xla/python/ifrt:attribute_map",
         "//xla/python/ifrt/hlo:hlo_program",
         "//xla/service:hlo_proto_cc",
-        "//xla/translate/mhlo_to_hlo:type_to_shape",
         "//xla/tsl/concurrency:ref_count",
+        "@com_google_absl//absl/base:core_headers",
         "@com_google_absl//absl/container:flat_hash_map",
         "@com_google_absl//absl/container:inlined_vector",
         "@com_google_absl//absl/functional:any_invocable",
@@ -236,6 +253,7 @@ cc_library(
         "@com_google_absl//absl/strings",
         "@com_google_absl//absl/strings:str_format",
         "@com_google_absl//absl/synchronization",
+        "@com_google_absl//absl/time",
         "@com_google_absl//absl/types:span",
         "@llvm-project//llvm:Support",
         "@llvm-project//mlir:FuncDialect",
@@ -260,26 +278,65 @@ cc_library(
 )
 
 cc_library(
+    name = "pjrt_attribute_map_util",
+    srcs = ["pjrt_attribute_map_util.cc"],
+    hdrs = ["pjrt_attribute_map_util.h"],
+    compatible_with = get_compatible_with_portable(),
+    deps = [
+        "//xla/pjrt:pjrt_common",
+        "//xla/python/ifrt:attribute_map",
+        "@com_google_absl//absl/container:flat_hash_map",
+    ],
+)
+
+xla_cc_test(
+    name = "pjrt_attribute_map_util_test",
+    srcs = ["pjrt_attribute_map_util_test.cc"],
+    deps = [
+        ":pjrt_attribute_map_util",
+        "//xla/pjrt:pjrt_common",
+        "//xla/python/ifrt:attribute_map",
+        "@com_google_absl//absl/container:flat_hash_map",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
+cc_library(
+    name = "pjrt_dtype",
+    srcs = ["pjrt_dtype.cc"],
+    hdrs = ["pjrt_dtype.h"],
+    compatible_with = get_compatible_with_portable(),
+    deps = [
+        "//xla:util",
+        "//xla:xla_data_proto_cc",
+        "//xla/python/ifrt",
+        "@com_google_absl//absl/status:statusor",
+    ],
+)
+
+cc_library(
     name = "basic_string_array",
     srcs = ["basic_string_array.cc"],
     hdrs = ["basic_string_array.h"],
     compatible_with = get_compatible_with_portable(),
     deps = [
-        "//xla:status",
         "//xla:xla_data_proto_cc",
         "//xla/pjrt:pjrt_layout",
         "//xla/python/ifrt",
         "//xla/tsl/concurrency:ref_count",
         "@com_google_absl//absl/base:core_headers",
         "@com_google_absl//absl/container:inlined_vector",
+        "@com_google_absl//absl/hash",
         "@com_google_absl//absl/log:check",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
         "@com_google_absl//absl/strings:str_format",
         "@com_google_absl//absl/strings:string_view",
         "@com_google_absl//absl/synchronization",
         "@com_google_absl//absl/types:span",
         "@llvm-project//llvm:Support",
+        "@local_tsl//tsl/platform:statusor",
     ],
 )
 
@@ -289,10 +346,13 @@ xla_cc_test(
     deps = [
         ":basic_string_array",
         ":tfrt_cpu_client_test_lib",
+        "//xla:shape_util",
         "//xla/pjrt:pjrt_future",
+        "//xla/pjrt:pjrt_layout",
         "//xla/python/ifrt",
         "//xla/python/ifrt:test_util",
         "//xla/tsl/concurrency:ref_count",
+        "//xla/tsl/lib/core:status_test_util",
         "@com_google_absl//absl/log",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/strings",
@@ -300,7 +360,7 @@ xla_cc_test(
         "@com_google_absl//absl/synchronization",
         "@com_google_absl//absl/types:span",
         "@com_google_googletest//:gtest_main",
-        "@local_tsl//tsl/lib/core:status_test_util",
+        "@llvm-project//llvm:Support",
         "@local_tsl//tsl/platform:env",
         "@local_tsl//tsl/platform:statusor",
         "@local_tsl//tsl/platform:test",

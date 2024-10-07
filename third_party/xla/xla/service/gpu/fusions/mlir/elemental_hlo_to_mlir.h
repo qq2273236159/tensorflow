@@ -20,12 +20,15 @@ limitations under the License.
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "llvm/ADT/SmallVector.h"
-#include "mlir/Dialect/Func/IR/FuncOps.h"  // from @llvm-project
-#include "mlir/IR/AffineExpr.h"  // from @llvm-project
-#include "mlir/IR/ImplicitLocOpBuilder.h"  // from @llvm-project
-#include "mlir/IR/Value.h"  // from @llvm-project
-#include "mlir/IR/ValueRange.h"  // from @llvm-project
-#include "mlir/Support/LLVM.h"  // from @llvm-project
+#include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/IR/AffineExpr.h"
+#include "mlir/IR/Builders.h"
+#include "mlir/IR/ImplicitLocOpBuilder.h"
+#include "mlir/IR/TypeRange.h"
+#include "mlir/IR/Types.h"
+#include "mlir/IR/Value.h"
+#include "mlir/IR/ValueRange.h"
+#include "mlir/Support/LLVM.h"
 #include "xla/hlo/ir/hlo_computation.h"
 #include "xla/hlo/ir/hlo_instruction.h"
 #include "xla/service/gpu/fusions/mlir/computation_partitioner.h"
@@ -38,7 +41,7 @@ namespace gpu {
 namespace mlir_converter {
 
 using OperandProvider =
-    std::function<absl::StatusOr<llvm::SmallVector<mlir::Value>>(
+    std::function<absl::StatusOr<llvm::SmallVector<mlir::Value, 1>>(
         const HloInstruction* instr, int index, mlir::ValueRange indices)>;
 
 // Emits MLIR to produce the value of a parameter. The parameter must be located
@@ -46,7 +49,7 @@ using OperandProvider =
 // searching in 'computation' for the subgraph that contains 'instr'. If
 // 'instr' does not belong to 'computation', the caller subgraph can be passed
 // directly.
-llvm::SmallVector<mlir::Value> ProvideParameter(
+mlir::ValueRange ProvideParameter(
     const PartitionedComputation& computation, const HloInstruction* instr,
     int operand_index, mlir::ValueRange indices,
     const CallTargetProvider& call_target_provider, mlir::func::FuncOp this_fn,
@@ -55,24 +58,11 @@ llvm::SmallVector<mlir::Value> ProvideParameter(
 
 // Emits MLIR to produce the values of a range of parameters. The parameters
 // must all be scalars. The parameters are all evaluated at the same indices.
-llvm::SmallVector<mlir::Value> ProvideParameterRange(
+llvm::SmallVector<mlir::Value, 2> ProvideParameterRange(
     const PartitionedComputation& computation, const HloInstruction* instr,
     int start, int num, mlir::ValueRange indices,
     const CallTargetProvider& call_target_provider, mlir::func::FuncOp this_fn,
     mlir::ImplicitLocOpBuilder& builder);
-
-// Checks whether the given HLO instruction can be converted to MLIR.
-bool IsHloOpSupported(const HloInstruction* instr,
-                      se::CudaComputeCapability compute_capability);
-
-// Checks whether the given HLO computation is supported by the MLIR converter:
-// - all instructions in it are supported
-// - the signature is supported: if the computation is not a fusion computation,
-//   all arguments have rank 0.
-bool IsHloConversionSupported(const HloComputation* computation,
-                              se::GpuComputeCapability compute_capability);
-bool IsHloConversionSupported(const HloFusionAdaptor& fusion,
-                              se::GpuComputeCapability compute_capability);
 
 // Converts a function (subgraph) to an MLIR function producing one element of
 // the result. The function must have the correct interface.
@@ -83,10 +73,9 @@ absl::Status SubgraphToMlirFunction(
 
 mlir::Value UnrealizedConversionCast(mlir::Type type, mlir::Value value,
                                      mlir::ImplicitLocOpBuilder& b);
-
-// Converts any integers that aren't yet signless to signless.
-mlir::SmallVector<mlir::Value> ConvertToSignless(mlir::ValueRange values,
-                                                 mlir::ImplicitLocOpBuilder& b);
+mlir::SmallVector<mlir::Value, 2> UnrealizedConversionCast(
+    mlir::TypeRange types, mlir::ValueRange values,
+    mlir::ImplicitLocOpBuilder& b);
 
 // Creates an affine.apply op for the given expression and values.
 mlir::Value ApplyAffineExpr(mlir::AffineExpr expr, mlir::ValueRange dims,
@@ -94,10 +83,10 @@ mlir::Value ApplyAffineExpr(mlir::AffineExpr expr, mlir::ValueRange dims,
                             mlir::ImplicitLocOpBuilder& b);
 
 // Creates an `apply_indexing` op for the given map.
-llvm::SmallVector<mlir::Value> ApplyIndexing(const IndexingMap& map,
-                                             mlir::ValueRange dims,
-                                             mlir::ValueRange symbols,
-                                             mlir::ImplicitLocOpBuilder& b);
+llvm::SmallVector<mlir::Value, 3> ApplyIndexing(IndexingMap map,
+                                                mlir::ValueRange dims,
+                                                mlir::ValueRange symbols,
+                                                mlir::ImplicitLocOpBuilder& b);
 
 // Checks all the constraints and dimension ranges in the map.
 mlir::Value CheckConstraints(const IndexingMap& map, mlir::ValueRange dims,
@@ -118,7 +107,7 @@ mlir::Value CheckConstraints(const IndexingMap& map, mlir::ValueRange dims,
 //   inits will be initialized with a vector splat. Passing a vector init is
 //   supported.
 // - Tensor arguments and results are unaffected.
-llvm::SmallVector<mlir::Value> EmitLoopNest(
+mlir::ValueRange EmitLoopNest(
     mlir::ImplicitLocOpBuilder& b, mlir::ValueRange dim_values,
     mlir::ValueRange iter_args_inits, const IndexingMap& indexing_map,
     mlir::function_ref<llvm::SmallVector<mlir::Value>(
@@ -127,9 +116,19 @@ llvm::SmallVector<mlir::Value> EmitLoopNest(
         create_body,
     bool vectorize = false);
 
+// Same as EmitLoopNest, but uses xla_gpu.loop.
+mlir::ValueRange EmitXlaLoopOp(
+    mlir::ImplicitLocOpBuilder& b, mlir::ValueRange dim_values,
+    mlir::ValueRange iter_args_inits, const IndexingMap& indexing_map,
+    mlir::function_ref<llvm::SmallVector<mlir::Value>(
+        mlir::ValueRange ivs, mlir::ValueRange map_results,
+        mlir::ValueRange iter_args)>
+        create_body,
+    bool vectorize = false);
+
 // Same as EmitLoopNest, but the body building function can return an error
 // which gets returned from EmitLoopNestWithStatus.
-absl::StatusOr<llvm::SmallVector<mlir::Value>> EmitLoopNestWithStatus(
+absl::StatusOr<mlir::ValueRange> EmitLoopNestWithStatus(
     mlir::ImplicitLocOpBuilder& b, mlir::ValueRange dim_values,
     mlir::ValueRange iter_args_inits, const IndexingMap& indexing_map,
     mlir::function_ref<absl::StatusOr<llvm::SmallVector<mlir::Value>>(
@@ -147,6 +146,13 @@ mlir::Value ClampIndex(mlir::Value index, bool is_unsigned, int64_t high,
 mlir::SmallVector<mlir::Value, 2> InlineBlock(mlir::OpBuilder& builder,
                                               mlir::Block& src_block,
                                               mlir::ValueRange mapped_args);
+
+// Populates `lbs`, `ubs` and `steps` with the loop bounds from `indexing_map`.
+void GetLoopBoundsFromIndexingMap(mlir::ImplicitLocOpBuilder& b,
+                                  const IndexingMap& indexing_map,
+                                  llvm::SmallVectorImpl<mlir::Value>* lbs,
+                                  llvm::SmallVectorImpl<mlir::Value>* ubs,
+                                  llvm::SmallVectorImpl<mlir::Value>* steps);
 
 }  // namespace mlir_converter
 }  // namespace gpu

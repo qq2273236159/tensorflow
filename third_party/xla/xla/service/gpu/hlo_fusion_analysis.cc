@@ -26,6 +26,7 @@ limitations under the License.
 #include "absl/container/inlined_vector.h"
 #include "absl/log/check.h"
 #include "absl/log/log.h"
+#include "absl/status/statusor.h"
 #include "absl/strings/string_view.h"
 #include "absl/types/span.h"
 #include "llvm/ADT/STLExtras.h"
@@ -39,7 +40,6 @@ limitations under the License.
 #include "xla/service/gpu/reduction_utils.h"
 #include "xla/shape.h"
 #include "xla/shape_util.h"
-#include "xla/statusor.h"
 #include "xla/stream_executor/device_description.h"
 
 namespace xla {
@@ -77,8 +77,7 @@ std::optional<TransposeDescription> FindConsistentTransposeHero(
   std::vector<const HloInstruction*> non_transpose_roots;
 
   for (auto [root, hero] : llvm::zip(hlo_roots, heroes)) {
-    if (auto tr = GetDescriptionForTiledTransposeEmitter(root.instruction(),
-                                                         hero.instruction())) {
+    if (auto tr = GetDescriptionForTiledTransposeEmitter(hero.instruction())) {
       if (!tiled_transpose_hero) {
         // First transpose hero found.
         tiled_transpose_hero = tr;
@@ -106,14 +105,23 @@ std::optional<TransposeDescription> FindConsistentTransposeHero(
   return tiled_transpose_hero;
 }
 
-int SmallestBitWidth(absl::Span<HloInstructionAdaptor const> args) {
+const Shape& GetShape(const HloInstructionAdaptor& adaptor) {
+  return adaptor.shape();
+}
+
+const Shape& GetShape(const HloInstruction* instruction) {
+  return instruction->shape();
+}
+
+template <typename Container>
+int SmallestBitWidth(const Container& args) {
   int bits = std::numeric_limits<int>::max();
-  for (const HloInstructionAdaptor& operand : args) {
-    if (!operand.shape().IsArray()) continue;
-    bits = std::min(
-        bits, operand.shape().element_type() == PRED
-                  ? 8
-                  : primitive_util::BitWidth(operand.shape().element_type()));
+  for (const auto& operand : args) {
+    const Shape& shape = GetShape(operand);
+    if (!shape.IsArray()) continue;
+    bits = std::min(bits, shape.element_type() == PRED
+                              ? 8
+                              : primitive_util::BitWidth(shape.element_type()));
   }
   return bits;
 }
@@ -147,14 +155,9 @@ HloFusionAnalysis HloFusionAnalysis::Create(
     heroes.push_back(FindNonTrivialHero(root));
   }
 
-  absl::InlinedVector<HloInstructionAdaptor, 2> fusion_arguments;
-  FindFusionArguments(*fusion, [&](const HloInstructionAdaptor& argument) {
-    fusion_arguments.push_back(argument);
-  });
-
   InputOutputInfo input_output_info{
-      .smallest_input_dtype_bits = SmallestBitWidth(fusion_arguments),
-      .smallest_output_dtype_bits = SmallestBitWidth(roots),
+      /*smallest_input_dtype_bits=*/SmallestBitWidth(fusion->GetParameters()),
+      /*smallest_output_dtype_bits=*/SmallestBitWidth(roots),
   };
 
   std::optional<TransposeDescription> tiled_transpose_hero =
@@ -167,15 +170,40 @@ HloFusionAnalysis HloFusionAnalysis::Create(
 
 // static
 HloFusionAnalysis HloFusionAnalysis::Create(
-    const HloFusionInstruction* fusion,
-    const se::DeviceDescription* device_info) {
-  CHECK(device_info != nullptr);
-  FusionBackendConfig backend_config =
-      fusion->has_backend_config()
-          ? fusion->backend_config<GpuBackendConfig>()->fusion_backend_config()
-          : FusionBackendConfig::default_instance();
-  return Create(std::move(backend_config),
-                HloFusionAdaptor::ForInstruction(fusion), device_info);
+    const HloInstruction& instruction,
+    const se::DeviceDescription& device_info) {
+  absl::StatusOr<GpuBackendConfig> gpu_backend_config =
+      instruction.backend_config<GpuBackendConfig>();
+
+  FusionBackendConfig fusion_backend_config =
+      gpu_backend_config.ok() ? gpu_backend_config->fusion_backend_config()
+                              : FusionBackendConfig::default_instance();
+  return Create(std::move(fusion_backend_config),
+                HloFusionAdaptor::ForInstruction(&instruction), &device_info);
+}
+
+// static
+HloFusionAnalysis HloFusionAnalysis::Create(
+    const HloInstruction& producer, const HloInstruction& consumer,
+    const se::DeviceDescription& device_info) {
+  absl::StatusOr<GpuBackendConfig> gpu_backend_config;
+
+  if (consumer.has_backend_config()) {
+    gpu_backend_config = consumer.backend_config<GpuBackendConfig>();
+  }
+
+  if (!gpu_backend_config.ok() && producer.has_backend_config()) {
+    gpu_backend_config = producer.backend_config<GpuBackendConfig>();
+  }
+
+  FusionBackendConfig fusion_backend_config =
+      gpu_backend_config.ok() ? gpu_backend_config->fusion_backend_config()
+                              : FusionBackendConfig::default_instance();
+
+  return HloFusionAnalysis::Create(
+      std::move(fusion_backend_config),
+      HloFusionAdaptor::ForProducerConsumer(&producer, &consumer),
+      &device_info);
 }
 
 // Returns true if the fusion has consistent transpose heros.
@@ -204,8 +232,8 @@ HloFusionAnalysis::EmitterFusionKind HloFusionAnalysis::GetEmitterFusionKind()
     return EmitterFusionKind::kCustomFusion;
   }
 
-  if (fusion_backend_config_.kind() == kTritonGemmFusionKind ||
-      fusion_backend_config_.kind() == kTritonSoftmaxFusionKind) {
+  if (fusion_backend_config_.kind() == kTritonFusionKind ||
+      fusion_backend_config_.kind() == kTritonGemmFusionKind) {
     return EmitterFusionKind::kTriton;
   }
 
@@ -260,7 +288,7 @@ HloFusionAnalysis::EmitterFusionKind HloFusionAnalysis::GetEmitterFusionKind()
   }
 
   // We expect that the last dimension is swapped with a different dimension.
-  if (HasConsistentTransposeHeros() && tiled_transpose_->permutation[2] != 2) {
+  if (HasConsistentTransposeHeros()) {
     return EmitterFusionKind::kTranspose;
   }
 
@@ -299,25 +327,6 @@ const HloInstruction* HloFusionAnalysis::FindHeroReduction() const {
     }
   }
   LOG(FATAL) << "Did not find a hero reduction";
-}
-
-HloFusionAnalysis AnalyzeProducerConsumerFusion(
-    const HloInstruction& producer, const HloInstruction& consumer,
-    const se::DeviceDescription& device_info) {
-  return HloFusionAnalysis::Create(
-      consumer.has_backend_config()
-          ? consumer.backend_config<GpuBackendConfig>()->fusion_backend_config()
-          : producer.backend_config<GpuBackendConfig>()
-                ->fusion_backend_config(),
-      HloFusionAdaptor::ForProducerConsumer(&producer, &consumer),
-      &device_info);
-}
-
-HloFusionAnalysis AnalyzeFusion(const HloInstruction& consumer,
-                                const se::DeviceDescription& device_info) {
-  return HloFusionAnalysis::Create(
-      consumer.backend_config<GpuBackendConfig>()->fusion_backend_config(),
-      HloFusionAdaptor::ForInstruction(&consumer), &device_info);
 }
 
 }  // namespace gpu

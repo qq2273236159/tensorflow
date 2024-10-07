@@ -34,15 +34,15 @@ limitations under the License.
 #include "absl/strings/string_view.h"
 #include "absl/synchronization/mutex.h"
 #include "absl/types/span.h"
-#include "third_party/nanobind/include/nanobind/nanobind.h"
-#include "third_party/nanobind/include/nanobind/ndarray.h"
-#include "third_party/nanobind/include/nanobind/stl/optional.h"  // IWYU pragma: keep
-#include "third_party/nanobind/include/nanobind/stl/pair.h"  // IWYU pragma: keep
-#include "third_party/nanobind/include/nanobind/stl/shared_ptr.h"  // IWYU pragma: keep
-#include "third_party/nanobind/include/nanobind/stl/string.h"  // IWYU pragma: keep
-#include "third_party/nanobind/include/nanobind/stl/string_view.h"  // IWYU pragma: keep
-#include "third_party/nanobind/include/nanobind/stl/variant.h"  // IWYU pragma: keep
-#include "third_party/nanobind/include/nanobind/stl/vector.h"  // IWYU pragma: keep
+#include "nanobind/nanobind.h"
+#include "nanobind/ndarray.h"
+#include "nanobind/stl/optional.h"  // IWYU pragma: keep
+#include "nanobind/stl/pair.h"  // IWYU pragma: keep
+#include "nanobind/stl/shared_ptr.h"  // IWYU pragma: keep
+#include "nanobind/stl/string.h"  // IWYU pragma: keep
+#include "nanobind/stl/string_view.h"  // IWYU pragma: keep
+#include "nanobind/stl/variant.h"  // IWYU pragma: keep
+#include "nanobind/stl/vector.h"  // IWYU pragma: keep
 #include "xla/array.h"
 #include "xla/client/executable_build_options.h"
 #include "xla/client/xla_builder.h"
@@ -55,6 +55,7 @@ limitations under the License.
 #include "xla/hlo/ir/hlo_module.h"
 #include "xla/hlo/ir/hlo_module_group.h"
 #include "xla/hlo/ir/hlo_sharding.h"
+#include "xla/hlo/pass/hlo_pass_interface.h"
 #include "xla/layout.h"
 #include "xla/layout_util.h"
 #include "xla/literal.h"
@@ -75,15 +76,14 @@ limitations under the License.
 #include "xla/service/hlo_graph_dumper.h"
 #include "xla/service/hlo_module_config.h"
 #include "xla/service/hlo_parser.h"
-#include "xla/service/hlo_pass_interface.h"
 #include "xla/service/name_uniquer.h"
 #include "xla/service/tuple_simplifier.h"
 #include "xla/shape.h"
 #include "xla/shape_util.h"
+#include "xla/tsl/lib/strings/proto_serialization.h"
 #include "xla/util.h"
 #include "xla/xla.pb.h"
 #include "xla/xla_data.pb.h"
-#include "tsl/lib/strings/proto_serialization.h"
 #include "tsl/platform/env.h"
 #include "tsl/platform/errors.h"
 #include "tsl/platform/logging.h"
@@ -296,30 +296,82 @@ absl::StatusOr<HloSharding> IotaTileHelper(
                    subgroup_types);
 }
 
-// Registers a 'fn_capsule' as a custom call target.
-// 'fn_capsule' must be a void* pointer encapsulated in a PyCapsule object.
-// 'platform' is an XLA platform name, e.g., "Host" or "CUDA".
+// Registers a 'fn' as a custom call target.
+//
+// `fn` must be a custom call implementation function pointer (XLA_FFI_Handler*
+// when implemented as FFI handler) encapsulated in a PyCapsule object or a
+// a dictionary of function pointers (also encapsulated in a PyCapsule).
+//
+// See XLA_FFI_ExecutionStage documentation for more details about the
+// custom execution stages.
 absl::Status PyRegisterCustomCallTarget(const std::string& fn_name,
-                                        nb::capsule capsule,
+                                        nb::object fn,
                                         const std::string& platform,
-                                        int api_version) {
-  switch (api_version) {
-    case 0:
-      CustomCallTargetRegistry::Global()->Register(
-          fn_name, static_cast<void*>(capsule.data()), platform);
-      return absl::OkStatus();
-    case 1:
-      ffi::Ffi::RegisterStaticHandler(xla::ffi::GetXlaFfiApi(), fn_name,
-                                      platform,
-                                      reinterpret_cast<XLA_FFI_Handler*>(
-                                          static_cast<void*>(capsule.data())));
-      return absl::OkStatus();
-    default:
-      return absl::UnimplementedError(absl::StrFormat(
-          "API version %d is not supported by RegisterCustomCallTarget. "
-          "Supported versions are 0 and 1.",
-          api_version));
+                                        int api_version,
+                                        XLA_FFI_Handler_Traits traits) {
+  // Register legacy custom call target (untyped void* API).
+  if (api_version == 0) {
+    if (traits != 0) {
+      return absl::InvalidArgumentError(
+          "Custom call target registration with traits is not supported for "
+          "api_version=0");
+    }
+
+    nb::capsule capsule;
+    if (!nb::try_cast<nb::capsule>(fn, capsule)) {
+      return absl::InvalidArgumentError(
+          "Custom call target registration with api_version=0 requires a "
+          "PyCapsule fn object");
+    }
+
+    CustomCallTargetRegistry::Global()->Register(
+        fn_name, static_cast<void*>(capsule.data()), platform);
+    return absl::OkStatus();
   }
+
+  // Register XLA FFI handler (typed API with explicit function signatures).
+  if (api_version == 1) {
+    nb::capsule capsule;
+    if (nb::try_cast<nb::capsule>(fn, capsule)) {
+      return ffi::TakeStatus(ffi::Ffi::RegisterStaticHandler(
+          xla::ffi::GetXlaFfiApi(), fn_name, platform,
+          reinterpret_cast<XLA_FFI_Handler*>(
+              static_cast<void*>(capsule.data()))));
+    }
+
+    nb::dict bundle;
+    if (nb::try_cast<nb::dict>(fn, bundle)) {
+      auto handler = [&](const char* name) -> absl::StatusOr<XLA_FFI_Handler*> {
+        if (!bundle.contains(name)) return nullptr;
+
+        nb::capsule capsule;
+        if (!nb::try_cast<nb::capsule>(bundle[name], capsule)) {
+          return absl::InvalidArgumentError(
+              "Custom call target registration with api_version=1 requires a "
+              "PyCapsule fn object for all dict keys");
+        }
+
+        return reinterpret_cast<XLA_FFI_Handler*>(capsule.data());
+      };
+
+      XLA_FFI_Handler_Bundle bundle;
+      TF_ASSIGN_OR_RETURN(bundle.instantiate, handler("instantiate"));
+      TF_ASSIGN_OR_RETURN(bundle.prepare, handler("prepare"));
+      TF_ASSIGN_OR_RETURN(bundle.initialize, handler("initialize"));
+      TF_ASSIGN_OR_RETURN(bundle.execute, handler("execute"));
+
+      return ffi::TakeStatus(ffi::Ffi::RegisterStaticHandler(
+          xla::ffi::GetXlaFfiApi(), fn_name, platform, bundle, traits));
+    }
+
+    return absl::InvalidArgumentError(
+        "Unsupported custom call target type for api_version=1");
+  }
+
+  return absl::UnimplementedError(absl::StrFormat(
+      "API version %d is not supported by RegisterCustomCallTarget. "
+      "Supported versions are 0 and 1.",
+      api_version));
 }
 
 template <typename T, typename Container>
@@ -344,18 +396,64 @@ void DefRepeatedProperty(nb::class_<T>& cls, const char* name,
       });
 }
 
+template <typename T, typename Container>
+void DefRepeatedEnumProperty(nb::class_<T>& cls, const char* name,
+                             Container* (T::*getter)()) {
+  cls.def_prop_rw(
+      name,
+      [getter](T& obj) {
+        Container* elems = (obj.*getter)();
+        std::vector<typename Container::value_type> result;
+        result.reserve(elems->size());
+        std::copy(elems->begin(), elems->end(), std::back_inserter(result));
+        return result;
+      },
+      [getter](T& obj, nb::sequence new_elems) {
+        Container* elems = (obj.*getter)();
+        elems->Clear();
+        for (nb::handle e : new_elems) {
+          elems->Add(nb::cast<int>(e.attr("value")));
+        }
+      });
+}
+
 }  // namespace
 
 void BuildXlaCompilerSubmodule(nb::module_& m) {
   // Shapes
   nb::class_<Layout> layout_class(m, "Layout");
   layout_class.def(nb::init<absl::Span<const int64_t>>())
+      .def("__init__",
+           [](Layout* self, nb::sequence minor_to_major, nb::sequence tiling,
+              int64_t element_size_in_bits) {
+             std::vector<Tile> xla_tiles;
+             xla_tiles.reserve(nb::len(tiling.ptr()));
+             for (auto tile : tiling) {
+               xla_tiles.push_back(Tile(
+                   SequenceToVector<int64_t>(nb::cast<nb::sequence>(tile))));
+             }
+             std::vector<int64_t> xla_minor_to_major =
+                 SequenceToVector<int64_t>(minor_to_major);
+             new (self)
+                 Layout(xla_minor_to_major, xla_tiles, element_size_in_bits);
+           })
       .def("minor_to_major",
            [](Layout layout) { return SpanToNbTuple(layout.minor_to_major()); })
+      .def("element_size_in_bits", &Layout::element_size_in_bits)
+      .def("tiling",
+           [](Layout layout) {
+             std::vector<nb::tuple> result;
+             result.reserve(layout.tiles().size());
+             for (auto& t : layout.tiles()) {
+               result.push_back(SpanToNbTuple(t.dimensions()));
+             }
+             return result;
+           })
       .def("__eq__", [](const Layout& layout,
                         const Layout& other) { return layout == other; })
       .def("__ne__", [](const Layout& layout,
                         const Layout& other) { return layout != other; })
+      .def("__str__", &Layout::ToString)
       .def("__hash__",
            [](const Layout& layout) { return absl::HashOf(layout); })
       .def("to_string", &Layout::ToString)
@@ -818,7 +916,7 @@ void BuildXlaCompilerSubmodule(nb::module_& m) {
            xla::ValueOrThrowWrapper(
                [](const DeviceAssignment& da) -> absl::StatusOr<nb::bytes> {
                  DeviceAssignmentProto proto;
-                 TF_RETURN_IF_ERROR(da.Serialize(&proto));
+                 da.Serialize(&proto);
                  std::string result;
                  if (!tsl::SerializeToStringDeterministic(proto, &result)) {
                    return Unknown(
@@ -927,18 +1025,18 @@ void BuildXlaCompilerSubmodule(nb::module_& m) {
   // Custom-call targets.
   m.def(
       "register_custom_call_target",
-      [](nb::object fn_name_py, nb::capsule capsule,
-         const std::string& platform, const int api_version) {
+      [](nb::object fn_name_py, nb::object fn, const std::string& platform,
+         int api_version, XLA_FFI_Handler_Traits traits) {
         std::string fn_name;
         if (!nb::try_cast<std::string>(fn_name_py, fn_name)) {
           nb::bytes bytes = nb::cast<nb::bytes>(fn_name_py);
           fn_name = std::string(bytes.c_str(), bytes.size());
         }
         xla::ThrowIfError(PyRegisterCustomCallTarget(
-            fn_name, std::move(capsule), platform, api_version));
+            fn_name, std::move(fn), platform, api_version, traits));
       },
-      nb::arg("fn_name"), nb::arg("capsule"), nb::arg("platform"),
-      nb::arg("api_version") = 0);
+      nb::arg("fn_name"), nb::arg("fn"), nb::arg("platform"),
+      nb::arg("api_version") = 0, nb::arg("traits") = 0);
 
   m.def(
       "custom_call_targets",
@@ -949,10 +1047,21 @@ void BuildXlaCompilerSubmodule(nb::module_& m) {
           targets[nb::str(name.data(), name.size())] = nb::capsule(target);
         }
 
-        for (const auto& [name, registration] :
-             ffi::StaticRegisteredHandlers(platform)) {
-          targets[nb::str(name.data(), name.size())] =
-              nb::capsule(reinterpret_cast<void*>(registration.bundle.execute));
+        auto ffi_handlers = ffi::StaticRegisteredHandlers(platform);
+        if (!ffi_handlers.ok()) return targets;
+
+        for (const auto& [name, registration] : *ffi_handlers) {
+          nb::dict bundle;
+          auto export_handler = [&](std::string_view name, XLA_FFI_Handler* h) {
+            if (h != nullptr) {
+              bundle[nb::str(name.data(), name.size())] =
+                  nb::capsule(reinterpret_cast<void*>(h));
+            }
+          };
+          export_handler("prepare", registration.bundle.prepare);
+          export_handler("initialize", registration.bundle.initialize);
+          export_handler("execute", registration.bundle.execute);
+          targets[nb::str(name.data(), name.size())] = std::move(bundle);
         }
         return targets;
       },
@@ -1090,6 +1199,20 @@ void BuildXlaCompilerSubmodule(nb::module_& m) {
                    &DebugOptions::xla_gpu_dump_autotune_logs_to,
                    [](DebugOptions* self, std::string value) {
                      self->set_xla_gpu_dump_autotune_logs_to(value);
+                   })
+      .def_prop_rw("xla_gpu_kernel_cache_file",
+                   &DebugOptions::xla_gpu_kernel_cache_file,
+                   [](DebugOptions* self, std::string value) {
+                     self->set_xla_gpu_kernel_cache_file(value);
+                   })
+      .def_prop_rw(
+          "xla_gpu_enable_llvm_module_compilation_parallelism",
+          &DebugOptions::xla_gpu_enable_llvm_module_compilation_parallelism,
+          &DebugOptions::set_xla_gpu_enable_llvm_module_compilation_parallelism)
+      .def_prop_rw("xla_gpu_per_fusion_autotune_cache_dir",
+                   &DebugOptions::xla_gpu_per_fusion_autotune_cache_dir,
+                   [](DebugOptions* self, std::string value) {
+                     self->set_xla_gpu_per_fusion_autotune_cache_dir(value);
                    });
 
   nb::class_<ExecutableBuildOptions>(m, "ExecutableBuildOptions")
@@ -1164,9 +1287,13 @@ void BuildXlaCompilerSubmodule(nb::module_& m) {
           [](ExecutableBuildOptions& options, std::vector<bool> values) {
             absl::InlinedVector<bool, 1> v(values.begin(), values.end());
             options.set_allow_spmd_sharding_propagation_to_output(v);
-          });
+          })
+      .def_prop_rw("use_shardy_partitioner",
+                   &ExecutableBuildOptions::use_shardy_partitioner,
+                   &ExecutableBuildOptions::set_use_shardy_partitioner);
 
-  nb::enum_<OpSharding::Type> op_sharding_type(m, "OpSharding_Type");
+  nb::enum_<OpSharding::Type> op_sharding_type(m, "OpSharding_Type",
+                                               nb::is_arithmetic());
   op_sharding_type.value("REPLICATED", OpSharding::REPLICATED)
       .value("MAXIMAL", OpSharding::MAXIMAL)
       .value("MANUAL", OpSharding::MANUAL)
@@ -1234,8 +1361,8 @@ void BuildXlaCompilerSubmodule(nb::module_& m) {
                       &xla::OpSharding::mutable_iota_transpose_perm);
   DefRepeatedProperty(op_sharding, "tuple_shardings",
                       &xla::OpSharding::mutable_tuple_shardings);
-  DefRepeatedProperty(op_sharding, "last_tile_dims",
-                      &xla::OpSharding::mutable_last_tile_dims);
+  DefRepeatedEnumProperty(op_sharding, "last_tile_dims",
+                          &xla::OpSharding::mutable_last_tile_dims);
 
   nb::class_<HloSharding> hlo_sharding(m, "HloSharding");
   hlo_sharding

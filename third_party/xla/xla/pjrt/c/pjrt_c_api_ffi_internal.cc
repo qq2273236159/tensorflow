@@ -15,14 +15,31 @@ limitations under the License.
 
 #include "xla/pjrt/c/pjrt_c_api_ffi_internal.h"
 
+#include <string_view>
+
 #include "absl/status/status.h"
 #include "xla/ffi/execution_context.h"
+#include "xla/ffi/type_id_registry.h"
 #include "xla/pjrt/c/pjrt_c_api.h"
 #include "xla/pjrt/c/pjrt_c_api_ffi_extension.h"
 #include "xla/pjrt/c/pjrt_c_api_helpers.h"
 #include "xla/pjrt/c/pjrt_c_api_wrapper_impl.h"
 
 namespace pjrt {
+
+static PJRT_Error* PJRT_FFI_TypeID_Register(
+    PJRT_FFI_TypeID_Register_Args* args) {
+  PJRT_RETURN_IF_ERROR(ActualStructSizeIsGreaterOrEqual(
+      "PJRT_FFI_TypeID_Register_Args",
+      PJRT_FFI_TypeID_Register_Args_STRUCT_SIZE, args->struct_size));
+
+  PJRT_ASSIGN_OR_RETURN(
+      auto type_id,
+      xla::ffi::TypeIdRegistry::RegisterExternalTypeId(
+          std::string_view(args->type_name, args->type_name_size)));
+  args->type_id = type_id.value();
+  return nullptr;
+}
 
 static PJRT_Error* PJRT_FFI_UserData_Add(PJRT_FFI_UserData_Add_Args* args) {
   PJRT_RETURN_IF_ERROR(ActualStructSizeIsGreaterOrEqual(
@@ -34,7 +51,7 @@ static PJRT_Error* PJRT_FFI_UserData_Add(PJRT_FFI_UserData_Add_Args* args) {
         "PJRT FFI extension requires execute context to be not nullptr")};
   }
 
-  xla::ffi::ExecutionContext::TypeId type_id(args->user_data.type_id);
+  xla::ffi::TypeIdRegistry::TypeId type_id(args->user_data.type_id);
   PJRT_RETURN_IF_ERROR(args->context->execute_context->ffi_context().Insert(
       type_id, args->user_data.data, args->user_data.deleter));
   return nullptr;
@@ -45,7 +62,8 @@ PJRT_FFI_Extension CreateFfiExtension(PJRT_Extension_Base* next) {
       /*struct_size=*/PJRT_FFI_Extension_STRUCT_SIZE,
       /*type=*/PJRT_Extension_Type::PJRT_Extension_Type_FFI,
       /*next=*/next,
-      /*custom_call=*/PJRT_FFI_UserData_Add,
+      /*type_id_register=*/PJRT_FFI_TypeID_Register,
+      /*user_data_add=*/PJRT_FFI_UserData_Add,
   };
 }
 

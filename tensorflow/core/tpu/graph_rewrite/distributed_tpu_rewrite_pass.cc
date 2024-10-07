@@ -39,6 +39,7 @@ limitations under the License.
 #include "absl/container/flat_hash_set.h"
 #include "absl/status/status.h"
 #include "absl/strings/escaping.h"
+#include "absl/strings/match.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_format.h"
 #include "absl/strings/str_join.h"
@@ -573,7 +574,7 @@ Status FindHostComputeKeyPlaceholderNodes(
 
   for (Node* node : graph->op_nodes()) {
     if (node->type_string() == "Placeholder" &&
-        str_util::EndsWith(node->name(), "_key_placeholder")) {
+        absl::EndsWith(node->name(), "_key_placeholder")) {
       const AttrValue* call_node_attr =
           node->attrs().Find("_host_compute_call_node");
       if (call_node_attr != nullptr) {
@@ -2655,8 +2656,7 @@ Status DistributedTPURewritePass::BuildCompileNode(
   }
 
   if (xla_device_assignment != nullptr) {
-    TF_RETURN_IF_ERROR(
-        xla_device_assignment->Serialize(proto.mutable_device_assignment()));
+    xla_device_assignment->Serialize(proto.mutable_device_assignment());
   }
 
   const int num_args = arg_types.size();

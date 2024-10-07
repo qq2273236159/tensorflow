@@ -29,6 +29,7 @@ limitations under the License.
 #include "absl/container/flat_hash_set.h"
 #include "absl/container/inlined_vector.h"
 #include "absl/log/check.h"
+#include "absl/memory/memory.h"
 #include "absl/types/span.h"
 #include "xla/hlo/ir/hlo_computation.h"
 #include "xla/hlo/ir/hlo_instruction.h"
@@ -40,18 +41,20 @@ namespace {
 
 template <typename F>
 void ResolveUsers(const HloInstruction* value, const HloInstruction* user,
-                  const HloFusionAdaptor& fusion_adaptor, F&& fn) {
+                  const HloFusionAdaptor& fusion_adaptor, F&& add_user) {
   if (user->opcode() == HloOpcode::kTuple && user->IsRoot()) {
     if (auto* fusion = user->parent()->FusionInstruction()) {
       // Skip through the tuple -> get-tuple-element ops and directly go to the
       // "real" users.
       for (const auto* gte : fusion->users()) {
         if (gte->opcode() != HloOpcode::kGetTupleElement) {
-          fn(gte);
+          if (fusion_adaptor.ContainsInstruction(value)) {
+            add_user(gte);
+          }
           continue;
         }
         for (const auto* gte_user : gte->users()) {
-          ResolveUsers(gte, gte_user, fusion_adaptor, fn);
+          ResolveUsers(gte, gte_user, fusion_adaptor, add_user);
         }
       }
     }
@@ -59,10 +62,10 @@ void ResolveUsers(const HloInstruction* value, const HloInstruction* user,
              user->opcode() == HloOpcode::kFusion) {
     auto* param = user->fused_parameter(user->operand_index(value));
     for (const auto* param_user : param->users()) {
-      fn(param_user);
+      add_user(param_user);
     }
-  } else {
-    fn(user);
+  } else if (fusion_adaptor.ContainsInstruction(user)) {
+    add_user(user);
   }
 }
 
@@ -127,6 +130,11 @@ class SingleInstructionFusion : public internal::HloFusionInstructionAdaptor {
   absl::InlinedVector<HloInstructionAdaptor, 2> MakeInstructionPostOrder()
       const override {
     return {HloInstructionAdaptor{*instruction_, parent_}};
+  }
+
+  void ForEach(
+      const std::function<void(HloInstructionAdaptor)>& fn) const override {
+    fn(HloInstructionAdaptor{*instruction_, parent_});
   }
 
   std::string ToString() const override { return instruction_->ToString(); }
@@ -219,6 +227,20 @@ class HloComputationFusion : public internal::HloFusionInstructionAdaptor {
     return result;
   }
 
+  void ForEach(
+      const std::function<void(HloInstructionAdaptor)>& fn) const override {
+    for (const HloInstruction* instr : computation_->instructions()) {
+      // HloFusionAdaptor hides existence of parameters, tuples and gte
+      // instructions.
+      if (instr->opcode() == HloOpcode::kParameter ||
+          instr->opcode() == HloOpcode::kTuple ||
+          instr->opcode() == HloOpcode::kGetTupleElement) {
+        continue;
+      }
+      fn(HloInstructionAdaptor{*instr, parent_});
+    }
+  }
+
   std::string ToString() const override { return computation_->ToString(); }
 
  private:
@@ -234,7 +256,7 @@ std::unique_ptr<HloFusionAdaptor> HloFusionAdaptor::ForInstruction(
     return ForComputation(instruction->fused_instructions_computation());
   }
 
-  auto fusion_adaptor = std::make_unique<HloFusionAdaptor>();
+  auto fusion_adaptor = absl::WrapUnique(new HloFusionAdaptor);
   fusion_adaptor->AddInstruction(instruction);
   return fusion_adaptor;
 }
@@ -242,7 +264,7 @@ std::unique_ptr<HloFusionAdaptor> HloFusionAdaptor::ForInstruction(
 /*static*/
 std::unique_ptr<HloFusionAdaptor> HloFusionAdaptor::ForProducerConsumer(
     const HloInstruction* producer, const HloInstruction* consumer) {
-  auto fusion_adaptor = std::make_unique<HloFusionAdaptor>();
+  auto fusion_adaptor = absl::WrapUnique(new HloFusionAdaptor);
   fusion_adaptor->AddInstruction(producer);
   fusion_adaptor->AddInstruction(consumer);
   return fusion_adaptor;
@@ -251,7 +273,7 @@ std::unique_ptr<HloFusionAdaptor> HloFusionAdaptor::ForProducerConsumer(
 /*static*/
 std::unique_ptr<HloFusionAdaptor> HloFusionAdaptor::ForComputation(
     const HloComputation* computation) {
-  auto fusion_adaptor = std::make_unique<HloFusionAdaptor>();
+  auto fusion_adaptor = absl::WrapUnique(new HloFusionAdaptor);
   fusion_adaptor->AddComputation(computation);
   return fusion_adaptor;
 }
@@ -364,10 +386,17 @@ absl::InlinedVector<const HloInstruction*, 2> HloFusionAdaptor::GetParameters()
   absl::flat_hash_set<const HloInstruction*> parameters_to_skip;
   // Skip parameters that have just have a root user. Those will not be fused.
   for (const auto& root : producer_roots) {
-    if (root.opcode() == HloOpcode::kParameter &&
-        root.instruction().user_count() <= 1) {
-      parameters_to_skip.insert(
-          producer_fusion.operand(root.instruction().parameter_number()));
+    if (root.opcode() == HloOpcode::kParameter) {
+      // If the root instruction is both a parameter and the fusion instruction,
+      // then the producer fusion is a single instruction fusion of a parameter
+      // instruction. In that case, the parameter number refers to a parameter
+      // in the parent computation, and we mustn't query its operands.
+      if (&root.instruction() == &producer_fusion) {
+        parameters_to_skip.insert(&producer_fusion);
+      } else if (root.instruction().user_count() <= 1) {
+        parameters_to_skip.insert(
+            producer_fusion.operand(root.instruction().parameter_number()));
+      }
     }
   }
   for (auto param : fusion_instructions_[0]->GetParameters()) {
@@ -388,6 +417,13 @@ HloFusionAdaptor::MakeInstructionPostOrder() const {
   }
 
   return result_post_order;
+}
+
+void HloFusionAdaptor::ForEach(
+    const std::function<void(HloInstructionAdaptor)>& fn) const {
+  for (const auto& fusion_instruction : fusion_instructions_) {
+    fusion_instruction->ForEach(fn);
+  }
 }
 
 std::string HloFusionAdaptor::ToString() const {
@@ -432,6 +468,12 @@ HloInstructionAdaptor::GetOperands() const {
   return operands;
 }
 
+HloInstructionAdaptor::HloInstructionAdaptor(const HloInstruction& instruction,
+                                             const HloFusionAdaptor* parent)
+    : instruction_(&instruction), parent_(parent) {
+  CHECK_NE(parent, nullptr) << "Parent fusion adaptor must not be null";
+}
+
 HloInstructionAdaptor HloInstructionAdaptor::GetOperand(int index) const {
   return HloInstructionAdaptor{
       *ResolveOperand(instruction_->operand(index), *parent_), parent_};
@@ -465,13 +507,17 @@ bool operator==(const HloInstructionAdaptor& lhs,
          lhs.instruction_->unique_id() == rhs.instruction_->unique_id();
 }
 
+bool operator!=(const HloInstructionAdaptor& lhs,
+                const HloInstructionAdaptor& rhs) {
+  return !(lhs == rhs);
+}
+
 namespace {
 void HloBfsTraversal(
     absl::Span<const HloInstructionAdaptor> roots,
     const HloFusionAdaptor& fusion,
     const std::function<TraversalResult(HloInstructionAdaptor node)>&
         visit_node,
-    const std::function<void(HloInstructionAdaptor producer)>& visit_arg,
     bool visit_operands) {
   absl::flat_hash_set<HloInstructionAdaptor> visited;
   std::queue<HloInstructionAdaptor> q;
@@ -479,12 +525,8 @@ void HloBfsTraversal(
     const auto& adjacent_nodes =
         visit_operands ? node.GetOperands() : node.GetUsers();
     for (const auto& node : adjacent_nodes) {
-      if (visited.insert(node).second) {
-        if (fusion.ContainsInstruction(node)) {
-          q.push(node);
-        } else {
-          visit_arg(node);
-        }
+      if (fusion.ContainsInstruction(node) && visited.insert(node).second) {
+        q.push(node);
       }
     }
   };
@@ -513,9 +555,8 @@ void HloBfsConsumersFirstTraversal(
     absl::Span<const HloInstructionAdaptor> roots,
     const HloFusionAdaptor& fusion,
     const std::function<TraversalResult(HloInstructionAdaptor node)>&
-        visit_node,
-    const std::function<void(HloInstructionAdaptor producer)>& visit_arg) {
-  HloBfsTraversal(roots, fusion, visit_node, visit_arg,
+        visit_node) {
+  HloBfsTraversal(roots, fusion, visit_node,
                   /*visit_operands=*/true);
 }
 
@@ -524,33 +565,24 @@ void HloBfsProducersFirstTraversal(
     const HloFusionAdaptor& fusion,
     const std::function<TraversalResult(HloInstructionAdaptor node)>&
         visit_node) {
-  HloBfsTraversal(
-      producers, fusion, visit_node, [](HloInstructionAdaptor) {},
-      /*visit_operands=*/false);
+  HloBfsTraversal(producers, fusion, visit_node,
+                  /*visit_operands=*/false);
 }
 
-void FindFusionArguments(
-    const HloFusionAdaptor& fusion,
-    const std::function<void(HloInstructionAdaptor param)>& visit) {
-  HloBfsConsumersFirstTraversal(
-      fusion.GetRoots(), fusion,
-      [&](HloInstructionAdaptor) { return TraversalResult::kAdvance; }, visit);
+bool HloBfsAnyOf(absl::Span<const HloInstructionAdaptor> roots,
+                 const HloFusionAdaptor& fusion,
+                 const std::function<bool(HloInstructionAdaptor node)>& visit,
+                 bool visit_operands) {
+  return HloBfsFindIf(roots, fusion, visit, visit_operands).has_value();
 }
 
-bool HloAnyOf(absl::Span<const HloInstructionAdaptor> roots,
-              const HloFusionAdaptor& fusion,
-              const std::function<bool(HloInstructionAdaptor node)>& visit,
-              bool visit_operands) {
-  return HloFindIf(roots, fusion, visit, visit_operands).has_value();
+bool HloBfsAnyOf(absl::Span<const HloInstruction* const> roots,
+                 const std::function<bool(const HloInstruction* node)>& visit,
+                 bool visit_operands) {
+  return HloBfsFindIf(roots, visit, visit_operands).has_value();
 }
 
-bool HloAnyOf(absl::Span<const HloInstruction* const> roots,
-              const std::function<bool(const HloInstruction* node)>& visit,
-              bool visit_operands) {
-  return HloFindIf(roots, visit, visit_operands).has_value();
-}
-
-std::optional<HloInstructionAdaptor> HloFindIf(
+std::optional<HloInstructionAdaptor> HloBfsFindIf(
     absl::Span<const HloInstructionAdaptor> roots,
     const HloFusionAdaptor& fusion,
     const std::function<bool(HloInstructionAdaptor node)>& visit,
@@ -565,14 +597,15 @@ std::optional<HloInstructionAdaptor> HloFindIf(
         }
         return TraversalResult::kAdvance;
       },
-      [](HloInstructionAdaptor) {}, visit_operands);
+      visit_operands);
   return result;
 }
 
-std::optional<const HloInstruction*> HloFindIf(
+std::vector<const HloInstruction*> HloFindAllImpl(
     absl::Span<const HloInstruction* const> roots,
     const std::function<bool(const HloInstruction* node)>& visit,
-    bool visit_operands) {
+    bool visit_operands, bool find_first_only = false) {
+  std::vector<const HloInstruction*> result;
   absl::flat_hash_set<const HloInstruction*> visited;
   std::queue<const HloInstruction*> q;
   auto enqueue = [&](const HloInstruction* node) {
@@ -599,11 +632,34 @@ std::optional<const HloInstruction*> HloFindIf(
     const HloInstruction* node = q.front();
     q.pop();
     if (visit(node)) {
-      return node;
+      result.push_back(node);
+      if (find_first_only) {
+        return result;
+      }
     }
     enqueue(node);
   }
-  return std::nullopt;
+  return result;
+}
+
+std::optional<const HloInstruction*> HloBfsFindIf(
+    absl::Span<const HloInstruction* const> roots,
+    const std::function<bool(const HloInstruction* node)>& visit,
+    bool visit_operands) {
+  auto result = HloFindAllImpl(roots, visit, visit_operands,
+                               /*find_first_only=*/true);
+  if (result.empty()) {
+    return std::nullopt;
+  }
+  return result[0];
+}
+
+std::vector<const HloInstruction*> HloBfsFindAll(
+    absl::Span<const HloInstruction* const> roots,
+    const std::function<bool(const HloInstruction* node)>& visit,
+    bool visit_operands) {
+  std::vector<const HloInstruction*> result;
+  return HloFindAllImpl(roots, visit, visit_operands);
 }
 
 std::vector<HloInstructionAdaptor> HloFindUseChain(HloInstructionAdaptor parent,

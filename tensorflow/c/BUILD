@@ -309,8 +309,6 @@ tf_cuda_library(
             "//tensorflow/cc:scope_internal",
             "//tensorflow/cc:while_loop",
             "//tensorflow/cc/saved_model:loader_lite",
-            "//tensorflow/compiler/mlir/tfr:graph_decompose_pass",
-            "//tensorflow/compiler/mlir/tfr:node_expansion_pass",
             "//tensorflow/core:core_cpu",
             "//tensorflow/core:core_cpu_internal",
             "//tensorflow/core:framework",
@@ -349,8 +347,6 @@ tf_cuda_library(
     ],
     visibility = [
         "//tensorflow/c:__subpackages__",
-        "//tensorflow/cc/experimental/libtf:__pkg__",
-        "//tensorflow/cc/experimental/libtf:__subpackages__",
         # copybara:uncomment_begin(google-only)
         # "//tensorflow/cc/experimental/tf2:__pkg__",
         # "//tensorflow/cc/experimental/tf2:__subpackages__",
@@ -749,7 +745,10 @@ tf_cuda_library(
         ":tf_status",
         ":tf_status_helper",
         "//tensorflow/core/platform:env",
+        "//tensorflow/core/platform:file_statistics",
         "//tensorflow/core/platform:path",
+        "//tensorflow/core/platform:status",
+        "//tensorflow/core/platform:stringpiece",
         "//tensorflow/core/platform:types",
     ],
 )
@@ -810,9 +809,9 @@ tf_cuda_library(
             "//tensorflow/core:framework",
             "//tensorflow/core:framework_lite",
             "//tensorflow/core:protos_all_cc",
-            "@local_tsl//tsl/framework:device_id_utils",
             "@local_tsl//tsl/platform:statusor",
             "@local_xla//xla/stream_executor",
+            "@local_xla//xla/tsl/framework:device_id_utils",
         ],
     }),
 )

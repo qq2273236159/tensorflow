@@ -20,28 +20,36 @@ limitations under the License.
 #include <utility>
 #include <vector>
 
+#include "absl/log/check.h"
+#include "absl/status/status.h"
+#include "absl/strings/string_view.h"
 #include "absl/types/span.h"
 #include "xla/hlo/ir/hlo_computation.h"
 #include "xla/hlo/ir/hlo_instruction.h"
 #include "xla/hlo/ir/hlo_module.h"
 #include "xla/hlo/ir/hlo_opcode.h"
+#include "xla/layout.h"
 #include "xla/layout_util.h"
 #include "xla/literal.h"
+#include "xla/literal_util.h"
 #include "xla/service/algebraic_simplifier.h"
 #include "xla/service/computation_layout.h"
 #include "xla/service/hlo_parser.h"
+#include "xla/service/logical_buffer.h"
 #include "xla/service/pattern_matcher.h"
 #include "xla/service/pattern_matcher_gmock.h"
+#include "xla/shape.h"
 #include "xla/shape_layout.h"
 #include "xla/shape_util.h"
 #include "xla/test.h"
 #include "xla/test_helpers.h"
 #include "xla/tests/hlo_test_base.h"
-#include "xla/tests/test_utils.h"
+#include "xla/tsl/lib/core/status_test_util.h"
 #include "xla/util.h"
 #include "xla/xla_data.pb.h"
-#include "tsl/lib/core/status_test_util.h"
+#include "tsl/platform/errors.h"
 #include "tsl/platform/status.h"
+#include "tsl/platform/statusor.h"
 
 namespace xla {
 namespace {
@@ -645,12 +653,13 @@ TEST_F(LayoutAssignmentTest, TransposeWithinFusionDoesNotCrash) {
                          /*device_allocator=*/nullptr)
           .value();
 
-  EXPECT_EQ(OkStatus(), backend()
-                            .compiler()
-                            ->RunBackend(std::move(compiled_module),
-                                         backend().default_stream_executor(),
-                                         /*device_allocator=*/nullptr)
-                            .status());
+  EXPECT_EQ(absl::OkStatus(),
+            backend()
+                .compiler()
+                ->RunBackend(std::move(compiled_module),
+                             backend().default_stream_executor(),
+                             /*device_allocator=*/nullptr)
+                .status());
 }
 
 // A GTE inside of a fusion node inherits the layout of its operand (which
@@ -862,6 +871,35 @@ TEST_F(LayoutAssignmentTest, ChannelLayoutMismatch) {
 
   EXPECT_TRUE(ShapeUtil::Equal(FindInstruction(m.get(), "send")->shape(),
                                FindInstruction(m.get(), "recv")->shape()));
+}
+
+TEST_F(LayoutAssignmentTest, AllReduceSpmd) {
+  // Pin non matching layouts to parameter and root.
+  const char* module_str = R"(
+    HloModule test_module, num_partitions=2
+
+    add {
+      lhs = f32[] parameter(0)
+      rhs = f32[] parameter(1)
+      ROOT add = f32[] add(lhs, rhs)
+    }
+
+    ENTRY entry_computation {
+      param = f32[2,2] parameter(0)
+      ar.0 = f32[2,2] all-reduce(param),
+        channel_id=1, replica_groups={{0}}, to_apply=add
+      p1 = f32[2] parameter(1)
+      ar.1 = f32[2] all-reduce(p1),
+        channel_id=1, replica_groups={{0}}, to_apply=add
+      ROOT t = tuple(ar.0, ar.1)
+    })";
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> m,
+                          ParseAndReturnVerifiedModule(module_str));
+  // Check that assign layouts does not crash with repeated channel_id and
+  // different shapes.
+  ComputationLayout computation_layout(
+      m->entry_computation()->ComputeProgramShape());
+  AssignLayouts(m.get(), &computation_layout);
 }
 
 TEST_F(LayoutAssignmentTest, AllReduceLayoutMissmatch) {

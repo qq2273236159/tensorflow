@@ -37,6 +37,7 @@ limitations under the License.
 #include "xla/stream_executor/kernel_spec.h"
 #include "xla/stream_executor/launch_dim.h"
 #include "xla/stream_executor/stream_executor.h"
+#include "xla/tsl/protobuf/dnn.pb.h"
 #include "xla/xla_data.pb.h"
 
 // Helper functions for interacting with StreamExecutor.
@@ -44,9 +45,13 @@ limitations under the License.
 namespace xla {
 namespace gpu {
 
+// Returns DNN version info from provided stream executor.
+absl::StatusOr<se::dnn::VersionInfo> GetDnnVersionInfo(
+    stream_executor::StreamExecutor* stream_exec);
+
 // Returns DNN version info from provided stream executor when possible,
 // fallback version otherwise.
-se::dnn::VersionInfo GetDnnVersionInfo(
+se::dnn::VersionInfo GetDnnVersionInfoOrDefault(
     stream_executor::StreamExecutor* stream_exec,
     se::dnn::VersionInfo fallback_version = se::dnn::VersionInfo{0, 0, 0});
 

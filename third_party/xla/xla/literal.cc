@@ -33,11 +33,12 @@ limitations under the License.
 #include "absl/base/casts.h"
 #include "absl/container/inlined_vector.h"
 #include "absl/functional/function_ref.h"
+#include "absl/status/status.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_format.h"
 #include "absl/strings/string_view.h"
 #include "absl/types/span.h"
-#include "Eigen/Core"  // from @eigen_archive
+#include "Eigen/Core"
 #include "xla/index_util.h"
 #include "xla/layout.h"
 #include "xla/layout_util.h"
@@ -47,13 +48,12 @@ limitations under the License.
 #include "xla/shape.h"
 #include "xla/shape_tree.h"
 #include "xla/shape_util.h"
-#include "xla/status.h"
 #include "xla/status_macros.h"
+#include "xla/tsl/lib/core/bitmap.h"
 #include "xla/tsl/util/byte_swap_array.h"
 #include "xla/types.h"
 #include "xla/util.h"
 #include "xla/xla_data.pb.h"
-#include "tsl/lib/core/bitmap.h"
 #include "tsl/platform/errors.h"
 #include "tsl/platform/logging.h"  // IWYU pragma: keep
 #include "tsl/platform/mem.h"
@@ -91,9 +91,10 @@ bool LiteralProtoHasValues(const LiteralProto& proto) {
          !proto.s16s().empty() || proto.s32s_size() || proto.s64s_size() ||
          !proto.u2s().empty() || !proto.u4s().empty() || !proto.u8s().empty() ||
          !proto.u16s().empty() || proto.u32s_size() || proto.u64s_size() ||
-         !proto.f8e5m2s().empty() || !proto.f8e4m3fns().empty() ||
-         !proto.f8e4m3b11fnuzs().empty() || !proto.f8e5m2fnuzs().empty() ||
-         !proto.f8e4m3fnuzs().empty() || !proto.f16s().empty() ||
+         !proto.f8e5m2s().empty() || !proto.f8e4m3s().empty() ||
+         !proto.f8e4m3fns().empty() || !proto.f8e4m3b11fnuzs().empty() ||
+         !proto.f8e5m2fnuzs().empty() || !proto.f8e4m3fnuzs().empty() ||
+         !proto.f8e3m4s().empty() || !proto.f16s().empty() ||
          !proto.bf16s().empty() || proto.f32s_size() || proto.f64s_size() ||
          proto.c64s_size() || proto.c128s_size() || proto.preds_size() ||
          proto.tuple_literals_size();
@@ -252,7 +253,7 @@ Literal::Literal(const Shape& shape)
 void Literal::SetShape(const Shape& shape) {
   Shape shape_storage;
   const Shape* shape_ptr = &shape;
-  if (LayoutUtil::HasCustomElementSizeInBits(shape)) {
+  if (shape.IsArray() && LayoutUtil::HasCustomElementSizeInBits(shape)) {
     shape_storage = shape;
     shape_storage.mutable_layout()->set_element_size_in_bits(0);
     shape_ptr = &shape_storage;
@@ -842,7 +843,7 @@ absl::Status MutableLiteralBase::CopySliceFrom(
   TF_RET_CHECK(src_literal.shape().rank() == src_base.size());
   TF_RET_CHECK(shape().rank() == dest_base.size());
 
-  return primitive_util::ArrayTypeSwitch<Status>(
+  return primitive_util::ArrayTypeSwitch<absl::Status>(
       [&](auto primitive_type_constant) -> absl::Status {
         using NativeT = NativeTypeOf<primitive_type_constant>;
         return CopySliceFromInternal<NativeT>(src_literal, src_base, dest_base,
@@ -1384,7 +1385,7 @@ std::optional<complex128> LiteralBase::GetAsComplex128(
 absl::Status MutableLiteralBase::SetIntegralAsS64(
     absl::Span<const int64_t> multi_index, int64_t value) {
   CHECK(LayoutUtil::IsDenseArray(shape()));
-  return primitive_util::PrimitiveTypeSwitch<Status>(
+  return primitive_util::PrimitiveTypeSwitch<absl::Status>(
       [&](auto primitive_type_constant) -> absl::Status {
         if constexpr (primitive_util::IsIntegralType(primitive_type_constant) ||
                       primitive_type_constant == PRED) {
@@ -1684,7 +1685,15 @@ void ConvertBetweenNativeTypes(absl::Span<const NativeSrcT> src_data,
         return std::numeric_limits<NativeDestT>::lowest();
       }
     }
-    return static_cast<NativeDestT>(src);
+    // TODO(b/370786669): Once ml_dtypes is updated to include
+    // https://github.com/jax-ml/ml_dtypes/pull/205, do not special-case e3m4 by
+    // casting to half first.
+    if constexpr (sizeof(src) == 1 &&
+                  std::is_same_v<NativeDestT, tsl::float8_e3m4>) {
+      return static_cast<NativeDestT>(static_cast<half>(src));
+    } else {
+      return static_cast<NativeDestT>(src);
+    }
   };
 
   NativeDestT* dest_data = static_cast<NativeDestT*>(dst_base);
@@ -1703,7 +1712,7 @@ absl::Status ConvertIfDestTypeMatches(const LiteralBase& src_literal,
   auto src_data = src_literal.data<NativeSrcT>();
   void* dst_base = dst_literal.untyped_data();
   DCHECK_EQ(src_data.size(), dst_literal.element_count());
-  return primitive_util::ArrayTypeSwitch<Status>(
+  return primitive_util::ArrayTypeSwitch<absl::Status>(
       [&](auto primitive_type_constant) -> absl::Status {
         if constexpr (primitive_util::IsComplexType(kSrcType) &&
                       !primitive_util::IsComplexType(primitive_type_constant)) {
@@ -1739,7 +1748,7 @@ absl::StatusOr<Literal> ConvertSwitch(const LiteralBase& literal,
   // duplicating it N^2 times in the conversion implementation.
   Literal result(
       ShapeUtil::ChangeElementType(literal.shape(), primitive_dest_type));
-  TF_RETURN_IF_ERROR(primitive_util::ArrayTypeSwitch<Status>(
+  TF_RETURN_IF_ERROR(primitive_util::ArrayTypeSwitch<absl::Status>(
       [&](auto primitive_type_constant) -> absl::Status {
         return ConvertIfDestTypeMatches<primitive_type_constant>(literal,
                                                                  result);
@@ -1891,39 +1900,42 @@ bool LiteralBase::Piece::EqualElements(const LiteralBase::Piece& other) const {
       subshape().element_type());
 }
 
-bool LiteralBase::operator==(const LiteralBase& other) const {
+bool LiteralBase::Equal(const LiteralBase& other, bool layout_sensitive) const {
   // Checking the structure of tuple literals. Checks for dense arrays are
   // performed below.
   if (!ShapeUtil::EqualStructure(shape(), other.shape())) {
     return false;
   }
 
-  return root_piece().ForEachSubpieceWithBool(
-      [&](const ShapeIndex& index, const Piece& piece) {
-        const Piece& other_piece = other.piece(index);
-        const Shape& subshape = piece.subshape();
-        const Shape& other_subshape = other_piece.subshape();
-        if (subshape.element_type() != other_subshape.element_type()) {
-          return false;
-        }
-        if (!piece.subshape().IsArray()) {
-          return true;
-        }
-        if (subshape.rank() != other_subshape.rank()) {
-          return false;
-        }
+  return root_piece().ForEachSubpieceWithBool([&](const ShapeIndex& index,
+                                                  const Piece& piece) {
+    const Piece& other_piece = other.piece(index);
+    const Shape& subshape = piece.subshape();
+    const Shape& other_subshape = other_piece.subshape();
+    if (subshape.element_type() != other_subshape.element_type()) {
+      return false;
+    }
+    if (!piece.subshape().IsArray()) {
+      return true;
+    }
+    if (subshape.rank() != other_subshape.rank()) {
+      return false;
+    }
+    if (layout_sensitive && (subshape.layout() != other_subshape.layout())) {
+      return false;
+    }
 
-        for (int64_t i = 0; i < subshape.rank(); ++i) {
-          if (piece.GetDynamicSize(i) != other_piece.GetDynamicSize(i)) {
-            return false;
-          }
-        }
+    for (int64_t i = 0; i < subshape.rank(); ++i) {
+      if (piece.GetDynamicSize(i) != other_piece.GetDynamicSize(i)) {
+        return false;
+      }
+    }
 
-        if (!piece.EqualElements(other_piece)) {
-          return false;
-        }
-        return true;
-      });
+    if (!piece.EqualElements(other_piece)) {
+      return false;
+    }
+    return true;
+  });
 }
 
 template <typename NativeT>
@@ -1947,7 +1959,7 @@ template <typename NativeT>
 static bool AllElementsEqualValue(absl::Span<const NativeT> data,
                                   NativeT value) {
   for (int64_t i = 0; i < data.size(); ++i) {
-    if (!EqualIncludingNan(data[i], value)) {
+    if (memcmp(&data[i], &value, sizeof value)) {
       return false;
     }
   }
@@ -2255,6 +2267,11 @@ void LiteralBase::Piece::WriteToProto(LiteralProto* proto) const {
           reinterpret_cast<const char*>(data<tsl::float8_e5m2>().data()),
           size_bytes_dense());
       break;
+    case F8E4M3:
+      *proto->mutable_f8e4m3s() = std::string(
+          reinterpret_cast<const char*>(data<tsl::float8_e4m3>().data()),
+          size_bytes_dense());
+      break;
     case F8E4M3FN:
       *proto->mutable_f8e4m3fns() = std::string(
           reinterpret_cast<const char*>(data<tsl::float8_e4m3fn>().data()),
@@ -2273,6 +2290,11 @@ void LiteralBase::Piece::WriteToProto(LiteralProto* proto) const {
     case F8E4M3FNUZ:
       *proto->mutable_f8e4m3fnuzs() = std::string(
           reinterpret_cast<const char*>(data<tsl::float8_e4m3fnuz>().data()),
+          size_bytes_dense());
+      break;
+    case F8E3M4:
+      *proto->mutable_f8e3m4s() = std::string(
+          reinterpret_cast<const char*>(data<tsl::float8_e3m4>().data()),
           size_bytes_dense());
       break;
     case F16:
@@ -2433,6 +2455,13 @@ absl::Status LiteralBase::Piece::CopyFromProto(const LiteralProto& proto) {
       memcpy(untyped_data(), s.data(), s.size());
       break;
     }
+    case F8E4M3: {
+      const std::string& s(proto.f8e4m3s());
+      TF_RET_CHECK(data<tsl::float8_e4m3>().size() * sizeof(tsl::float8_e4m3) ==
+                   s.size());
+      memcpy(untyped_data(), s.data(), s.size());
+      break;
+    }
     case F8E4M3FN: {
       const std::string& s(proto.f8e4m3fns());
       TF_RET_CHECK(data<tsl::float8_e4m3fn>().size() *
@@ -2461,6 +2490,13 @@ absl::Status LiteralBase::Piece::CopyFromProto(const LiteralProto& proto) {
       const std::string& s(proto.f8e4m3fnuzs());
       TF_RET_CHECK(data<tsl::float8_e4m3fnuz>().size() *
                        sizeof(tsl::float8_e4m3fnuz) ==
+                   s.size());
+      memcpy(untyped_data(), s.data(), s.size());
+      break;
+    }
+    case F8E3M4: {
+      const std::string& s(proto.f8e3m4s());
+      TF_RET_CHECK(data<tsl::float8_e3m4>().size() * sizeof(tsl::float8_e3m4) ==
                    s.size());
       memcpy(untyped_data(), s.data(), s.size());
       break;

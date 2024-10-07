@@ -23,12 +23,12 @@ limitations under the License.
 #include <vector>
 
 #include "absl/container/flat_hash_map.h"
+#include "absl/status/status.h"
+#include "absl/status/statusor.h"
 #include "xla/hlo/ir/hlo_computation.h"
 #include "xla/hlo/ir/hlo_instruction.h"
 #include "xla/hlo/ir/hlo_module.h"
 #include "xla/service/hlo_alias_analysis.h"
-#include "xla/status.h"
-#include "xla/statusor.h"
 #include "tsl/platform/status.h"
 
 namespace xla {

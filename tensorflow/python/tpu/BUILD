@@ -154,6 +154,7 @@ pytype_strict_library(
     deps = [
         ":topology",
         "//tensorflow/python/platform:tf_logging",
+        "//tensorflow/python/util:numpy_compat",
         "//tensorflow/python/util:tf_export",
         "//third_party/py/numpy",
     ],
@@ -211,6 +212,7 @@ pytype_strict_library(
     srcs_version = "PY3",
     deps = [
         "//tensorflow/core/protobuf/tpu:topology_proto_py",
+        "//tensorflow/python/util:numpy_compat",
         "//tensorflow/python/util:tf_export",
         "//third_party/py/numpy",
     ],
@@ -1002,7 +1004,6 @@ py_strict_library(
 tf_proto_library(
     name = "tensor_tracer_proto",
     srcs = ["tensor_tracer.proto"],
-    cc_api_version = 2,
     protodeps = [
         "//tensorflow/core:protos_all",
     ],
@@ -1012,7 +1013,6 @@ tf_proto_library(
 # copybara:uncomment_begin(google-only)
 # py_proto_library(
 #     name = "tensor_tracer_py_pb2",
-#     api_version = 2,
 #     visibility = ["//visibility:public"],
 #     deps = [":tensor_tracer_proto"],
 # )
@@ -1049,12 +1049,8 @@ tf_python_pybind_extension(
     deps = [
         "//tensorflow/core/tpu/kernels:sparse_core_ops_utils",
         "//tensorflow/python/lib/core:pybind11_lib",
-        "//tensorflow/python/lib/core:pybind11_status",
-        "//tensorflow/python/lib/core:pybind11_status_headers",
         "//third_party/python_runtime:headers",  # buildcleaner: keep
         "@pybind11",
-        "@pybind11_abseil//pybind11_abseil:absl_casters",
-        "@pybind11_protobuf//pybind11_protobuf:native_proto_caster",
     ],
 )
 
@@ -1066,6 +1062,8 @@ py_strict_library(
         ":_pywrap_tpu_embedding",
         ":tpu_embedding_base",
         ":tpu_embedding_v2_utils",
+        ":tpu_embedding_v3_checkpoint_adapter",
+        ":tpu_embedding_v3_utils",
         ":tpu_replication",
         "//tensorflow/core:protos_all_py",
         "//tensorflow/core/tpu/kernels:sparse_core_layout_proto_py",
@@ -1112,6 +1110,7 @@ tpu_py_strict_test(
     # copybara:uncomment disable_v4i = True,
     # copybara:uncomment disable_v5 = False,
     # copybara:uncomment disable_v5_grm = True,
+    # copybara:uncomment disable_v6e = True,
     python_version = "PY3",
     shard_count = 4,
     srcs_version = "PY3",
@@ -1132,11 +1131,68 @@ tpu_py_strict_test(
         "//tensorflow/python/framework:sparse_tensor",
         "//tensorflow/python/ops:array_ops",
         "//tensorflow/python/ops:init_ops_v2",
+        "//tensorflow/python/ops:math_ops",
         "//tensorflow/python/ops:sparse_ops",
         "//tensorflow/python/ops:variables",
         "//tensorflow/python/platform:client_testlib",
         "//tensorflow/python/util:nest",
         "//third_party/py/numpy",
+        "@absl_py//absl/testing:parameterized",
+    ],
+)
+
+tpu_py_strict_test(
+    name = "tpu_embedding_v3_additional_test",
+    srcs = ["tpu_embedding_v3_additional_test.py"],
+    args = [
+        "--tpu=''",
+    ],
+    disable_experimental = True,
+    disable_tfrt = False,
+    disable_v2 = True,
+    disable_v3 = True,
+    # copybara:uncomment disable_v4i = True,
+    # copybara:uncomment disable_v5 = False,
+    # copybara:uncomment disable_v5_grm = True,
+    env = {
+        "TF_XLA_FLAGS": (
+            "--tf_mlir_enable_mlir_bridge=true " +
+            "--tf_mlir_enable_convert_control_to_data_outputs_pass=true " +
+            "--tf_mlir_enable_merge_control_flow_pass=true " +
+            "--tf_mlir_enable_strict_clusters=true " +
+            # These tests run lookup without while loops.
+            "--tf_xla_disable_full_embedding_pipelining=true"
+        ),
+    },
+    python_version = "PY3",
+    # Make it so there are enough shards so each test runs in separate shards.
+    shard_count = 12,
+    srcs_version = "PY3",
+    visibility = ["//visibility:private"],
+    deps = [
+        ":device_assignment",
+        ":tpu_embedding_for_serving",
+        ":tpu_embedding_v2_utils",
+        ":tpu_embedding_v3",
+        "//tensorflow/python/checkpoint",
+        "//tensorflow/python/compat:v2_compat",
+        "//tensorflow/python/distribute:distribute_lib",
+        "//tensorflow/python/distribute:tpu_strategy",
+        "//tensorflow/python/distribute:values",
+        "//tensorflow/python/distribute/cluster_resolver:tpu_cluster_resolver_py",
+        "//tensorflow/python/eager:context",
+        "//tensorflow/python/eager:def_function",
+        "//tensorflow/python/eager:remote",
+        "//tensorflow/python/framework:combinations",
+        "//tensorflow/python/framework:config",
+        "//tensorflow/python/framework:constant_op",
+        "//tensorflow/python/framework:dtypes",
+        "//tensorflow/python/framework:sparse_tensor",
+        "//tensorflow/python/ops:array_ops",
+        "//tensorflow/python/platform:client_testlib",
+        "//third_party/py/numpy",
+        "@absl_py//absl/flags",
+        "@absl_py//absl/logging",
         "@absl_py//absl/testing:parameterized",
     ],
 )

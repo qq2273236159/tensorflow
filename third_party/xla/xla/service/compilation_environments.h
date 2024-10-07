@@ -1,3 +1,4 @@
+#include "tsl/platform/status.h"
 /* Copyright 2022 The OpenXLA Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -24,9 +25,10 @@ limitations under the License.
 #include <utility>
 
 #include "absl/container/flat_hash_map.h"
-#include "xla/statusor.h"
+#include "absl/status/statusor.h"
 #include "xla/xla.pb.h"
 #include "tsl/platform/casts.h"
+#include "tsl/platform/platform.h"
 #include "tsl/platform/protobuf.h"
 
 namespace xla {
@@ -142,7 +144,12 @@ T& CompilationEnvironments::GetMutableEnv() {
     it = environments_.find(descriptor);
   }
 
+  // TODO(b/302086111): Remove after XLA has an updated protobuf version.
+#if TSL_IS_IN_OSS
   return tensorflow::down_cast<T&>(*it->second);
+#else
+  return tsl::protobuf::DownCastToGenerated<T>(*it->second);
+#endif
 }
 
 template <typename T>

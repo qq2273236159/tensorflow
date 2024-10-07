@@ -20,6 +20,7 @@ limitations under the License.
 #include <utility>
 #include <vector>
 
+#include "xla/tsl/profiler/utils/group_events.h"
 #include "tensorflow/core/platform/test.h"
 #include "tensorflow/core/platform/types.h"
 #include "tensorflow/core/profiler/convert/multi_xplanes_to_op_stats.h"
@@ -36,7 +37,6 @@ limitations under the License.
 #include "tensorflow/core/profiler/utils/xplane_test_utils.h"
 #include "tsl/platform/status.h"
 #include "tsl/profiler/protobuf/xplane.pb.h"
-#include "tsl/profiler/utils/group_events.h"
 
 namespace tensorflow {
 namespace profiler {
@@ -86,12 +86,16 @@ TEST(ConvertXPlaneToOpStats, GpuPerfEnv) {
   TF_CHECK_OK(ConvertMultiXSpacesToCombinedOpStats(session_snapshot_or.value(),
                                                    options, &op_stats));
   const PerfEnv& perf_env = op_stats.perf_env();
-  EXPECT_NEAR(141, perf_env.peak_tera_flops_per_second(), kMaxError);
+  // Change to lower flops number that we do not use sum of the tensor core peak
+  // flops and the cuda core peak flops together as peak flops. Only use the
+  // tensor core peak flops as all those white papers are using.
+  EXPECT_NEAR(125.34, perf_env.peak_tera_flops_per_second(), kMaxError);
   EXPECT_NEAR(
       900,
       perf_env.peak_bws_giga_bytes_per_second(MemBwType::MEM_BW_TYPE_HBM_RW),
       kMaxError);
-  EXPECT_NEAR(156.67, perf_env.ridge_point(), kMaxError);
+  // Ridge point changed accordingly from above peak flops change.
+  EXPECT_NEAR(139.26, perf_env.ridge_point(), kMaxError);
 }
 
 TEST(ConvertXPlaneToOpStats, GpuRunEnvironment) {
@@ -460,6 +464,66 @@ TEST(ConvertXPlaneToOpStats, TpuDeviceTraceToStepDb) {
   EXPECT_THAT(op_stats.device_op_metrics_db().metrics_db(),
               UnorderedElementsAre(Property(&OpMetrics::name, "op_name"),
                                    Property(&OpMetrics::name, "IDLE")));
+}
+
+// Verifies that the step db is generated correctly by intersecting for
+// multi-device TPU.
+TEST(ConvertXPlaneToOpStats, TpuMultiDeviceStepDbTest) {
+  auto space = std::make_unique<XSpace>();
+
+  XPlaneBuilder device_plane_builder1(
+      GetOrCreateTpuXPlane(space.get(), /*device_ordinal=*/0, "TPU V4", 0, 0));
+  XPlaneBuilder device_plane_builder2(
+      GetOrCreateTpuXPlane(space.get(), /*device_ordinal=*/1, "TPU V4", 0, 0));
+  device_plane_builder1.ReserveLines(1);
+  device_plane_builder2.ReserveLines(1);
+
+  // Create 1 step in xplane in TPU ordinal 0.
+  XStatMetadata* kGroupId1 = device_plane_builder1.GetOrCreateStatMetadata(
+      GetStatTypeStr(StatType::kGroupId));
+  XLineBuilder line = device_plane_builder1.GetOrCreateLine(1);
+  line.SetName(kXlaOpLineName);
+  // Step 1
+  XEventMetadata* event_metadata =
+      device_plane_builder1.GetOrCreateEventMetadata(1);
+  event_metadata->set_name("Step 1");
+  XEventBuilder event_builder = line.AddEvent(*event_metadata);
+  event_builder.AddStatValue(*kGroupId1, 1);  // step num
+  event_builder.SetDurationNs(100);
+  event_builder.SetOffsetNs(100);
+
+  // Create 2 steps in xplane in TPU ordinal 1.
+  line = device_plane_builder2.GetOrCreateLine(1);
+  line.SetName(kXlaOpLineName);
+  // Step 1
+  XStatMetadata* kGroupId2 = device_plane_builder2.GetOrCreateStatMetadata(
+      GetStatTypeStr(StatType::kGroupId));
+  XEventMetadata* event_metadata2 =
+      device_plane_builder2.GetOrCreateEventMetadata(2);
+  event_metadata2->set_name("Step 1");
+  XEventBuilder event_builder2 = line.AddEvent(*event_metadata2);
+  event_builder2.AddStatValue(*kGroupId2, 1);  // step num
+  event_builder2.SetDurationNs(100);
+  event_builder2.SetOffsetNs(300);
+  // Step 2
+  XStatMetadata* kGroupId3 = device_plane_builder2.GetOrCreateStatMetadata(
+      GetStatTypeStr(StatType::kGroupId));
+  XEventMetadata* event_metadata3 =
+      device_plane_builder2.GetOrCreateEventMetadata(2);
+  event_metadata3->set_name("Step 2");
+  XEventBuilder event_builder3 = line.AddEvent(*event_metadata3);
+  event_builder3.AddStatValue(*kGroupId3, 2);  // step num
+  event_builder3.SetDurationNs(100);
+  event_builder3.SetOffsetNs(300);
+
+  OpStatsOptions options;
+  options.generate_op_metrics_db = true;
+  options.generate_step_db = true;
+  OpStats op_stats = ConvertXSpaceToOpStats(*space, options);
+  const StepDatabaseResult& step_db = op_stats.step_db();
+  // For TPU step events, we intersect the step events by step num across
+  // different TPU devices.
+  EXPECT_EQ(step_db.step_sequence_size(), 1);
 }
 
 }  // namespace

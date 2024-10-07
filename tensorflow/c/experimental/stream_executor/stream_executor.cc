@@ -21,9 +21,12 @@ limitations under the License.
 // device.
 #include "tensorflow/c/experimental/stream_executor/stream_executor.h"
 
+#include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 #include <utility>
+#include <variant>
 
 #include "absl/functional/any_invocable.h"
 #include "absl/status/status.h"
@@ -32,6 +35,7 @@ limitations under the License.
 #include "tensorflow/c/c_api_macros_internal.h"
 #include "tensorflow/c/experimental/stream_executor/stream_executor_internal.h"
 #include "tensorflow/c/tf_status_helper.h"
+#include "xla/stream_executor/device_description.h"
 #include "xla/stream_executor/executor_cache.h"
 #include "xla/stream_executor/host_memory_allocation.h"
 #include "xla/stream_executor/memory_allocation.h"
@@ -39,6 +43,7 @@ limitations under the License.
 #include "xla/stream_executor/platform_manager.h"
 #include "xla/stream_executor/stream.h"
 #include "xla/stream_executor/stream_executor.h"
+#include "xla/stream_executor/stream_executor_common.h"
 #include "tensorflow/core/common_runtime/device/device_utils.h"
 #include "tensorflow/core/platform/env.h"
 #include "tensorflow/core/platform/errors.h"
@@ -154,17 +159,6 @@ absl::Status ValidateSEPlatformRegistrationParams(
 }
 #undef TF_VALIDATE_NOT_NULL
 
-// Converts DeviceMemoryBase to a C struct.
-SP_DeviceMemoryBase DeviceMemoryBaseToC(const DeviceMemoryBase* mem) {
-  SP_DeviceMemoryBase device_memory_base{SP_DEVICE_MEMORY_BASE_STRUCT_SIZE};
-  // `opaque` field inside SP_DeviceMemoryBase is not const.
-  // Therefore, we need to cast away the constness before setting it.
-  device_memory_base.opaque = const_cast<void*>(mem->opaque());
-  device_memory_base.size = mem->size();
-  device_memory_base.payload = mem->payload();
-  return device_memory_base;
-}
-
 DeviceMemoryBase DeviceMemoryBaseFromC(const SP_DeviceMemoryBase& mem) {
   DeviceMemoryBase base(mem.opaque, mem.size);
   base.SetPayload(mem.payload);
@@ -186,7 +180,7 @@ void HostCallbackTrampoline(void* ctx, TF_Status* status) {
   delete host_ctx;
 }
 
-class CStreamExecutor : public StreamExecutor {
+class CStreamExecutor : public StreamExecutorCommon {
  public:
   explicit CStreamExecutor(Platform* se_platform, SP_Device device,
                            SP_DeviceFns* device_fns,
@@ -194,7 +188,7 @@ class CStreamExecutor : public StreamExecutor {
                            SP_Platform* platform, SP_PlatformFns* platform_fns,
                            SP_TimerFns* timer_fns, const std::string& name,
                            int visible_device_count)
-      : StreamExecutor(se_platform),
+      : StreamExecutorCommon(se_platform),
         device_(std::move(device)),
         device_fns_(device_fns),
         stream_executor_(stream_executor),
@@ -210,7 +204,7 @@ class CStreamExecutor : public StreamExecutor {
 
   absl::Status Init() override { return absl::OkStatus(); }
 
-  DeviceMemoryBase Allocate(uint64 size, int64_t memory_space) override {
+  DeviceMemoryBase Allocate(uint64_t size, int64_t memory_space) override {
     SP_DeviceMemoryBase mem = {SP_DEVICE_MEMORY_BASE_STRUCT_SIZE};
     stream_executor_->allocate(&device_, size, memory_space, &mem);
     absl::Status status = ValidateSPDeviceMemoryBase(mem);
@@ -219,7 +213,7 @@ class CStreamExecutor : public StreamExecutor {
     }
     return DeviceMemoryBaseFromC(mem);
   }
-  DeviceMemoryBase Allocate(uint64 size) {
+  DeviceMemoryBase Allocate(uint64_t size) {
     return Allocate(size, /*memory_space=*/0);
   }
 
@@ -229,7 +223,7 @@ class CStreamExecutor : public StreamExecutor {
   }
 
   absl::StatusOr<std::unique_ptr<MemoryAllocation>> HostMemoryAllocate(
-      uint64 size) override {
+      uint64_t size) override {
     auto* buffer = stream_executor_->host_memory_allocate(&device_, size);
     if (buffer == nullptr && size > 0) {
       return absl::InternalError(
@@ -242,7 +236,7 @@ class CStreamExecutor : public StreamExecutor {
     stream_executor_->host_memory_deallocate(&device_, mem);
   }
 
-  void* UnifiedMemoryAllocate(uint64 size) override {
+  void* UnifiedMemoryAllocate(uint64_t size) override {
     CHECK(stream_executor_->unified_memory_allocate);
     return stream_executor_->unified_memory_allocate(&device_, size);
   }
@@ -290,14 +284,14 @@ class CStreamExecutor : public StreamExecutor {
     return true;
   }
   absl::Status SynchronousMemZero(DeviceMemoryBase* location,
-                                  uint64 size) override {
+                                  uint64_t size) override {
     // TODO(annarev): figure out if we should support memzero/memset
     // functionality by allocating on host and then copying to device.
     return tsl::errors::Unimplemented(
         "SynchronousMemZero is not supported by pluggable device.");
   }
   absl::Status SynchronousMemcpy(DeviceMemoryBase* gpu_dst,
-                                 const void* host_src, uint64 size) override {
+                                 const void* host_src, uint64_t size) override {
     OwnedTFStatus c_status(TF_NewStatus());
     SP_DeviceMemoryBase device_memory_base = DeviceMemoryBaseToC(gpu_dst);
     stream_executor_->sync_memcpy_htod(&device_, &device_memory_base, host_src,
@@ -306,124 +300,15 @@ class CStreamExecutor : public StreamExecutor {
   }
   absl::Status SynchronousMemcpy(void* host_dst,
                                  const DeviceMemoryBase& gpu_src,
-                                 uint64 size) override {
+                                 uint64_t size) override {
     OwnedTFStatus c_status(TF_NewStatus());
     SP_DeviceMemoryBase device_memory_base = DeviceMemoryBaseToC(&gpu_src);
     stream_executor_->sync_memcpy_dtoh(&device_, host_dst, &device_memory_base,
                                        size, c_status.get());
     return StatusFromTF_Status(c_status.get());
   }
-  absl::Status MemZero(Stream* stream, DeviceMemoryBase* location,
-                       uint64 size) override {
-    OwnedTFStatus c_status(TF_NewStatus());
-    SP_Stream stream_handle =
-        static_cast<CStream*>(stream->implementation())->Handle();
-    SP_DeviceMemoryBase device_mem = DeviceMemoryBaseToC(location);
-    stream_executor_->mem_zero(&device_, stream_handle, &device_mem, size,
-                               c_status.get());
-    return StatusFromTF_Status(c_status.get());
-  }
-  absl::Status Memset(Stream* stream, DeviceMemoryBase* location, uint8 pattern,
-                      uint64 size) override {
-    OwnedTFStatus c_status(TF_NewStatus());
-    SP_Stream stream_handle =
-        static_cast<CStream*>(stream->implementation())->Handle();
-    SP_DeviceMemoryBase device_mem = DeviceMemoryBaseToC(location);
-    stream_executor_->memset(&device_, stream_handle, &device_mem, pattern,
-                             size, c_status.get());
-    return StatusFromTF_Status(c_status.get());
-  }
-  absl::Status Memset32(Stream* stream, DeviceMemoryBase* location,
-                        uint32 pattern, uint64 size) override {
-    OwnedTFStatus c_status(TF_NewStatus());
-    SP_Stream stream_handle =
-        static_cast<CStream*>(stream->implementation())->Handle();
-    SP_DeviceMemoryBase device_mem = DeviceMemoryBaseToC(location);
-    stream_executor_->memset32(&device_, stream_handle, &device_mem, pattern,
-                               size, c_status.get());
-    return StatusFromTF_Status(c_status.get());
-  }
-  absl::Status Memcpy(Stream* stream, void* host_dst,
-                      const DeviceMemoryBase& gpu_src, uint64 size) override {
-    OwnedTFStatus c_status(TF_NewStatus());
-    SP_Stream stream_handle =
-        static_cast<CStream*>(stream->implementation())->Handle();
-    SP_DeviceMemoryBase device_mem_src = DeviceMemoryBaseToC(&gpu_src);
-    stream_executor_->memcpy_dtoh(&device_, stream_handle, host_dst,
-                                  &device_mem_src, size, c_status.get());
-    if (TF_GetCode(c_status.get()) != TF_OK) {
-      LOG(ERROR) << TF_Message(c_status.get());
-    }
-    return StatusFromTF_Status(c_status.get());
-  }
-  absl::Status Memcpy(Stream* stream, DeviceMemoryBase* gpu_dst,
-                      const void* host_src, uint64 size) override {
-    OwnedTFStatus c_status(TF_NewStatus());
-    SP_Stream stream_handle =
-        static_cast<CStream*>(stream->implementation())->Handle();
-    SP_DeviceMemoryBase device_mem_dst = DeviceMemoryBaseToC(gpu_dst);
-    stream_executor_->memcpy_htod(&device_, stream_handle, &device_mem_dst,
-                                  host_src, size, c_status.get());
-    if (TF_GetCode(c_status.get()) != TF_OK) {
-      LOG(ERROR) << TF_Message(c_status.get());
-    }
-    return StatusFromTF_Status(c_status.get());
-  }
-  bool MemcpyDeviceToDevice(Stream* stream, DeviceMemoryBase* gpu_dst,
-                            const DeviceMemoryBase& gpu_src,
-                            uint64 size) override {
-    OwnedTFStatus c_status(TF_NewStatus());
-    SP_Stream stream_handle =
-        static_cast<CStream*>(stream->implementation())->Handle();
-    SP_DeviceMemoryBase device_mem_dst = DeviceMemoryBaseToC(gpu_dst);
-    SP_DeviceMemoryBase device_mem_src = DeviceMemoryBaseToC(&gpu_src);
-    stream_executor_->memcpy_dtod(&device_, stream_handle, &device_mem_dst,
-                                  &device_mem_src, size, c_status.get());
-    if (TF_GetCode(c_status.get()) != TF_OK) {
-      LOG(ERROR) << TF_Message(c_status.get());
-      return false;
-    }
-    return true;
-  }
-  bool HostCallback(Stream* stream,
-                    absl::AnyInvocable<absl::Status() &&> callback) override {
-    SP_Stream stream_handle =
-        static_cast<CStream*>(stream->implementation())->Handle();
-    HostCallbackContext* ctx = new HostCallbackContext{std::move(callback)};
-    return stream_executor_->host_callback(&device_, stream_handle,
-                                           &HostCallbackTrampoline, ctx);
-  }
-  absl::Status RecordEvent(Stream* stream, Event* event) override {
-    SP_Stream stream_handle =
-        static_cast<CStream*>(stream->implementation())->Handle();
-    return static_cast<CEvent*>(event)->Record(stream_handle);
-  }
-  absl::Status WaitForEvent(Stream* stream, Event* event) override {
-    SP_Stream stream_handle =
-        static_cast<CStream*>(stream->implementation())->Handle();
-    SP_Event event_handle = static_cast<CEvent*>(event)->Handle();
-    OwnedTFStatus c_status(TF_NewStatus());
-    stream_executor_->wait_for_event(&device_, stream_handle, event_handle,
-                                     c_status.get());
-    absl::Status s = StatusFromTF_Status(c_status.get());
-    return s;
-  }
   void DeallocateStream(Stream* stream) override {
-    static_cast<CStream*>(stream->implementation())->Destroy();
-  }
-  bool CreateStreamDependency(Stream* dependent, Stream* other) override {
-    OwnedTFStatus c_status(TF_NewStatus());
-    SP_Stream dependent_handle =
-        static_cast<CStream*>(dependent->implementation())->Handle();
-    SP_Stream other_handle =
-        static_cast<CStream*>(other->implementation())->Handle();
-    stream_executor_->create_stream_dependency(&device_, dependent_handle,
-                                               other_handle, c_status.get());
-    if (TF_GetCode(c_status.get()) != TF_OK) {
-      LOG(ERROR) << TF_Message(c_status.get());
-      return false;
-    }
-    return true;
+    static_cast<CStream*>(stream)->Destroy();
   }
   absl::Status BlockHostForEvent(Stream* stream, Event* event) {
     OwnedTFStatus c_status(TF_NewStatus());
@@ -435,8 +320,7 @@ class CStreamExecutor : public StreamExecutor {
 
   absl::Status BlockHostUntilDone(Stream* stream) override {
     OwnedTFStatus c_status(TF_NewStatus());
-    SP_Stream stream_handle =
-        static_cast<CStream*>(stream->implementation())->Handle();
+    SP_Stream stream_handle = static_cast<CStream*>(stream)->Handle();
 
     // If `block_host_until_done` is set, use it.
     if (stream_executor_->block_host_until_done != nullptr) {
@@ -461,22 +345,11 @@ class CStreamExecutor : public StreamExecutor {
     return StatusFromTF_Status(c_status.get());
   }
 
-  absl::Status GetStatus(Stream* stream) override {
-    OwnedTFStatus c_status(TF_NewStatus());
-    SP_Stream stream_handle =
-        static_cast<CStream*>(stream->implementation())->Handle();
-    stream_executor_->get_stream_status(&device_, stream_handle,
-                                        c_status.get());
-    return StatusFromTF_Status(c_status.get());
-  }
-
-  absl::Status EnablePeerAccessTo(StreamExecutorInterface* other) override {
+  absl::Status EnablePeerAccessTo(StreamExecutor* other) override {
     return tsl::errors::Unimplemented(
         "EnablePeerAccessTo is not supported by pluggable device.");
   }
-  bool CanEnablePeerAccessTo(StreamExecutorInterface* other) override {
-    return false;
-  }
+  bool CanEnablePeerAccessTo(StreamExecutor* other) override { return false; }
 
   bool DeviceMemoryUsage(int64_t* free, int64_t* total) const override {
     return stream_executor_->device_memory_usage(
@@ -490,34 +363,34 @@ class CStreamExecutor : public StreamExecutor {
       const override {
     OwnedTFStatus c_status(TF_NewStatus());
 
-    internal::DeviceDescriptionBuilder builder;
+    DeviceDescription desc;
     if (device_.hardware_name != nullptr) {
-      builder.set_name(device_.hardware_name);
+      desc.set_name(device_.hardware_name);
     }
     if (device_.device_vendor != nullptr) {
-      builder.set_device_vendor(device_.device_vendor);
+      desc.set_device_vendor(device_.device_vendor);
     }
     if (device_.pci_bus_id != nullptr) {
-      builder.set_pci_bus_id(device_.pci_bus_id);
+      desc.set_pci_bus_id(device_.pci_bus_id);
     }
 
     if (device_fns_->get_numa_node != nullptr) {
       int32_t numa_node = device_fns_->get_numa_node(&device_);
       if (numa_node >= 0) {
-        builder.set_numa_node(numa_node);
+        desc.set_numa_node(numa_node);
       }
     }
 
     if (device_fns_->get_memory_bandwidth != nullptr) {
       int64_t memory_bandwidth = device_fns_->get_memory_bandwidth(&device_);
       if (memory_bandwidth >= 0) {
-        builder.set_memory_bandwidth(memory_bandwidth);
+        desc.set_memory_bandwidth(memory_bandwidth);
       }
     }
     // TODO(annarev): Add gflops field in DeviceDescription and set it here.
     // TODO(annarev): Perhaps add `supports_unified_memory` in
     // DeviceDescription.
-    return builder.Build();
+    return std::make_unique<DeviceDescription>(std::move(desc));
   }
 
   absl::StatusOr<std::unique_ptr<Event>> CreateEvent() override {
@@ -527,8 +400,7 @@ class CStreamExecutor : public StreamExecutor {
   }
 
   absl::StatusOr<std::unique_ptr<Stream>> CreateStream(
-      std::optional<std::variant<StreamPriority, int>> priority =
-          std::nullopt) override {
+      std::optional<std::variant<StreamPriority, int>> priority) override {
     auto stream = std::make_unique<CStream>(&device_, stream_executor_, this);
     TF_RETURN_IF_ERROR(stream->Create());
     return std::move(stream);
@@ -562,7 +434,6 @@ CPlatform::CPlatform(SP_Platform platform,
       name_(platform.name) {}
 
 CPlatform::~CPlatform() {
-  executor_cache_.DestroyAllExecutors();
   platform_fns_.destroy_device_fns(&platform_, &device_fns_);
   platform_fns_.destroy_stream_executor(&platform_, &stream_executor_);
   platform_fns_.destroy_timer_fns(&platform_, &timer_fns_);
@@ -575,28 +446,25 @@ CPlatform::DescriptionForDevice(int ordinal) const {
   // TODO(annarev): see if we can get StreamExecutor instance
   // and call GetDeviceDescription. executor_cache_.Get would need
   // to be made const for it to work.
-  internal::DeviceDescriptionBuilder builder;
-  builder.set_name(name_);
-  return builder.Build();
+  DeviceDescription desc;
+  desc.set_name(name_);
+  return std::make_unique<DeviceDescription>(std::move(desc));
+}
+absl::StatusOr<StreamExecutor*> CPlatform::FindExisting(int ordinal) {
+  return executor_cache_.Get(ordinal);
 }
 absl::StatusOr<StreamExecutor*> CPlatform::ExecutorForDevice(int ordinal) {
-  stream_executor::StreamExecutorConfig config;
-  config.ordinal = ordinal;
-  return GetExecutor(config);
-}
-absl::StatusOr<StreamExecutor*> CPlatform::GetExecutor(
-    const StreamExecutorConfig& config) {
   return executor_cache_.GetOrCreate(
-      config, [&]() { return GetUncachedExecutor(config); });
+      ordinal, [this, ordinal]() { return GetUncachedExecutor(ordinal); });
 }
 absl::StatusOr<std::unique_ptr<StreamExecutor>> CPlatform::GetUncachedExecutor(
-    const StreamExecutorConfig& config) {
+    int ordinal) {
   // Fill device creation params
   SE_CreateDeviceParams device_params{SE_CREATE_DEVICE_PARAMS_STRUCT_SIZE};
   SP_Device device{SP_DEVICE_STRUCT_SIZE};
   device_params.device = &device;
   device_params.ext = nullptr;
-  device_params.ordinal = config.ordinal;
+  device_params.ordinal = ordinal;
   OwnedTFStatus c_status(TF_NewStatus());
 
   // Create Device

@@ -28,8 +28,8 @@ limitations under the License.
 #include "absl/time/time.h"
 #include "xla/tsl/distributed_runtime/call_options.h"
 #include "xla/tsl/distributed_runtime/coordination/coordination_client.h"
+#include "xla/tsl/protobuf/coordination_service.pb.h"
 #include "tsl/platform/status.h"
-#include "tsl/protobuf/coordination_service.pb.h"
 
 namespace tensorflow {
 class CoordinationServiceConfig;
@@ -197,6 +197,10 @@ class CoordinationServiceAgent {
   //   - AlreadyExists: key is already set.
   virtual absl::Status InsertKeyValue(std::string_view key,
                                       std::string_view value) = 0;
+
+  virtual absl::Status InsertKeyValue(std::string_view key,
+                                      std::string_view value,
+                                      bool allow_overwrite) = 0;
 
   // Delete config keys in the coordination service.
   virtual absl::Status DeleteKeyValue(std::string_view key) = 0;

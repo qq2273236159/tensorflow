@@ -375,7 +375,7 @@ Status ModelToProtoHelper(std::shared_ptr<Node> output, ModelProto* model) {
       to_serialize.push_back(input);
     }
   }
-  return OkStatus();
+  return absl::OkStatus();
 }
 
 // Recursively produces node tree rooted in `output` from the given model proto.
@@ -398,7 +398,7 @@ Status ModelFromProtoHelper(ModelProto model, std::shared_ptr<Node>* output) {
       to_restore_inputs.push_back(input);
     }
   }
-  return OkStatus();
+  return absl::OkStatus();
 }
 
 // The first input of InterleaveMany corresponds to the input dataset whose
@@ -418,7 +418,7 @@ class InterleaveMany : public Node {
     }
   }
 
-  virtual ~InterleaveMany() {}
+  ~InterleaveMany() override {}
 
   // The ratio of an InterleaveMany node is `1/cycle_length`. If cycle length is
   // not available, we approximate it by `1/input_size`. The input size does not
@@ -555,7 +555,7 @@ class InterleaveMany : public Node {
   Status ToProto(ModelProto::Node* node_proto) const override {
     TF_RETURN_IF_ERROR(Node::ToProto(node_proto));
     node_proto->set_node_class(NodeClass::INTERLEAVE_MANY);
-    return OkStatus();
+    return absl::OkStatus();
   }
 };
 
@@ -574,7 +574,7 @@ class AsyncInterleaveMany : public Node {
     }
   }
 
-  virtual ~AsyncInterleaveMany() {}
+  ~AsyncInterleaveMany() override {}
 
   bool IsAsync() const override { return true; }
 
@@ -778,7 +778,7 @@ class AsyncInterleaveMany : public Node {
   Status ToProto(ModelProto::Node* node_proto) const override {
     TF_RETURN_IF_ERROR(Node::ToProto(node_proto));
     node_proto->set_node_class(NodeClass::ASYNC_INTERLEAVE_MANY);
-    return OkStatus();
+    return absl::OkStatus();
   }
 };
 
@@ -786,7 +786,7 @@ class KnownRatio : public Node {
  public:
   KnownRatio(Node::Args args, double ratio) : Node(args), ratio_(ratio) {}
 
-  virtual ~KnownRatio() {}
+  ~KnownRatio() override {}
 
   double Ratio() const override { return ratio_; }
 
@@ -871,7 +871,7 @@ class KnownRatio : public Node {
     TF_RETURN_IF_ERROR(Node::ToProto(node_proto));
     node_proto->set_node_class(NodeClass::KNOWN_RATIO);
     node_proto->set_ratio(ratio_);
-    return OkStatus();
+    return absl::OkStatus();
   }
 
  private:
@@ -892,7 +892,7 @@ class AsyncRatio : public Node {
     }
   }
 
-  virtual ~AsyncRatio() {}
+  ~AsyncRatio() override {}
 
   bool IsAsync() const override { return true; }
 
@@ -1137,7 +1137,7 @@ class UnknownRatio : public Node {
  public:
   using Node::Node;
 
-  virtual ~UnknownRatio() {}
+  ~UnknownRatio() override {}
 
   double Ratio() const override {
     tf_shared_lock l(mu_);
@@ -1250,7 +1250,7 @@ class UnknownRatio : public Node {
   Status ToProto(ModelProto::Node* node_proto) const override {
     TF_RETURN_IF_ERROR(Node::ToProto(node_proto));
     node_proto->set_node_class(NodeClass::UNKNOWN_RATIO);
-    return OkStatus();
+    return absl::OkStatus();
   }
 };
 
@@ -1258,7 +1258,7 @@ class Unknown : public Node {
  public:
   using Node::Node;
 
-  virtual ~Unknown() {}
+  ~Unknown() override {}
 
  protected:
   std::shared_ptr<Node> Clone(std::shared_ptr<Node> output) const override
@@ -1304,7 +1304,7 @@ class Unknown : public Node {
   Status ToProto(ModelProto::Node* node_proto) const override {
     TF_RETURN_IF_ERROR(Node::ToProto(node_proto));
     node_proto->set_node_class(NodeClass::UNKNOWN);
-    return OkStatus();
+    return absl::OkStatus();
   }
 };
 
@@ -1316,7 +1316,7 @@ class AsyncKnownRatio : public AsyncRatio {
       : AsyncRatio(args, ratio, memory_ratio, parameters,
                    is_legacy_prefetch_autotuned) {}
 
-  virtual ~AsyncKnownRatio() {}
+  ~AsyncKnownRatio() override {}
 
  protected:
   std::shared_ptr<Node> Clone(std::shared_ptr<Node> output) const override
@@ -1347,7 +1347,7 @@ class AsyncKnownRatio : public AsyncRatio {
       parameter->set_value(parameter->state_value());
       parameter->set_tunable(true);
     }
-    return OkStatus();
+    return absl::OkStatus();
   }
 };
 
@@ -1357,7 +1357,7 @@ class AsyncUnknownRatio : public AsyncRatio {
                     std::vector<std::shared_ptr<Parameter>> parameters)
       : AsyncRatio(args, /*ratio=*/0.0, /*memory_ratio=*/0.0, parameters) {}
 
-  virtual ~AsyncUnknownRatio() {}
+  ~AsyncUnknownRatio() override {}
 
   double Ratio() const override {
     tf_shared_lock l(mu_);
@@ -1390,7 +1390,7 @@ class AsyncUnknownRatio : public AsyncRatio {
   Status ToProto(ModelProto::Node* node_proto) const override {
     TF_RETURN_IF_ERROR(Node::ToProto(node_proto));
     node_proto->set_node_class(NodeClass::ASYNC_UNKNOWN_RATIO);
-    return OkStatus();
+    return absl::OkStatus();
   }
 };
 
@@ -2168,7 +2168,7 @@ Status Node::ToProto(ModelProto::Node* node_proto) const {
   for (auto const& input : inputs_) {
     node_proto->add_inputs(input->id());
   }
-  return OkStatus();
+  return absl::OkStatus();
 }
 
 Status Node::FromProtoHelper(ModelProto::Node node_proto,
@@ -2218,7 +2218,7 @@ Status Node::FromProtoHelper(ModelProto::Node node_proto,
     mutex_lock l(node->mu_);
     node->UpdateProcessingTimeEma();
   }
-  return OkStatus();
+  return absl::OkStatus();
 }
 
 Status Node::FromProto(ModelProto::Node node_proto,
@@ -2567,7 +2567,7 @@ Status Model::OptimizeLoop(AutotuneAlgorithm algorithm,
         current_time_ms = EnvTime::NowMicros() / EnvTime::kMillisToMicros;
       }
       if (cancellation_manager->IsCancelled()) {
-        return OkStatus();
+        return absl::OkStatus();
       }
     }
 
@@ -3194,7 +3194,7 @@ Status Model::ToProto(ModelProto* model_proto) {
   tf_shared_lock gap_lock(gap_mu_);
   *model_proto->mutable_gap_times() = {gap_times_usec_.begin(),
                                        gap_times_usec_.end()};
-  return OkStatus();
+  return absl::OkStatus();
 }
 
 Status Model::FromProto(ModelProto model_proto, std::unique_ptr<Model>* model) {
@@ -3204,7 +3204,7 @@ Status Model::FromProto(ModelProto model_proto, std::unique_ptr<Model>* model) {
       ModelFromProtoHelper(model_proto, &restored_model->output_));
   restored_model->id_counter_ = model_proto.id_counter();
   *model = std::move(restored_model);
-  return OkStatus();
+  return absl::OkStatus();
 }
 
 Status Model::Save(const string& fname, std::shared_ptr<Node> snapshot,
@@ -3232,7 +3232,7 @@ Status Model::Load(const string& fname, std::unique_ptr<Model>* model,
   const OptimizationParams restored_optimization_params =
       model_proto.optimization_params();
   *optimization_params = restored_optimization_params;
-  return OkStatus();
+  return absl::OkStatus();
 }
 
 std::string Model::DebugString() {

@@ -17,17 +17,17 @@ limitations under the License.
 #include <utility>
 #include <vector>
 
+#include "absl/status/statusor.h"
 #include "xla/client/client_library.h"
 #include "xla/client/local_client.h"
-#include "xla/client/sharding_builder.h"
-#include "xla/client/xla_builder.h"
+#include "xla/hlo/builder/sharding_builder.h"
+#include "xla/hlo/builder/xla_builder.h"
 #include "xla/layout_util.h"
 #include "xla/literal.h"
 #include "xla/service/platform_util.h"
 #include "xla/service/shaped_buffer.h"
 #include "xla/service/transfer_manager.h"
 #include "xla/shape_util.h"
-#include "xla/statusor.h"
 #include "xla/stream_executor/device_memory_allocator.h"
 #include "xla/stream_executor/host/host_platform_id.h"
 #include "xla/stream_executor/platform_manager.h"
@@ -905,9 +905,7 @@ XLA_TEST_F(LocalClientExecuteTest, DISABLED_ON_INTERPRETER(InfeedOutfeedTest)) {
 void BM_LocalClientOverhead(::testing::benchmark::State& state) {
   se::Platform* platform = PlatformUtil::GetDefaultPlatform().value();
   auto executors = PlatformUtil::GetStreamExecutors(platform).value();
-  se::StreamExecutorMemoryAllocator allocator(
-      platform, std::vector<se::StreamExecutorInterface*>(executors.begin(),
-                                                          executors.end()));
+  se::StreamExecutorMemoryAllocator allocator(platform, executors);
   LocalClient* client = ClientLibrary::GetOrCreateLocalClient(platform).value();
   auto* transfer_manager = TransferManager::GetForPlatform(platform).value();
   int device_ordinal = client->default_device_ordinal();
@@ -969,7 +967,7 @@ XLA_TEST_F(LocalClientExecuteTest, ValidateFDOProfile) {
   const HloModule& compiled_module =
       executables.front()->executable()->module();
   EXPECT_EQ(compiled_module.config().fdo_profile(), kFdoProfile);
-  TF_ASSERT_OK_AND_ASSIGN(auto proto, compiled_module.ToProtoWithConfig());
+  auto proto = compiled_module.ToProtoWithConfig();
   EXPECT_EQ(proto.config().fdo_profile(), kFdoProfile);
 }
 
@@ -993,8 +991,31 @@ XLA_TEST_F(LocalClientExecuteTest, ValidateDeviceMemorySize) {
   const HloModule& compiled_module =
       executables.front()->executable()->module();
   EXPECT_EQ(compiled_module.config().device_memory_size(), kDeviceMemorySize);
-  TF_ASSERT_OK_AND_ASSIGN(auto proto, compiled_module.ToProtoWithConfig());
+  auto proto = compiled_module.ToProtoWithConfig();
   EXPECT_EQ(proto.config().device_memory_size(), kDeviceMemorySize);
+}
+
+XLA_TEST_F(LocalClientExecuteTest, ValidateUseShardyPartitioner) {
+  XlaBuilder builder(TestName());
+  auto x = Parameter(&builder, 0, ShapeUtil::MakeShape(F32, {3}), "x");
+  auto y = ConstantR1<float>(&builder, {2.0f, 3.0f, 4.0f});
+  Add(x, y);
+  Shape argument_layout =
+      local_client_->backend().compiler()->DefaultDeviceShapeRepresentation(
+          ShapeUtil::MakeShapeWithDenseLayout(F32, /*dimensions=*/{3}, {0}));
+
+  ExecutableBuildOptions build_options;
+  build_options.set_use_shardy_partitioner(true);
+  TF_ASSERT_OK_AND_ASSIGN(
+      auto executables,
+      local_client_->Compile(builder.Build().value(), {&argument_layout},
+                             build_options));
+  EXPECT_EQ(1, executables.size());
+  const HloModule& compiled_module =
+      executables.front()->executable()->module();
+  EXPECT_EQ(compiled_module.config().use_shardy_partitioner(), true);
+  auto proto = compiled_module.ToProtoWithConfig();
+  EXPECT_EQ(proto.config().use_shardy_partitioner(), true);
 }
 
 BENCHMARK(BM_LocalClientOverhead);

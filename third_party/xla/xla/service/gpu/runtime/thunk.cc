@@ -34,6 +34,7 @@ limitations under the License.
 #include "xla/executable_run_options.h"
 #include "xla/ffi/execution_context.h"
 #include "xla/hlo/ir/hlo_instruction.h"
+#include "xla/hlo/translate/mhlo_to_hlo/location_exporter.h"
 #include "xla/service/global_device_id.h"
 #include "xla/service/gpu/backend_configs.pb.h"
 #include "xla/service/gpu/buffer_allocations.h"
@@ -43,7 +44,6 @@ limitations under the License.
 #include "xla/service/gpu/runtime/nccl_clique_key.h"
 #include "xla/service/service_executable_run_options.h"
 #include "xla/stream_executor/stream.h"
-#include "xla/translate/mhlo_to_hlo/location_exporter.h"
 #include "tsl/platform/statusor.h"
 
 namespace xla {
@@ -186,7 +186,12 @@ Thunk::ExecuteParams Thunk::ExecuteParams::Create(
                        run_options.run_options().send_device_memory_function(),
                        run_options.run_options().recv_device_memory_function(),
                        run_options.run_options().ffi_execution_context(),
-                       additional_compute_streams);
+                       additional_compute_streams,
+                       run_options.run_options().gpu_executable_run_options()
+                           ? run_options.run_options()
+                                 .gpu_executable_run_options()
+                                 ->enable_mock_nccl_collectives()
+                           : false);
 }
 
 Thunk::ExecuteParams Thunk::ExecuteParams::CloneWithNewAllocations(
@@ -209,7 +214,7 @@ Thunk::ExecuteParams::ExecuteParams(
     SendDeviceMemoryFunction* send_device_memory_function,
     RecvDeviceMemoryFunction* recv_device_memory_function,
     const ffi::ExecutionContext* ffi_execution_context,
-    ExecutionStreamIdMap additional_compute_streams)
+    ExecutionStreamIdMap additional_compute_streams, bool mock_collectives)
     : buffer_allocations(buffer_allocations),
       stream(stream),
       command_buffer_trace_stream(command_buffer_trace_stream),
@@ -220,7 +225,8 @@ Thunk::ExecuteParams::ExecuteParams(
       send_device_memory_function(send_device_memory_function),
       recv_device_memory_function(recv_device_memory_function),
       ffi_execution_context(ffi_execution_context),
-      additional_compute_streams(additional_compute_streams) {}
+      additional_compute_streams(additional_compute_streams),
+      mock_collectives(mock_collectives) {}
 
 //===----------------------------------------------------------------------===//
 
@@ -229,7 +235,7 @@ Thunk::ExecuteParams::ExecuteParams(
   case Thunk::x: \
     return #x
   switch (kind) {
-    CASE(kAddressComputation);
+    CASE(kDynamicSlice);
     CASE(kCholesky);
     CASE(kCommandBuffer);
     CASE(kConditional);
@@ -280,7 +286,6 @@ Thunk::ExecuteParams::ExecuteParams(
     CASE(kSequential);
     CASE(kTriangularSolve);
     CASE(kWhile);
-    CASE(kFusedMHA);
     CASE(kWaitForStreams);
     CASE(kCuDnn);
   }
@@ -303,36 +308,6 @@ std::ostream& operator<<(std::ostream& os, Thunk::Kind kind) {
   return os << Thunk::KindToString(kind);
 }
 
-std::string ThunkSequence::ToString(
-    int indent,
-    std::function<std::string(const Thunk*)> get_thunk_annotation) const {
-  const std::string indent_str(indent * 2, ' ');
-  if (empty()) return indent_str + "No thunks.";
-
-  auto thunk_with_longest_kind = absl::c_max_element(
-      *this,
-      [](const std::unique_ptr<Thunk>& a, const std::unique_ptr<Thunk>& b) {
-        return Thunk::KindToString(a->kind()).length() <
-               Thunk::KindToString(b->kind()).length();
-      });
-  int64_t max_thunk_kind_len =
-      Thunk::KindToString(thunk_with_longest_kind->get()->kind()).length();
-  std::string result;
-  for (const std::unique_ptr<Thunk>& thunk : *this) {
-    // Write out the thunk kind, padded out to max_thunk_kind_len.
-    absl::string_view kind_str = Thunk::KindToString(thunk->kind());
-    absl::StrAppend(&result, indent_str, kind_str,
-                    std::string(max_thunk_kind_len - kind_str.length(), ' '),
-                    "\t");
-    if (get_thunk_annotation) {
-      absl::StrAppend(&result, get_thunk_annotation(thunk.get()));
-    }
-    absl::StrAppend(&result, thunk->ToStringExtra(indent));
-    absl::StrAppend(&result, "\n");
-  }
-  return result;
-}
-
 bool IsReductionCollective(Thunk::Kind kind) {
   return kind == Thunk::kNcclAllReduce || kind == Thunk::kNcclAllReduceStart ||
          kind == Thunk::kNcclReduceScatter ||
@@ -350,6 +325,36 @@ Thunk::ThunkInfo Thunk::ThunkInfo::WithProfileAnnotation(
                            gpu_backend_config->operation_queue_id());
   }
   return thunk_info;
+}
+
+bool Thunk::IsCollective() const {
+  switch (kind()) {
+    case kNcclAllGather:
+    case kNcclAllGatherStart:
+    case kNcclAllGatherDone:
+    case kNcclAllReduce:
+    case kNcclAllReduceStart:
+    case kNcclAllReduceDone:
+    case kNcclCollectiveBroadcast:
+    case kNcclCollectiveBroadcastStart:
+    case kNcclCollectiveBroadcastDone:
+    case kNcclCollectivePermute:
+    case kNcclCollectivePermuteStart:
+    case kNcclCollectivePermuteDone:
+    case kNcclReduceScatter:
+    case kNcclReduceScatterStart:
+    case kNcclReduceScatterDone:
+    case kNcclAllToAll:
+    case kNcclAllToAllStart:
+    case kNcclAllToAllDone:
+    case kNcclSend:
+    case kNcclSendDone:
+    case kNcclRecv:
+    case kNcclRecvDone:
+      return true;
+    default:
+      return false;
+  }
 }
 
 }  // namespace gpu

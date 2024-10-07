@@ -38,12 +38,14 @@ limitations under the License.
 #include "absl/synchronization/mutex.h"
 #include "absl/types/span.h"
 #include "llvm/Support/ErrorHandling.h"
-#include "mlir/IR/OwningOpRef.h"  // from @llvm-project
-#include "mlir/Pass/PassManager.h"  // from @llvm-project
-#include "mlir/Support/LogicalResult.h"  // from @llvm-project
-#include "xla/client/xla_computation.h"
+#include "mlir/IR/OwningOpRef.h"
+#include "mlir/Pass/PassManager.h"
+#include "mlir/Support/LogicalResult.h"
+#include "xla/hlo/builder/xla_computation.h"
 #include "xla/hlo/ir/hlo_module.h"
+#include "xla/hlo/translate/mhlo_to_hlo/mlir_hlo_to_hlo.h"
 #include "xla/layout.h"
+#include "xla/layout_util.h"
 #include "xla/literal.h"
 #include "xla/mlir_hlo/mhlo/transforms/passes.h"
 #include "xla/pjrt/c/pjrt_c_api.h"
@@ -67,13 +69,10 @@ limitations under the License.
 #include "xla/service/hlo_module_config.h"
 #include "xla/shape.h"
 #include "xla/shape_util.h"
-#include "xla/status.h"
-#include "xla/statusor.h"
-#include "xla/translate/mhlo_to_hlo/mlir_hlo_to_hlo.h"
+#include "xla/tsl/framework/allocator.h"
 #include "xla/util.h"
 #include "xla/xla.pb.h"
 #include "xla/xla_data.pb.h"
-#include "tsl/framework/allocator.h"
 #include "tsl/platform/casts.h"
 #include "tsl/platform/errors.h"
 #include "tsl/platform/fingerprint.h"
@@ -334,11 +333,6 @@ absl::StatusOr<PjRtDevice*> PjRtCApiClient::LookupDevice(
 }
 
 absl::StatusOr<PjRtDevice*> PjRtCApiClient::LookupAddressableDevice(
-    int local_hardware_id) const {
-  return LookupAddressableDevice(PjRtLocalDeviceId(local_hardware_id));
-}
-
-absl::StatusOr<PjRtDevice*> PjRtCApiClient::LookupAddressableDevice(
     PjRtLocalDeviceId local_device_id) const {
   PJRT_Client_LookupAddressableDevice_Args args;
   args.struct_size = PJRT_Client_LookupAddressableDevice_Args_STRUCT_SIZE;
@@ -398,12 +392,12 @@ absl::StatusOr<std::unique_ptr<PjRtLoadedExecutable>> PjRtCApiClient::Compile(
 
 absl::StatusOr<std::unique_ptr<PjRtLoadedExecutable>> PjRtCApiClient::Compile(
     mlir::ModuleOp module, CompileOptions options) {
-  // TODO: Once plugins are ready, use SerializeUsingVersionedStablehlo.
   if (!pjrt_c_api()) llvm::report_fatal_error("pjrt_c_api is null");
   TF_ASSIGN_OR_RETURN(
       std::string serialized,
-      xla::SerializeUsingNativeBytecode(
-          module, plugin_attributes()->pjrt_c_api_minor_version));
+      xla::Serialize(module,
+                     xla::GetDefaultStablehloVersion(
+                         plugin_attributes()->pjrt_c_api_minor_version)));
   std::string format(pjrt::kMlirFormat);
   return InitializeArgsAndCompile(this, c_api_, c_client_.get(), options,
                                   serialized, format);
@@ -650,8 +644,7 @@ absl::StatusOr<Layout> PjRtCApiClient::GetDefaultLayout(
       pjrt::FindExtension<PJRT_Layouts_Extension>(
           c_api, PJRT_Extension_Type::PJRT_Extension_Type_Layouts);
   if (extension == nullptr) {
-    return absl::UnimplementedError(
-        "Layouts extension not implemented in this PJRT plugin.");
+    return LayoutUtil::MakeDescendingLayout(dims.size());
   }
   PJRT_Layouts_PJRT_Client_GetDefaultLayout_Args args;
   args.struct_size = PJRT_Layouts_PJRT_Client_GetDefaultLayout_Args_STRUCT_SIZE;
@@ -825,11 +818,7 @@ bool PjRtCApiDevice::IsAddressable() const {
   return args.is_addressable;
 }
 
-int PjRtCApiDevice::local_hardware_id() const {
-  return local_hardware_id_typed().value();
-}
-
-PjRtLocalHardwareId PjRtCApiDevice::local_hardware_id_typed() const {
+PjRtLocalHardwareId PjRtCApiDevice::local_hardware_id() const {
   PJRT_Device_LocalHardwareId_Args args;
   args.struct_size = PJRT_Device_LocalHardwareId_Args_STRUCT_SIZE;
   args.extension_start = nullptr;
@@ -1164,7 +1153,6 @@ PjRtCApiExecutable::GetHloModules() const {
   }
 
   if (program_format == ::pjrt::kMlirFormat) {
-    xla::HloProto hlo_proto;
     mlir::MLIRContext ctx;
     TF_ASSIGN_OR_RETURN(  // NOLINT(clang-diagnostic-pre-c++20-compat)
         mlir::OwningOpRef<mlir::ModuleOp> module,
@@ -1175,17 +1163,12 @@ PjRtCApiExecutable::GetHloModules() const {
       return xla::Internal("failed to convert to MHLO");
     // TODO(jieying): Tuple args should really come from GetCompileOptions (or
     // equivalent) once implemented.
-    TF_RETURN_IF_ERROR(mlir::ConvertMlirHloToHlo(module.get(), &hlo_proto,
-                                                 /*use_tuple_args=*/false,
-                                                 /*return_tuple=*/false));
-    xla::DebugOptions debug_options;
-    TF_ASSIGN_OR_RETURN(xla::HloModuleConfig module_config,
-                        xla::HloModule::CreateModuleConfigFromProto(
-                            hlo_proto.hlo_module(), debug_options));
+    mlir::MlirToHloConversionOptions options;
+    options.return_tuple = false;
+    TF_ASSIGN_OR_RETURN(std::unique_ptr<xla::HloModule> hlo_module,
+                        mlir::ConvertMlirHloToHloModule(module.get(), options));
+
     std::vector<std::shared_ptr<HloModule>> out;
-    TF_ASSIGN_OR_RETURN(
-        std::unique_ptr<HloModule> hlo_module,
-        HloModule::CreateFromProto(hlo_proto.hlo_module(), module_config));
     out.push_back(std::move(hlo_module));
     return out;
   }
@@ -1809,18 +1792,41 @@ std::unique_ptr<PjRtLayout> PjRtCApiBuffer::layout() const {
   {
     absl::MutexLock lock(&mu_);
     if (!layout_.has_value()) {
-      PJRT_Buffer_GetMemoryLayout_Args args;
-      args.struct_size = PJRT_Buffer_GetMemoryLayout_Args_STRUCT_SIZE;
-      args.extension_start = nullptr;
-      args.buffer = buffer_.get();
-      pjrt::LogFatalIfPjrtError(
-          pjrt_c_api()->PJRT_Buffer_GetMemoryLayout(&args), pjrt_c_api());
-      CHECK_EQ(args.layout.type, PJRT_Buffer_MemoryLayout_Type_Tiled)
-          << "PjRtCApiBuffer only supports tiled device layouts";
-      absl::StatusOr<Layout> cpp_layout =
-          pjrt::ConvertToLayout(args.layout.tiled);
-      TF_CHECK_OK(cpp_layout.status());
-      layout_.emplace(*cpp_layout);
+      const PJRT_Api* c_api = pjrt_c_api();
+      PJRT_Layouts_Extension* extension =
+          pjrt::FindExtension<PJRT_Layouts_Extension>(
+              c_api, PJRT_Extension_Type::PJRT_Extension_Type_Layouts);
+      if (extension == nullptr) {
+        layout_.emplace(LayoutUtil::MakeDescendingLayout(dimensions().size()));
+      } else {
+        std::unique_ptr<PJRT_Layouts_MemoryLayout,
+                        pjrt::PJRT_Layouts_MemoryLayoutDeleter>
+            layout = pjrt::GetMemoryLayout(c_api, buffer_.get());
+
+        // TODO(b/343274093): returns a PjRtLayout that wraps a C API layout
+        // directly instead of de/serializing into an xla::Layout.
+        PJRT_Layouts_MemoryLayout_Serialize_Args serialize_args;
+        serialize_args.struct_size =
+            PJRT_Layouts_MemoryLayout_Serialize_Args_STRUCT_SIZE;
+        serialize_args.extension_start = nullptr;
+        serialize_args.layout = layout.get();
+        pjrt::LogFatalIfPjrtError(
+            extension->PJRT_Layouts_MemoryLayout_Serialize(&serialize_args),
+            c_api);
+
+        // Clean up `PJRT_Layouts_SerializedLayout`.
+        absl::Cleanup cleanup = [&serialize_args] {
+          serialize_args.serialized_layout_deleter(
+              serialize_args.serialized_layout);
+        };
+
+        std::string serialized_layout(serialize_args.serialized_bytes,
+                                      serialize_args.serialized_bytes_size);
+        absl::StatusOr<PjRtXlaLayout> pjrt_xla_layout =
+            PjRtXlaLayout::Deserialize(serialized_layout);
+        TF_CHECK_OK(pjrt_xla_layout.status());
+        layout_.emplace(*pjrt_xla_layout);
+      }
     }
   }
   return std::make_unique<PjRtXlaLayout>(*layout_);
@@ -2302,13 +2308,13 @@ absl::StatusOr<std::unique_ptr<PjRtExecutable>> PjRtCApiCompiler::Compile(
 absl::StatusOr<std::unique_ptr<PjRtExecutable>> PjRtCApiCompiler::Compile(
     CompileOptions options, mlir::ModuleOp module,
     const PjRtTopologyDescription& topology, PjRtClient* client) {
-  // TODO: Once plugins are ready, use SerializeUsingVersionedStablehlo.
   std::optional<int64_t> plugin_version;
   if (client) {
     plugin_version = client->plugin_attributes()->pjrt_c_api_minor_version;
   }
-  TF_ASSIGN_OR_RETURN(std::string serialized, xla::SerializeUsingNativeBytecode(
-                                                  module, plugin_version));
+  TF_ASSIGN_OR_RETURN(
+      std::string serialized,
+      xla::Serialize(module, xla::GetDefaultStablehloVersion(plugin_version)));
   std::string format(pjrt::kMlirFormat);
   return InitializeArgsAndCompileAot(c_api_, client, options, topology,
                                      serialized, format);

@@ -21,6 +21,7 @@ limitations under the License.
 #include <limits>
 #include <utility>
 
+#include "absl/base/optimization.h"
 #include "absl/container/inlined_vector.h"
 #include "absl/functional/any_invocable.h"
 #include "absl/synchronization/blocking_counter.h"
@@ -62,12 +63,6 @@ AsyncValue::TypeInfoTable* AsyncValue::GetTypeInfoTableSingleton() {
 
 std::atomic<size_t> AsyncValue::total_allocated_async_values_;
 
-const AsyncValue::TypeInfo& AsyncValue::GetTypeInfo() const {
-  TypeInfoTable* type_info_table = AsyncValue::GetTypeInfoTableSingleton();
-  DCHECK_NE(type_id_, 0);
-  return (*type_info_table)[type_id_ - 1];
-}
-
 // This is called when the value is set into the ConcreteAsyncValue buffer, or
 // when the IndirectAsyncValue is forwarded to an available AsyncValue, and we
 // need to change our state and clear out the notifications. The current state
@@ -91,7 +86,7 @@ void AsyncValue::NotifyAvailable(State available_state) {
 
 void AsyncValue::RunWaiters(NotifierListNode* list) {
   while (list) {
-    auto* node = list;
+    NotifierListNode* node = list;
     // TODO(chky): pass state into notification_ so that waiters do not need to
     // check atomic state again.
     node->notification_();
@@ -187,6 +182,8 @@ void IndirectAsyncValue::ForwardTo(RCReference<AsyncValue> value) {
 //===----------------------------------------------------------------------===//
 
 void BlockUntilReady(AsyncValue* async_value) {
+  if (ABSL_PREDICT_TRUE(async_value->IsAvailable())) return;
+
   absl::BlockingCounter cnt(1);
   async_value->AndThen([&] { cnt.DecrementCount(); });
   cnt.Wait();

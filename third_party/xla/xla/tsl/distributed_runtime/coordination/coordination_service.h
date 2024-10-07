@@ -20,6 +20,7 @@ limitations under the License.
 #include <functional>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -27,12 +28,12 @@ limitations under the License.
 #include "absl/log/log.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
-#include "absl/strings/string_view.h"
 #include "absl/time/time.h"
 #include "xla/tsl/distributed_runtime/coordination/coordination_client.h"
+#include "xla/tsl/protobuf/coordination_config.pb.h"
+#include "xla/tsl/protobuf/coordination_service.pb.h"
 #include "tsl/platform/macros.h"
 #include "tsl/platform/status.h"
-#include "tsl/protobuf/coordination_config.pb.h"
 
 namespace tsl {
 class Env;
@@ -74,12 +75,12 @@ class CoordinationServiceInterface {
           std::unique_ptr<CoordinationClientCache> cache)>;
 
   using StatusOrValueCallback =
-      std::function<void(const absl::StatusOr<std::string>&)>;
+      std::function<void(const absl::StatusOr<std::string_view>&)>;
 
   virtual ~CoordinationServiceInterface() = default;
 
   static void RegisterCoordinationService(
-      const std::string& service_type_name,
+      std::string_view service_type_name,
       CoordinationServiceFactory factory_fn) {
     auto factories = GetCoordinationServiceFactories();
     factories->emplace(service_type_name, factory_fn);
@@ -167,29 +168,31 @@ class CoordinationServiceInterface {
   // Insert a configuration key-value in the coordination service.
   // For now, a key-value can only be inserted once and cannot be updated.
   // The key-values are not persisted and will be lost if the leader fails.
-  virtual absl::Status InsertKeyValue(const std::string& key,
-                                      const std::string& value) = 0;
+  virtual absl::Status InsertKeyValue(std::string_view key,
+                                      std::string_view value) = 0;
+  virtual absl::Status InsertKeyValue(std::string_view key,
+                                      std::string_view value,
+                                      bool allow_overwrite) = 0;
 
   // Get a configuration key-value from the coordination service. The `done`
   // callback is invoked when the key-value becomes available.
-  virtual void GetKeyValueAsync(const std::string& key,
+  virtual void GetKeyValueAsync(std::string_view key,
                                 StatusOrValueCallback done) = 0;
 
   // Get a configuration key-value from the coordination service. If the key
   // does not exist, return NotFound error.
-  virtual absl::StatusOr<std::string> TryGetKeyValue(
-      const std::string& key) = 0;
+  virtual absl::StatusOr<std::string> TryGetKeyValue(std::string_view key) = 0;
 
   // Gets all values under a directory (key).
   // A value is considered to be in the directory if its key is prefixed with
   // the directory. This is not a blocking call. Agent does not need to be
   // connected to utilize the distributed key-value store.
   virtual std::vector<tensorflow::KeyValueEntry> GetKeyValueDir(
-      absl::string_view directory_key) = 0;
+      std::string_view directory_key) = 0;
 
   // Delete configuration key-value. If key is a directory, recursively clean
   // up all key-values under the directory.
-  virtual absl::Status DeleteKeyValue(const std::string& key) = 0;
+  virtual absl::Status DeleteKeyValue(std::string_view key) = 0;
 
   // Blocks until all (or a subset of) tasks are at the barrier or the barrier
   // fails.
@@ -222,7 +225,7 @@ class CoordinationServiceInterface {
   //       list of participating tasks.
   //   - FailedPrecondition: Agent is in UNINITIALIZED or ERROR state.
   virtual void BarrierAsync(
-      const std::string& barrier_id, absl::Duration timeout,
+      std::string_view barrier_id, absl::Duration timeout,
       const tensorflow::CoordinatedTask& task,
       const std::vector<tensorflow::CoordinatedTask>& participating_tasks,
       StatusCallback done) = 0;
@@ -233,8 +236,19 @@ class CoordinationServiceInterface {
   // Possible service errors:
   //   - FailedPrecondition: Barrier has already been passed.
   virtual absl::Status CancelBarrier(
-      const std::string& barrier_id,
-      const tensorflow::CoordinatedTask& task) = 0;
+      std::string_view barrier_id, const tensorflow::CoordinatedTask& task) = 0;
+
+  // Gets error from the coordination service. Block until the service
+  // returns an error or the task/service is shutdown. This should never be used
+  // when there is service to client connection (i.e. `CoordinationClientCache`
+  // is passed in during construction).
+  //
+  // The first call to this function will trigger the error polling mode in the
+  // coordination service, so once an error occurs after the first call, the
+  // service will use the error polling mode to propagate the error to all
+  // connected tasks instead of simply shutting down.
+  virtual void PollForErrorAsync(const tensorflow::CoordinatedTask& task,
+                                 StatusCallback done) = 0;
 
  private:
   friend class CoordinationServiceRpcHandler;

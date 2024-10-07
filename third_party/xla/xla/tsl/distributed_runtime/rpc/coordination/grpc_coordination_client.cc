@@ -22,22 +22,22 @@ limitations under the License.
 #include <utility>
 #include <vector>
 
-#include "grpcpp/channel.h"
-#include "grpcpp/completion_queue.h"
-#include "grpcpp/generic/generic_stub.h"
 #include "absl/base/thread_annotations.h"
 #include "absl/log/log.h"
 #include "absl/synchronization/mutex.h"
+#include "grpcpp/channel.h"
+#include "grpcpp/completion_queue.h"
+#include "grpcpp/generic/generic_stub.h"
 #include "xla/tsl/distributed_runtime/call_options.h"
 #include "xla/tsl/distributed_runtime/coordination/coordination_client.h"
 #include "xla/tsl/distributed_runtime/rpc/grpc_channel.h"
 #include "xla/tsl/distributed_runtime/rpc/grpc_client_cq_tag.h"
 #include "xla/tsl/distributed_runtime/rpc/grpc_state.h"
 #include "xla/tsl/distributed_runtime/rpc/grpc_util.h"
+#include "xla/tsl/protobuf/coordination_service.pb.h"
 #include "tsl/platform/env.h"
 #include "tsl/platform/protobuf.h"
 #include "tsl/platform/status.h"
-#include "tsl/protobuf/coordination_service.pb.h"
 
 namespace tsl {
 namespace {
@@ -57,6 +57,8 @@ using tensorflow::HeartbeatRequest;
 using tensorflow::HeartbeatResponse;
 using tensorflow::InsertKeyValueRequest;
 using tensorflow::InsertKeyValueResponse;
+using tensorflow::PollForErrorRequest;
+using tensorflow::PollForErrorResponse;
 using tensorflow::RegisterTaskRequest;
 using tensorflow::RegisterTaskResponse;
 using tensorflow::ReportErrorToServiceRequest;
@@ -269,6 +271,17 @@ class GrpcCoordinationClient : public CoordinationClient {
         &target_);
   }
 
+  void PollForErrorAsync(CallOptions* call_opts,
+                         const PollForErrorRequest* request,
+                         PollForErrorResponse* response,
+                         StatusCallback done) override {
+    new RPCState<protobuf::Message>(
+        &stub_, cq_, "/tensorflow.CoordinationService/PollForError", *request,
+        response, std::move(done), call_opts,
+        /*threadpool=*/nullptr, /*max_retries=*/0, /*fail_fast=*/true,
+        &target_);
+  }
+
  private:
   ::grpc::GenericStub stub_;
   ::grpc::CompletionQueue* cq_;
@@ -347,9 +360,7 @@ CoordinationClientCache* NewGrpcCoordinationClientCache(
 
 CoordinationClient* NewGrpcCoordinationClient(
     std::shared_ptr<::grpc::Channel> channel) {
-  // TODO(hanyangtay): Pass in the logical task name for better logging.
-  return new GrpcCoordinationClient(
-      channel, /*target=*/"unknown_target_for_coordination_leader");
+  return new GrpcCoordinationClient(channel, /*target=*/"coordination_service");
 }
 
 }  // namespace tsl

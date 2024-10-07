@@ -35,10 +35,8 @@ limitations under the License.
 #include "xla/service/gpu/launch_dimensions.h"
 #include "xla/service/gpu/runtime/thunk.h"
 #include "xla/service/gpu/stream_executor_util.h"
-#include "xla/status.h"
 #include "xla/stream_executor/device_memory.h"
 #include "xla/stream_executor/kernel.h"
-#include "xla/stream_executor/kernel_factory.h"
 #include "xla/stream_executor/launch_dim.h"
 #include "xla/stream_executor/stream_executor.h"
 #include "tsl/platform/logging.h"
@@ -71,7 +69,7 @@ KernelThunk::KernelThunk(const HloInstruction* instr, std::string kernel_name,
   }
 }
 
-std::string KernelThunk::ToStringExtra(int indent) const {
+std::string KernelThunk::ToString(int indent) const {
   return absl::StrFormat(
       ", kernel = %s, launch dimensions = %s, cluster_dim = %s", kernel_name_,
       launch_dimensions_.ToString(),
@@ -179,7 +177,7 @@ CustomKernelThunk::CustomKernelThunk(
   }
 }
 
-std::string CustomKernelThunk::ToStringExtra(int indent) const {
+std::string CustomKernelThunk::ToString(int indent) const {
   return custom_kernel_.ToString();
 }
 
@@ -188,9 +186,9 @@ absl::Status CustomKernelThunk::Initialize(const InitializeParams& params) {
 
   auto it = kernel_cache_.find(params.executor);
   if (kernel_cache_.end() == it) {
-    TF_ASSIGN_OR_RETURN(std::unique_ptr<se::Kernel> kernel,
-                        se::KernelFactory::Create(
-                            params.executor, custom_kernel_.kernel_spec()));
+    TF_ASSIGN_OR_RETURN(
+        std::unique_ptr<se::Kernel> kernel,
+        params.executor->LoadKernel(custom_kernel_.kernel_spec()));
     kernel_cache_.emplace(params.executor, std::move(kernel));
   }
 
@@ -224,12 +222,12 @@ absl::Status CustomKernelThunk::ExecuteOnStream(const ExecuteParams& params) {
                                        custom_kernel_.shared_memory_bytes());
 
   if (auto cluster = custom_kernel_.cluster_dims(); cluster.has_value()) {
-    return executor->Launch(params.stream, custom_kernel_.thread_dims(),
-                            custom_kernel_.block_dims(), *cluster, *kernel,
-                            args);
+    return params.stream->Launch(custom_kernel_.thread_dims(),
+                                 custom_kernel_.block_dims(), *cluster, *kernel,
+                                 args);
   } else {
-    return executor->Launch(params.stream, custom_kernel_.thread_dims(),
-                            custom_kernel_.block_dims(), *kernel, args);
+    return params.stream->Launch(custom_kernel_.thread_dims(),
+                                 custom_kernel_.block_dims(), *kernel, args);
   }
 }
 

@@ -13,7 +13,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#include "third_party/nanobind/include/nanobind/nanobind.h"
+#include "nanobind/nanobind.h"
 #include "xla/ffi/api/c_api.h"
 #include "xla/ffi/api/ffi.h"
 
@@ -26,31 +26,31 @@ namespace nb = ::nanobind;
 // examples and features (e.g. binding attributes, custom user-defined structs
 // and arbitrary execution context).
 
-static Error AlwaysFail(Result<BufferBase>) {
+static Error AlwaysFail(Result<AnyBuffer>) {
   return Error(XLA_FFI_Error_Code_INTERNAL, "Failed intentionally");
 }
 
-static Error AlwaysSucceed(Result<BufferBase>) { return Error::Success(); }
+static Error AlwaysSucceed(Result<AnyBuffer>) { return Error::Success(); }
 
 static Error Subtract(BufferR0<DataType::F32> a, BufferR0<DataType::F32> b,
                       Result<BufferR0<DataType::F32>> out) {
-  *out->data = *a.data - *b.data;
+  *out->typed_data() = *a.typed_data() - *b.typed_data();
   return Error::Success();
 }
 
 static Error SubtractCst(BufferR0<DataType::F32> a,
                          Result<BufferR0<DataType::F32>> out, float cst) {
-  *out->data = *a.data - cst;
+  *out->typed_data() = *a.typed_data() - cst;
   return Error::Success();
 }
 
 // Define XLA FFI handlers from the implementations defined above using explicit
 // XLA FFI binding API to describe type signatures of custom calls.
 
-XLA_FFI_DEFINE_HANDLER(kAlwaysFail, AlwaysFail, Ffi::Bind().Ret<BufferBase>());
+XLA_FFI_DEFINE_HANDLER(kAlwaysFail, AlwaysFail, Ffi::Bind().Ret<AnyBuffer>());
 
 XLA_FFI_DEFINE_HANDLER(kAlwaysSucceed, AlwaysSucceed,
-                       Ffi::Bind().Ret<BufferBase>());
+                       Ffi::Bind().Ret<AnyBuffer>());
 
 XLA_FFI_DEFINE_HANDLER(kSubtract, Subtract,
                        Ffi::Bind()

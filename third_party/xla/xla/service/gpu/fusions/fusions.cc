@@ -14,43 +14,41 @@ limitations under the License.
 ==============================================================================*/
 #include "xla/service/gpu/fusions/fusions.h"
 
+#include <cstdint>
 #include <memory>
 #include <optional>
 #include <utility>
 
 #include "absl/algorithm/container.h"
-#include "absl/log/check.h"
-#include "absl/log/log.h"
 #include "absl/strings/match.h"
 #include "xla/hlo/ir/hlo_instruction.h"
 #include "xla/hlo/ir/hlo_opcode.h"
 #include "xla/layout_util.h"
 #include "xla/service/gpu/backend_configs.pb.h"
-#include "xla/service/gpu/fusions/concatenate.h"
 #include "xla/service/gpu/fusions/concatenate_mlir.h"
 #include "xla/service/gpu/fusions/copy.h"
 #include "xla/service/gpu/fusions/cudnn.h"
 #include "xla/service/gpu/fusions/custom.h"
 #include "xla/service/gpu/fusions/fusion_emitter.h"
-#include "xla/service/gpu/fusions/in_place_dynamic_update_slice.h"
 #include "xla/service/gpu/fusions/in_place_dynamic_update_slice_mlir.h"
-#include "xla/service/gpu/fusions/input_slices.h"
 #include "xla/service/gpu/fusions/input_slices_mlir.h"
-#include "xla/service/gpu/fusions/loop.h"
+#include "xla/service/gpu/fusions/legacy/concatenate.h"
+#include "xla/service/gpu/fusions/legacy/in_place_dynamic_update_slice.h"
+#include "xla/service/gpu/fusions/legacy/input_slices.h"
+#include "xla/service/gpu/fusions/legacy/loop.h"
+#include "xla/service/gpu/fusions/legacy/reduction.h"
+#include "xla/service/gpu/fusions/legacy/scatter.h"
+#include "xla/service/gpu/fusions/legacy/transpose.h"
 #include "xla/service/gpu/fusions/loop_mlir.h"
-#include "xla/service/gpu/fusions/mlir/elemental_hlo_to_mlir.h"
-#include "xla/service/gpu/fusions/reduction.h"
 #include "xla/service/gpu/fusions/reduction_mlir.h"
-#include "xla/service/gpu/fusions/scatter.h"
 #include "xla/service/gpu/fusions/scatter_mlir.h"
-#include "xla/service/gpu/fusions/transpose.h"
 #include "xla/service/gpu/fusions/transpose_mlir.h"
 #include "xla/service/gpu/fusions/triton.h"
 #include "xla/service/gpu/hlo_fusion_analysis.h"
 #include "xla/service/gpu/hlo_traversal.h"
 #include "xla/service/gpu/ir_emission_utils.h"
 #include "xla/shape.h"
-#include "xla/status.h"
+#include "xla/shape_util.h"
 
 namespace xla {
 namespace gpu {
@@ -94,12 +92,16 @@ std::optional<std::unique_ptr<FusionInterface>> HloFusionInfo::GetCopyFusion()
 
 bool HloFusionInfo::CanEmitDynamicUpdateSliceInPlace() const {
   auto ret = CanEmitFusedDynamicUpdateSliceInPlaceForGpu(
-      instr_, buffer_assignment_, analysis().fusion_roots());
+      analysis().fusion(),
+      [this](const HloInstruction* instruction, const ShapeIndex& index) {
+        return GetAllocationSlice(*buffer_assignment_, instruction, index);
+      },
+      instr_);
   return ret.ok() && *ret;
 }
 
-std::unique_ptr<FusionInterface> GetFusionEmitter(const FusionInfo& fusion_info,
-                                                  bool is_emission_phase) {
+std::unique_ptr<FusionInterface> GetFusionEmitter(
+    const FusionInfo& fusion_info) {
   const auto& analysis = fusion_info.analysis();
   const FusionBackendConfig& backend_config = analysis.fusion_backend_config();
 
@@ -108,56 +110,27 @@ std::unique_ptr<FusionInterface> GetFusionEmitter(const FusionInfo& fusion_info,
                          .GetModule()
                          ->config()
                          .debug_options();
-  auto check_mlir_emitters = [&](bool check = true) {
-    if (!opts.xla_gpu_enable_mlir_emitters()) {
-      return false;
-    }
-    CHECK(!check ||
-          mlir_converter::IsHloConversionSupported(
-              analysis.fusion(),
-              fusion_info.analysis().device_info().gpu_compute_capability()))
-        << "Unsupported fusion: "
-        << analysis.fusion_root(0).instruction().parent()->ToString();
-
-    static int num_mlir_emitters = 0;
-    if (is_emission_phase) {
-      // This kernel can be emitted with MLIR, but we need to check if there are
-      // limits to how many kernels can be emitted.
-      ++num_mlir_emitters;
-      if (num_mlir_emitters <= opts.xla_gpu_skip_mlir_kernels()) {
-        VLOG(5)
-            << "Skipping MLIR emission because initial skips were requested.";
-        return false;
-      }
-
-      int n_emitted = num_mlir_emitters - opts.xla_gpu_skip_mlir_kernels();
-      if (opts.xla_gpu_max_mlir_kernels() > 0 &&
-          n_emitted > opts.xla_gpu_max_mlir_kernels()) {
-        VLOG(5) << "Skipping MLIR emission because max_mlir_emitters was set.";
-        return false;
-      }
-    }
-    VLOG(5) << "Emitting with MLIR.";
-    return true;
+  auto check_mlir_emitters = [&](int64_t required_level) {
+    return opts.xla_gpu_mlir_emitter_level() >= required_level;
   };
 
   switch (analysis.GetEmitterFusionKind()) {
     case HloFusionAnalysis::EmitterFusionKind::kCustomFusion: {
       const auto& config = backend_config.custom_fusion_config();
       if (absl::StrContains(config.name(), "address_computation")) {
-        return std::make_unique<AddressComputationFusion>(analysis);
+        return std::make_unique<DynamicSliceFusion>(analysis);
       }
       return std::make_unique<CustomFusion>();
     }
     case HloFusionAnalysis::EmitterFusionKind::kInputSlices:
-      if (check_mlir_emitters()) {
+      if (check_mlir_emitters(/*required_level=*/2)) {
         return std::make_unique<MlirInputSlicesFusion>(analysis);
       }
       return std::make_unique<InputSlicesFusion>(analysis);
     case HloFusionAnalysis::EmitterFusionKind::kLoop: {
       if (IsDynamicUpdateSliceFusion(analysis) &&
           fusion_info.CanEmitDynamicUpdateSliceInPlace()) {
-        if (check_mlir_emitters()) {
+        if (check_mlir_emitters(/*required_level=*/2)) {
           return std::make_unique<MlirInPlaceDynamicUpdateSliceFusion>(
               analysis);
         }
@@ -168,31 +141,31 @@ std::unique_ptr<FusionInterface> GetFusionEmitter(const FusionInfo& fusion_info,
         return *std::move(copy_fusion);
       }
 
-      if (check_mlir_emitters()) {
+      if (check_mlir_emitters(/*required_level=*/1)) {
         return std::make_unique<MlirLoopFusion>(analysis);
       }
       return std::make_unique<LoopFusion>(analysis);
     }
     case HloFusionAnalysis::EmitterFusionKind::kReduction:
-      if (check_mlir_emitters()) {
-        return std::make_unique<MlirReductionFusion>(analysis);
+      if (check_mlir_emitters(/*required_level=*/4)) {
+        return CreateMlirReductionFusion(analysis);
       }
       return std::make_unique<ReductionFusion>(analysis);
     case HloFusionAnalysis::EmitterFusionKind::kScatter: {
-      if (check_mlir_emitters(false)) {
+      if (check_mlir_emitters(/*required_level=*/2)) {
         return std::make_unique<MlirScatterFusion>(analysis);
       }
       return std::make_unique<ScatterFusion>(analysis);
     }
     case HloFusionAnalysis::EmitterFusionKind::kTranspose: {
-      if (check_mlir_emitters()) {
+      if (check_mlir_emitters(/*required_level=*/3)) {
         return std::make_unique<MlirTransposeFusion>(analysis);
       }
       return std::make_unique<TransposeFusion>(analysis.device_info(),
                                                analysis);
     }
     case HloFusionAnalysis::EmitterFusionKind::kConcatenate: {
-      if (check_mlir_emitters()) {
+      if (check_mlir_emitters(/*required_level=*/2)) {
         return std::make_unique<MlirConcatenateFusion>(analysis);
       }
       return std::make_unique<ConcatenateFusion>(analysis);

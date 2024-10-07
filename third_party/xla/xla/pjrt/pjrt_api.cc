@@ -31,10 +31,9 @@ limitations under the License.
 #include <string>
 
 #include "absl/container/flat_hash_map.h"
+#include "absl/status/statusor.h"
 #include "absl/strings/string_view.h"
 #include "xla/pjrt/c/pjrt_c_api_helpers.h"
-#include "xla/status.h"
-#include "xla/statusor.h"
 #include "tsl/platform/errors.h"
 #include "tsl/platform/logging.h"
 
@@ -119,7 +118,7 @@ absl::StatusOr<bool> IsPjrtPluginInitialized(absl::string_view device_type) {
 static bool IsPjRtCompatibilityEnabled() {
   const char* val = getenv("ENABLE_PJRT_COMPATIBILITY");
   if (val == nullptr) {
-    return false;
+    return true;
   }
   bool enabled = false;
   if (!absl::SimpleAtob(val, &enabled)) {

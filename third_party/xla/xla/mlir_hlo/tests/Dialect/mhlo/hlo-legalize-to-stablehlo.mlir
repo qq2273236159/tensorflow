@@ -156,10 +156,9 @@ func.func @attr_custom_call_api_version_status_returning_unified(%arg0: tensor<f
 
 // CHECK-LABEL: "attr_custom_call_api_version_typed_ffi"
 func.func @attr_custom_call_api_version_typed_ffi(%arg0: tensor<f32>) -> tensor<f32> {
-  //      CHECK: "stablehlo.custom_call"([[ARG0:%arg[0-9]+]]) <{backend_config = "", call_target_name = "mhlo.custom_call"}> {
-  // CHECK-SAME:   mhlo.attributes = {api_version = 4 : i32, backend_config = {foo = "bar"}, call_target_name = "foo"},
-  // CHECK-SAME:   mhlo.version = 1 : i64
-  // CHECK-SAME: } : (tensor<f32>) -> tensor<f32>
+  //      CHECK: "stablehlo.custom_call"([[ARG0:%arg[0-9]+]]) <{api_version = 4 : i32, backend_config = {foo = "bar"},
+  // CHECK-SAME:  call_target_name = "foo"}>
+  // CHECK-SAME: (tensor<f32>) -> tensor<f32>
   %0 = "mhlo.custom_call"(%arg0) {
     call_target_name = "foo",
     backend_config = {foo = "bar"},
@@ -533,6 +532,13 @@ func.func @op_ceil(%arg0: tensor<f32>) -> tensor<f32> {
   func.return %0 : tensor<f32>
 }
 
+// CHECK-LABEL: "quantized_op_ceil"
+func.func @quantized_op_ceil(%arg0: tensor<!quant.uniform<i8:f32, 0.0039132908278820561:-128>>) -> tensor<!quant.uniform<i8:f32, 0.0039132908278820561:-128>> {
+  // CHECK: "stablehlo.ceil"([[ARG0:%arg[0-9]+]]) : (tensor<!quant.uniform<i8:f32, 0.0039132908278820561:-128>>) -> tensor<!quant.uniform<i8:f32, 0.0039132908278820561:-128>>
+  %0 = "mhlo.ceil"(%arg0) : (tensor<!quant.uniform<i8:f32, 0.0039132908278820561:-128>>) -> tensor<!quant.uniform<i8:f32, 0.0039132908278820561:-128>>
+  func.return %0 : tensor<!quant.uniform<i8:f32, 0.0039132908278820561:-128>>
+}
+
 // CHECK-LABEL: "op_cholesky"
 func.func @op_cholesky(%arg0: tensor<1x16x16xf32>) -> tensor<1x16x16xf32> {
   //      CHECK: "stablehlo.cholesky"([[ARG0:%arg[0-9]+]]) <{
@@ -739,7 +745,9 @@ func.func @op_custom_call_api_version_original(%arg0: tensor<f32>) -> tensor<f32
 
 // CHECK-LABEL: "op_custom_call_custom_call_schedule_none"
 func.func @op_custom_call_custom_call_schedule_none(%arg0: tensor<f32>) -> tensor<f32> {
-  //      CHECK: "stablehlo.custom_call"([[ARG0:%arg[0-9]+]]) <{backend_config = "", call_target_name = "foo"}> : (tensor<f32>) -> tensor<f32>
+  //      CHECK: "stablehlo.custom_call"([[ARG0:%arg[0-9]+]]) <{
+  // CHECK-SAME:  call_target_name = "foo"}>
+  // CHECK-SAME: (tensor<f32>) -> tensor<f32>
   %0 = "mhlo.custom_call"(%arg0) {
     call_target_name = "foo",
     custom_call_schedule = #mhlo<custom_call_schedule NONE>
@@ -749,10 +757,10 @@ func.func @op_custom_call_custom_call_schedule_none(%arg0: tensor<f32>) -> tenso
 
 // CHECK-LABEL: "op_custom_call_custom_call_schedule_none_ffi"
 func.func @op_custom_call_custom_call_schedule_none_ffi(%arg0: tensor<f32>) -> tensor<f32> {
-  //      CHECK: "stablehlo.custom_call"([[ARG0:%arg[0-9]+]]) <{backend_config = "", call_target_name = "mhlo.custom_call"}> {
-  // CHECK-SAME:   mhlo.attributes = {api_version = 4 : i32, backend_config = {foo = "bar"}, call_target_name = "foo"},
-  // CHECK-SAME:   mhlo.version = 1 : i64
-  // CHECK-SAME: } : (tensor<f32>) -> tensor<f32>
+  //      CHECK: "stablehlo.custom_call"([[ARG0:%arg[0-9]+]]) <{
+  // CHECK-SAME:   api_version = 4 : i32, backend_config = {foo = "bar"},
+  // CHECK-SAME:   call_target_name = "foo"}>
+  // CHECK-SAME: (tensor<f32>) -> tensor<f32>
   %0 = "mhlo.custom_call"(%arg0) {
     call_target_name = "foo",
     backend_config = {foo = "bar"},
@@ -790,6 +798,45 @@ func.func @op_dot_general(%arg0: tensor<8x8x16xf32>, %arg1: tensor<8x16x8xf32>) 
       rhs_contracting_dimensions = [1]
     >,
     precision_config = []
+  } : (tensor<8x8x16xf32>, tensor<8x16x8xf32>) -> tensor<8x8x8xf32>
+  func.return %0 : tensor<8x8x8xf32>
+}
+
+// CHECK-LABEL: "op_dot_general_algorithm"
+func.func @op_dot_general_algorithm(%arg0: tensor<8x8x16xf32>, %arg1: tensor<8x16x8xf32>) -> tensor<8x8x8xf32> {
+  //      CHECK: "stablehlo.dot_general"([[ARG0:%arg[0-9]+]], [[ARG1:%arg[0-9]+]]) <{
+  // CHECK-SAME:   algorithm = #stablehlo.dot_algorithm<
+  // CHECK-SAME:     lhs_precision_type = tf32,
+  // CHECK-SAME:     rhs_precision_type = tf32,
+  // CHECK-SAME:     accumulation_type = f32,
+  // CHECK-SAME:     lhs_component_count = 1,
+  // CHECK-SAME:     rhs_component_count = 1,
+  // CHECK-SAME:     num_primitive_operations = 1,
+  // CHECK-SAME:     allow_imprecise_accumulation = false
+  // CHECK-SAME:   >,
+  // CHECK-SAME:   dot_dimension_numbers = #stablehlo.dot<
+  // CHECK-SAME:     lhs_batching_dimensions = [0],
+  // CHECK-SAME:     rhs_batching_dimensions = [0],
+  // CHECK-SAME:     lhs_contracting_dimensions = [2],
+  // CHECK-SAME:     rhs_contracting_dimensions = [1]
+  // CHECK-SAME:   >
+  // CHECK-SAME: }> : (tensor<8x8x16xf32>, tensor<8x16x8xf32>) -> tensor<8x8x8xf32>
+  %0 = "mhlo.dot_general"(%arg0, %arg1) {
+    dot_dimension_numbers = #mhlo.dot<
+      lhs_batching_dimensions = [0],
+      lhs_contracting_dimensions = [2],
+      rhs_batching_dimensions = [0],
+      rhs_contracting_dimensions = [1]
+    >,
+    algorithm = #mhlo.dot_algorithm<
+      lhs_precision_type = tf32,
+      rhs_precision_type = tf32,
+      accumulation_type = f32,
+      lhs_component_count = 1,
+      rhs_component_count = 1,
+      num_primitive_operations = 1,
+      allow_imprecise_accumulation = false
+    >
   } : (tensor<8x8x16xf32>, tensor<8x16x8xf32>) -> tensor<8x8x8xf32>
   func.return %0 : tensor<8x8x8xf32>
 }
@@ -956,31 +1003,40 @@ func.func @op_floor(%arg0: tensor<f32>) -> tensor<f32> {
   func.return %0 : tensor<f32>
 }
 
+// CHECK-LABEL: "quantized_op_floor"
+func.func @quantized_op_floor(%arg0: tensor<!quant.uniform<i8:f32, 0.0039132908278820561:-128>>) -> tensor<!quant.uniform<i8:f32, 0.0039132908278820561:-128>> {
+  // CHECK: "stablehlo.floor"([[ARG0:%arg[0-9]+]]) : (tensor<!quant.uniform<i8:f32, 0.0039132908278820561:-128>>) -> tensor<!quant.uniform<i8:f32, 0.0039132908278820561:-128>>
+  %0 = "mhlo.floor"(%arg0) : (tensor<!quant.uniform<i8:f32, 0.0039132908278820561:-128>>) -> tensor<!quant.uniform<i8:f32, 0.0039132908278820561:-128>>
+  func.return %0 : tensor<!quant.uniform<i8:f32, 0.0039132908278820561:-128>>
+}
+
 // FusionOp aka mhlo.fusion is unsupported at the moment (see negative test below).
 
 // CHECK-LABEL: "op_gather"
-func.func @op_gather(%arg0 : tensor<2x4x9xf32>, %arg1 : tensor<1x5x2xi32>) -> tensor<1x5x1xf32> {
+func.func @op_gather(%arg0: tensor<2x3x4x2xi32>, %arg1: tensor<2x2x3x2xi64>) -> tensor<2x2x3x2x2xi32> {
   //      CHECK: "stablehlo.gather"([[ARG0:%arg[0-9]+]], [[ARG1:%arg[0-9]+]]) <{
   // CHECK-SAME:   dimension_numbers = #stablehlo.gather<
-  // CHECK-SAME:     offset_dims = [2],
-  // CHECK-SAME:     collapsed_slice_dims = [0, 1],
-  // CHECK-SAME:     start_index_map = [0, 1],
-  // CHECK-SAME:     index_vector_dim = 2
-  // CHECK-SAME:   >,
+  // CHECK-SAME:     offset_dims = [3, 4],
+  // CHECK-SAME:     collapsed_slice_dims = [1],
+  // CHECK-SAME:     operand_batching_dims = [0],
+  // CHECK-SAME:     start_indices_batching_dims = [1],
+  // CHECK-SAME:     start_index_map = [2, 1],
+  // CHECK-SAME:     index_vector_dim = 3>,
   // CHECK-SAME:   indices_are_sorted = false,
-  // CHECK-SAME:   slice_sizes = array<i64: 1, 1, 1>
-  // CHECK-SAME: }> : (tensor<2x4x9xf32>, tensor<1x5x2xi32>) -> tensor<1x5x1xf32>
+  // CHECK-SAME:   slice_sizes = array<i64: 1, 1, 2, 2>
+  // CHECK-SAME: }> : (tensor<2x3x4x2xi32>, tensor<2x2x3x2xi64>) -> tensor<2x2x3x2x2xi32>
   %0 = "mhlo.gather"(%arg0, %arg1) {
     dimension_numbers = #mhlo.gather<
-      offset_dims = [2],
-      collapsed_slice_dims = [0, 1],
-      start_index_map = [0, 1],
-      index_vector_dim = 2
-    >,
-    slice_sizes = dense<1> : tensor<3xi64>,
+      offset_dims = [3, 4],
+      collapsed_slice_dims = [1],
+      operand_batching_dims = [0],
+      start_indices_batching_dims = [1],
+      start_index_map = [2, 1],
+      index_vector_dim = 3>,
+    slice_sizes = dense<[1, 1, 2, 2]> : tensor<4xi64>,
     indices_are_sorted = false
-  } : (tensor<2x4x9xf32>, tensor<1x5x2xi32>) -> tensor<1x5x1xf32>
-  func.return %0 : tensor<1x5x1xf32>
+  } : (tensor<2x3x4x2xi32>, tensor<2x2x3x2xi64>) -> tensor<2x2x3x2x2xi32>
+  func.return %0 : tensor<2x2x3x2x2xi32>
 }
 
 // CHECK-LABEL: "op_get_dimension_size"
@@ -1383,36 +1439,38 @@ func.func @op_rsqrt(%arg0: tensor<f32>) -> tensor<f32> {
 }
 
 // CHECK-LABEL: "op_scatter"
-func.func @op_scatter(%arg0: tensor<200x100x300xf32>, %arg1: tensor<10x2xi32>, %arg2: tensor<10x300xf32>) -> tensor<200x100x300xf32> {
+func.func @op_scatter(%arg0: tensor<2x3x4x2xi64>, %arg1: tensor<2x2x3x2xi64>, %arg2: tensor<2x2x3x2x2xi64>) -> tensor<2x3x4x2xi64> {
   //      CHECK: "stablehlo.scatter"([[ARG0:%arg[0-9]+]], [[ARG1:%arg[0-9]+]], [[ARG2:%arg[0-9]+]]) <{
   // CHECK-SAME:  indices_are_sorted = true,
   // CHECK-SAME:  scatter_dimension_numbers = #stablehlo.scatter<
-  // CHECK-SAME:    update_window_dims = [1],
-  // CHECK-SAME:    inserted_window_dims = [0, 1],
-  // CHECK-SAME:    scatter_dims_to_operand_dims = [0, 1],
-  // CHECK-SAME:    index_vector_dim = 1
-  // CHECK-SAME:  >,
+  // CHECK-SAME:    update_window_dims = [3, 4],
+  // CHECK-SAME:    inserted_window_dims = [1],
+  // CHECK-SAME:    input_batching_dims = [0],
+  // CHECK-SAME:    scatter_indices_batching_dims = [1],
+  // CHECK-SAME:    scatter_dims_to_operand_dims = [2, 1],
+  // CHECK-SAME:    index_vector_dim = 3>,
   // CHECK-SAME:  unique_indices = true
   // CHECK-SAME: }> ({
-  // CHECK-NEXT:   ^[[BB:bb.*]](%[[ARG3:arg.*]]: tensor<f32>, %[[ARG4:arg.*]]: tensor<f32>):
-  // CHECK-NEXT:     %[[VAL1:.*]] = "stablehlo.add"(%[[ARG3]], %[[ARG4]]) : (tensor<f32>, tensor<f32>) -> tensor<f32>
-  // CHECK-NEXT:     "stablehlo.return"(%[[VAL1]]) : (tensor<f32>) -> ()
-  // CHECK-NEXT: }) : (tensor<200x100x300xf32>, tensor<10x2xi32>, tensor<10x300xf32>) -> tensor<200x100x300xf32>
+  // CHECK-NEXT:   ^[[BB:bb.*]](%[[ARG3:arg.*]]: tensor<i64>, %[[ARG4:arg.*]]: tensor<i64>):
+  // CHECK-NEXT:     %[[VAL1:.*]] = "stablehlo.add"(%[[ARG3]], %[[ARG4]]) : (tensor<i64>, tensor<i64>) -> tensor<i64>
+  // CHECK-NEXT:     "stablehlo.return"(%[[VAL1]]) : (tensor<i64>) -> ()
+  // CHECK-NEXT: }) : (tensor<2x3x4x2xi64>, tensor<2x2x3x2xi64>, tensor<2x2x3x2x2xi64>) -> tensor<2x3x4x2xi64>
   %0 = "mhlo.scatter"(%arg0, %arg1, %arg2) ({
-    ^bb0(%arg3: tensor<f32>, %arg4: tensor<f32>):
-      %1 = "mhlo.add"(%arg3, %arg4) : (tensor<f32>, tensor<f32>) -> tensor<f32>
-      "mhlo.return"(%1) : (tensor<f32>) -> ()
+    ^bb0(%arg3: tensor<i64>, %arg4: tensor<i64>):
+      %1 = "mhlo.add"(%arg3, %arg4) : (tensor<i64>, tensor<i64>) -> tensor<i64>
+      "mhlo.return"(%1) : (tensor<i64>) -> ()
   }) {
     scatter_dimension_numbers = #mhlo.scatter<
-      update_window_dims = [1],
-      inserted_window_dims = [0, 1],
-      scatter_dims_to_operand_dims = [0, 1],
-      index_vector_dim = 1
-    >,
+      update_window_dims = [3, 4],
+      inserted_window_dims = [1],
+      input_batching_dims = [0],
+      scatter_indices_batching_dims = [1],
+      scatter_dims_to_operand_dims = [2, 1],
+      index_vector_dim = 3>,
     indices_are_sorted = true,
     unique_indices = true
-  } : (tensor<200x100x300xf32>, tensor<10x2xi32>, tensor<10x300xf32>) -> tensor<200x100x300xf32>
-  func.return %0 : tensor<200x100x300xf32>
+  } : (tensor<2x3x4x2xi64>, tensor<2x2x3x2xi64>, tensor<2x2x3x2x2xi64>) -> tensor<2x3x4x2xi64>
+  func.return %0 : tensor<2x3x4x2xi64>
 }
 
 // CHECK-LABEL: "op_select_and_scatter"
@@ -1562,16 +1620,6 @@ func.func @op_subtract(%arg0: tensor<f32>, %arg1: tensor<f32>) -> tensor<f32> {
   func.return %0 : tensor<f32>
 }
 
-// CHECK-LABEL: "op_tan"
-func.func @op_tan(%arg0: tensor<f32>) -> tensor<f32> {
-  //               CHECK: "stablehlo.custom_call"([[ARG0:%arg[0-9]+]])  <{backend_config = "", call_target_name = "mhlo.tan"}> {
-  // CHECK-SAME{LITERAL}:    mhlo.attributes = {}
-  // CHECK-SAME{LITERAL}:    mhlo.version = 1 : i64
-  //          CHECK-SAME: } : (tensor<f32>) -> tensor<f32>
-  %0 = "mhlo.tan"(%arg0) : (tensor<f32>) -> tensor<f32>
-  func.return %0 : tensor<f32>
-}
-
 // CHECK-LABEL: "op_tanh"
 func.func @op_tanh(%arg0: tensor<f32>) -> tensor<f32> {
   // CHECK: "stablehlo.tanh"([[ARG0:%arg[0-9]+]]) : (tensor<f32>) -> tensor<f32>
@@ -1581,10 +1629,9 @@ func.func @op_tanh(%arg0: tensor<f32>) -> tensor<f32> {
 
 // CHECK-LABEL: "op_topk"
 func.func @op_topk(%arg0: tensor<5x10xf32>) -> (tensor<5x8xf32>, tensor<5x8xi32>) {
-  //               CHECK: "stablehlo.custom_call"([[ARG0:%arg[0-9]+]]) <{backend_config = "", call_target_name = "mhlo.topk"}> {
-  // CHECK-SAME{LITERAL}:    mhlo.attributes = {k = 8 : i64, largest = true}
-  // CHECK-SAME{LITERAL}:    mhlo.version = 1 : i64
-  //          CHECK-SAME: } : (tensor<5x10xf32>) -> (tensor<5x8xf32>, tensor<5x8xi32>)
+  // CHECK: "stablehlo.custom_call"([[ARG0:%arg[0-9]+]]) <{
+  // CHECK-SAME:   call_target_name = "mhlo.topk"}> {mhlo.attributes = {k = 8 : i64, largest = true}, mhlo.version = 1 : i64}
+  // CHECK-SAME: (tensor<5x10xf32>) -> (tensor<5x8xf32>, tensor<5x8xi32>)
   %0:2 = mhlo.topk(%arg0, k=8, largest=true) : tensor<5x10xf32> -> (tensor<5x8xf32>, tensor<5x8xi32>)
   func.return %0#0, %0#1 : tensor<5x8xf32>, tensor<5x8xi32>
 }
@@ -1635,17 +1682,6 @@ func.func @op_tuple(%arg0: tensor<f32>) -> tuple<tensor<f32>> {
   // CHECK: "stablehlo.tuple"([[ARG0:%arg[0-9]+]]) : (tensor<f32>) -> tuple<tensor<f32>>
   %0 = "mhlo.tuple"(%arg0) : (tensor<f32>) -> tuple<tensor<f32>>
   func.return %0 : tuple<tensor<f32>>
-}
-
-// CHECK-LABEL: "op_unary_einsum"
-func.func @op_unary_einsum(%arg0: tensor<8x16xf32>) -> tensor<8xf32> {
-  //      CHECK: "stablehlo.unary_einsum"([[ARG0:%arg[0-9]+]]) <{
-  // CHECK-SAME:   einsum_config = "ab->a"
-  // CHECK-SAME: }> : (tensor<8x16xf32>) -> tensor<8xf32>
-  %0 = "mhlo.unary_einsum"(%arg0) {
-    einsum_config = "ab->a"
-  } : (tensor<8x16xf32>) -> tensor<8xf32>
-  func.return %0 : tensor<8xf32>
 }
 
 // CHECK-LABEL: "op_uniform_dequantize"
@@ -1767,6 +1803,20 @@ func.func @type_ui64(%arg0: tensor<ui64>, %arg1: tensor<ui64>) -> tensor<ui64> {
   // CHECK: "stablehlo.add"([[ARG0:%arg[0-9]+]], [[ARG1:%arg[0-9]+]]) : (tensor<ui64>, tensor<ui64>) -> tensor<ui64>
   %0 = "mhlo.add"(%arg0, %arg1) : (tensor<ui64>, tensor<ui64>) -> tensor<ui64>
   func.return %0 : tensor<ui64>
+}
+
+// CHECK-LABEL: "type_f8E3M4"
+func.func @type_f8E3M4(%arg0: tensor<f8E3M4>, %arg1: tensor<f8E3M4>) -> tensor<f8E3M4> {
+  // CHECK: "stablehlo.add"([[ARG0:%arg[0-9]+]], [[ARG1:%arg[0-9]+]]) : (tensor<f8E3M4>, tensor<f8E3M4>) -> tensor<f8E3M4>
+  %0 = "mhlo.add"(%arg0, %arg1) : (tensor<f8E3M4>, tensor<f8E3M4>) -> tensor<f8E3M4>
+  func.return %0 : tensor<f8E3M4>
+}
+
+// CHECK-LABEL: "type_f8E4M3"
+func.func @type_f8E4M3(%arg0: tensor<f8E4M3>, %arg1: tensor<f8E4M3>) -> tensor<f8E4M3> {
+  // CHECK: "stablehlo.add"([[ARG0:%arg[0-9]+]], [[ARG1:%arg[0-9]+]]) : (tensor<f8E4M3>, tensor<f8E4M3>) -> tensor<f8E4M3>
+  %0 = "mhlo.add"(%arg0, %arg1) : (tensor<f8E4M3>, tensor<f8E4M3>) -> tensor<f8E4M3>
+  func.return %0 : tensor<f8E4M3>
 }
 
 // CHECK-LABEL: "type_f8E4M3FN"

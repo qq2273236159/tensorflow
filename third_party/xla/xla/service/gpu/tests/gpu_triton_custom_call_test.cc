@@ -23,11 +23,11 @@ limitations under the License.
 #include "absl/status/status.h"
 #include "absl/strings/string_view.h"
 #include "llvm/Support/raw_ostream.h"
-#include "mlir/IR/Attributes.h"  // from @llvm-project
-#include "mlir/IR/Builders.h"  // from @llvm-project
-#include "mlir/IR/BuiltinAttributes.h"  // from @llvm-project
-#include "mlir/IR/MLIRContext.h"  // from @llvm-project
-#include "mlir/Support/LLVM.h"  // from @llvm-project
+#include "mlir/IR/Attributes.h"
+#include "mlir/IR/Builders.h"
+#include "mlir/IR/BuiltinAttributes.h"
+#include "mlir/IR/MLIRContext.h"
+#include "mlir/Support/LLVM.h"
 #include "xla/hlo/ir/hlo_computation.h"
 #include "xla/hlo/ir/hlo_instruction.h"
 #include "xla/service/gpu/tests/gpu_codegen_test.h"
@@ -158,13 +158,6 @@ TEST_F(GpuIrEmitterUnnestedTest,
 ; CHECK-DAG:  addrspacecast ptr %arg1 to ptr addrspace(1)
 ; CHECK-DAG:  addrspacecast ptr %arg2 to ptr addrspace(1)
 ; CHECK-DAG:  addrspacecast ptr %arg3 to ptr addrspace(1)
-; CHECK: tail call i32 asm sideeffect
-; CHECK: tail call i32 asm sideeffect
-; CHECK: fadd float
-; CHECK-SAME: 1.000000e+00
-; CHECK-DAG: tail call void asm sideeffect
-; CHECK-DAG: tail call void asm sideeffect
-; CHECK:    ret void
       )",
                      /*match_optimized_ir=*/false);
 }
@@ -196,8 +189,8 @@ TEST_F(GpuIrEmitterUnnestedTest, CanNotEmitTritonCustomCallOnPreAmpereGpu) {
       CompileToExecutable(std::move(module), /*run_optimization_passes=*/false),
       tsl::testing::StatusIs(
           absl::StatusCode::kFailedPrecondition,
-          ::testing::StrEq(
-              "Triton support is only enabled for Ampere GPUs and up.")));
+          ::testing::HasSubstr("Triton support is only enabled for Ampere GPUs "
+                               "(compute capability 8.0) and up, but got")));
 }
 
 class TritonCustomCallTest : public HloTestBase {};

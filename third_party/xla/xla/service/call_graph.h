@@ -18,15 +18,25 @@ limitations under the License.
 #ifndef XLA_SERVICE_CALL_GRAPH_H_
 #define XLA_SERVICE_CALL_GRAPH_H_
 
+#include <cstdint>
 #include <memory>
 #include <ostream>
+#include <string>
+#include <utility>
+#include <vector>
 
 #include "absl/container/flat_hash_map.h"
 #include "absl/container/flat_hash_set.h"
+#include "absl/container/inlined_vector.h"
 #include "absl/functional/function_ref.h"
+#include "absl/status/status.h"
+#include "absl/strings/string_view.h"
+#include "absl/types/span.h"
 #include "xla/hlo/ir/hlo_computation.h"
 #include "xla/hlo/ir/hlo_instruction.h"
 #include "xla/hlo/ir/hlo_module.h"
+#include "xla/hlo/ir/hlo_opcode.h"
+#include "tsl/platform/logging.h"
 
 namespace xla {
 
@@ -131,7 +141,7 @@ class CallGraphNode {
   CallGraphNode(const CallGraphNode&) = delete;
   CallGraphNode& operator=(const CallGraphNode&) = delete;
   CallGraphNode(CallGraphNode&&) = default;
-  CallGraphNode& operator=(CallGraphNode&&) = default;
+  CallGraphNode& operator=(CallGraphNode&&) noexcept = default;
 
  private:
   // Only CallGraph can modify CallGraphNode.

@@ -17,21 +17,21 @@ limitations under the License.
 
 #include <stdarg.h>
 
+#include <algorithm>
 #include <cstddef>
+#include <iterator>
 #include <limits>
-#include <memory>
 #include <numeric>
-#include <optional>
 #include <string>
 #include <tuple>
 #include <utility>
-#include <variant>
 #include <vector>
 
 #include "absl/algorithm/container.h"
 #include "absl/base/casts.h"
-#include "absl/container/flat_hash_map.h"
+#include "absl/base/log_severity.h"
 #include "absl/container/inlined_vector.h"
+#include "absl/log/check.h"
 #include "absl/strings/match.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_format.h"
@@ -41,7 +41,6 @@ limitations under the License.
 #include "tsl/platform/env.h"
 #include "tsl/platform/numbers.h"
 #include "tsl/platform/stacktrace.h"
-#include "tsl/platform/threadpool.h"
 
 namespace xla {
 
@@ -138,7 +137,7 @@ std::string Reindent(absl::string_view original,
 template <typename FloatT>
 static void RoundTripNanPayload(FloatT value, std::string* result) {
   static_assert(!std::is_same<FloatT, tsl::float8_e4m3fn>::value,
-                "RoundTripNanPayload does not support E4M3");
+                "RoundTripNanPayload does not support E4M3FN");
   static_assert(!std::is_same<FloatT, tsl::float8_e4m3fnuz>::value,
                 "RoundTripNanPayload does not support E4M3FNUZ");
   static_assert(!std::is_same<FloatT, tsl::float8_e5m2fnuz>::value,
@@ -169,6 +168,12 @@ std::string RoundTripFpToString(tsl::float8_e5m2 value) {
   return result;
 }
 
+std::string RoundTripFpToString(tsl::float8_e4m3 value) {
+  std::string result = GenericRoundTripFpToString(value);
+  RoundTripNanPayload(value, &result);
+  return result;
+}
+
 std::string RoundTripFpToString(tsl::float8_e4m3fnuz value) {
   std::string result = GenericRoundTripFpToString(value);
   return result;
@@ -186,6 +191,12 @@ std::string RoundTripFpToString(tsl::float8_e4m3fn value) {
 
 std::string RoundTripFpToString(tsl::float8_e4m3b11fnuz value) {
   std::string result = GenericRoundTripFpToString(value);
+  return result;
+}
+
+std::string RoundTripFpToString(tsl::float8_e3m4 value) {
+  std::string result = GenericRoundTripFpToString(value);
+  RoundTripNanPayload(value, &result);
   return result;
 }
 
@@ -284,10 +295,11 @@ std::string HumanReadableNumTranscendentalOps(double trops,
   return HumanReadableNumOps(trops, nanoseconds, "TR");
 }
 
-void LogLines(int sev, absl::string_view text, const char* fname, int lineno) {
-  const int orig_sev = sev;
-  if (sev == tsl::FATAL) {
-    sev = tsl::ERROR;
+void LogLines(absl::LogSeverity sev, absl::string_view text, const char* fname,
+              int lineno) {
+  const absl::LogSeverity orig_sev = sev;
+  if (sev == absl::LogSeverity::kFatal) {
+    sev = absl::LogSeverity::kError;
   }
 
   // Protect calls with a mutex so we don't interleave calls to LogLines from
@@ -307,7 +319,7 @@ void LogLines(int sev, absl::string_view text, const char* fname, int lineno) {
     cur = eol + 1;
   }
 
-  if (orig_sev == tsl::FATAL) {
+  if (orig_sev == absl::LogSeverity::kFatal) {
     tsl::internal::LogString(fname, lineno, orig_sev,
                              "Aborting due to errors.");
   }
@@ -316,6 +328,15 @@ void LogLines(int sev, absl::string_view text, const char* fname, int lineno) {
 int64_t Product(absl::Span<const int64_t> xs) {
   return std::accumulate(xs.begin(), xs.end(), static_cast<int64_t>(1),
                          std::multiplies<int64_t>());
+}
+
+std::vector<int64_t> ElemwiseProduct(absl::Span<const int64_t> a,
+                                     absl::Span<const int64_t> b) {
+  CHECK_EQ(a.size(), b.size());
+  std::vector<int64_t> result;
+  std::transform(a.begin(), a.end(), b.begin(), std::back_inserter(result),
+                 std::multiplies<int64_t>());
+  return result;
 }
 
 absl::InlinedVector<std::pair<int64_t, int64_t>, 8> CommonFactors(

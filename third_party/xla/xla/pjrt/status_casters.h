@@ -16,9 +16,9 @@ limitations under the License.
 #ifndef XLA_PJRT_STATUS_CASTERS_H_
 #define XLA_PJRT_STATUS_CASTERS_H_
 
+#include "absl/status/status.h"
+#include "absl/status/statusor.h"
 #include "xla/pjrt/exceptions.h"
-#include "xla/status.h"
-#include "xla/statusor.h"
 #include "tsl/platform/macros.h"
 
 namespace xla {
@@ -139,7 +139,7 @@ struct ThrowIfErrorWrapper<absl::Status(Args...) const, C> {
 
 // Utilities for `StatusOr`.
 template <typename T>
-T ValueOrThrow(StatusOr<T> v) {
+T ValueOrThrow(absl::StatusOr<T> v) {
   if (!v.ok()) {
     throw xla::XlaRuntimeError(v.status());
   }

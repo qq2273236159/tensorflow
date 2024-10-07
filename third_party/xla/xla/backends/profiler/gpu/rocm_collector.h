@@ -18,7 +18,7 @@ limitations under the License.
 
 #include "absl/container/flat_hash_map.h"
 #include "absl/container/node_hash_set.h"
-#include "tsl/profiler/utils/xplane_builder.h"
+#include "xla/tsl/profiler/utils/xplane_builder.h"
 
 namespace xla {
 namespace profiler {
@@ -111,7 +111,7 @@ const char* GetRocmTracerEventSourceName(const RocmTracerEventSource& source);
 enum class RocmTracerEventDomain {
   InvalidDomain = 0,
   HIP_API,
-  HCC_OPS,  // TODO(rocm-profiler): renme this to HIP_OPS
+  HIP_OPS,
 };
 const char* GetRocmTracerEventDomainName(const RocmTracerEventDomain& domain);
 // RocmTracerSyncTypes forward decleration

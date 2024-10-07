@@ -26,6 +26,7 @@ limitations under the License.
 #include <unordered_set>
 #include <vector>
 
+#include "absl/status/status.h"
 #include "tensorflow/core/framework/graph.pb.h"
 #include "tensorflow/core/framework/node_def.pb.h"
 #include "tensorflow/core/framework/numeric_types.h"
@@ -66,7 +67,7 @@ Status InitializeVariables(Session* session,
   for (const string& init_op : init_ops) {
     TF_RETURN_IF_ERROR(session->Run({}, {}, {init_op}, nullptr));
   }
-  return OkStatus();
+  return absl::OkStatus();
 }
 
 template <class T>
@@ -156,7 +157,7 @@ Status GetOutputShapes(const std::vector<InputLayerInfo>& inputs,
     const TensorShape& found_shape = output_tensors[i].shape();
     (*node_shapes)[wanted_shape_name] = found_shape;
   }
-  return OkStatus();
+  return absl::OkStatus();
 }
 
 Status CalculateFlops(const GraphDef& graph,
@@ -222,7 +223,7 @@ Status CalculateFlops(const GraphDef& graph,
       *total_flops += current_flops;
     }
   }
-  return OkStatus();
+  return absl::OkStatus();
 }
 
 void RecordBenchmarkEntry(const string& output_prefix,
@@ -273,7 +274,7 @@ Status InitializeSession(int num_threads, const string& graph,
   LOG(INFO) << "Got config, " << config.device_count_size() << " devices";
 
   session->reset(tensorflow::NewSession(options));
-  graph_def->reset(new GraphDef());
+  *graph_def = std::make_unique<GraphDef>();
   tensorflow::GraphDef tensorflow_graph;
   Status s = ReadBinaryProto(Env::Default(), graph, graph_def->get());
   if (!s.ok()) {
@@ -291,7 +292,7 @@ Status InitializeSession(int num_threads, const string& graph,
     return s;
   }
 
-  return OkStatus();
+  return absl::OkStatus();
 }
 
 Status RunBenchmark(const std::vector<InputLayerInfo>& inputs,
@@ -375,7 +376,7 @@ Status TimeMultipleRuns(double sleep_seconds, int num_runs, double max_time_s,
   stat.OutputToStream(&stream);
   LOG(INFO) << stream.str() << std::endl;
 
-  return OkStatus();
+  return absl::OkStatus();
 }
 
 int Main(int argc, char** argv) {
@@ -532,7 +533,7 @@ int Main(int argc, char** argv) {
   stats_options.memory_limit = memory_limit;
   stats_options.show_type = show_type;
   stats_options.show_summary = show_summary;
-  stats.reset(new tensorflow::StatSummarizer(stats_options));
+  stats = std::make_unique<tensorflow::StatSummarizer>(stats_options);
 
   const double inter_inference_sleep_seconds =
       std::strtod(inference_delay.c_str(), nullptr);

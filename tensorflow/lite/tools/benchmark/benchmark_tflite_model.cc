@@ -27,6 +27,7 @@ limitations under the License.
 #include <random>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -36,7 +37,10 @@ limitations under the License.
 #include "absl/strings/str_replace.h"
 #include "absl/strings/str_split.h"
 #include "absl/strings/string_view.h"
+#include "absl/types/span.h"
 #include "ruy/profiler/profiler.h"  // from @ruy
+#include "tensorflow/core/example/example.pb.h"
+#include "tensorflow/core/example/feature.pb.h"
 #include "tensorflow/lite/core/c/c_api_types.h"
 #include "tensorflow/lite/core/c/common.h"
 #include "tensorflow/lite/core/kernels/register.h"
@@ -48,8 +52,10 @@ limitations under the License.
 #include "tensorflow/lite/kernels/cpu_backend_context.h"
 #include "tensorflow/lite/op_resolver.h"
 #include "tensorflow/lite/optional_debug_tools.h"
+#include "tensorflow/lite/profiling/model_runtime_info.h"
 #include "tensorflow/lite/profiling/profile_summary_formatter.h"
 #include "tensorflow/lite/string_util.h"
+#include "tensorflow/lite/tools/benchmark/benchmark_params.h"
 #include "tensorflow/lite/tools/benchmark/benchmark_utils.h"
 #include "tensorflow/lite/tools/benchmark/profiling_listener.h"
 #include "tensorflow/lite/tools/delegates/delegate_provider.h"
@@ -77,6 +83,58 @@ constexpr bool kOpProfilingEnabledDefault = true;
 #else
 constexpr bool kOpProfilingEnabledDefault = false;
 #endif
+
+// Op profiling output modes.
+constexpr char kOpProfilingOutputModeStdout[] = "stdout";
+constexpr char kOpProfilingOutputModeCsv[] = "csv";
+constexpr char kOpProfilingOutputModeProto[] = "proto";
+
+const char* kOpProfilingOutputModes[] = {kOpProfilingOutputModeStdout,
+                                         kOpProfilingOutputModeCsv,
+                                         kOpProfilingOutputModeProto};
+
+// Sets feature values in the tensorflow::Example proto from the tflite tensor.
+// Returns an error if the tensor type is not supported or the tensor dime is a
+// nullptr.
+TfLiteStatus MaybeSetFeatureValuesFromTensor(const TfLiteTensor& tensor,
+                                             tensorflow::Example& example) {
+  if (tensor.dims == nullptr) {
+    return kTfLiteError;
+  }
+
+  int total_elements = 1;
+  for (int i = 0; i < tensor.dims->size; i++) {
+    total_elements *= tensor.dims->data[i];
+  }
+  tensorflow::Feature& feature =
+      (*example.mutable_features()->mutable_feature())[tensor.name];
+  switch (tensor.type) {
+    case kTfLiteFloat32:
+    case kTfLiteFloat64:
+      feature.mutable_float_list()->mutable_value()->Resize(total_elements, 0);
+      return utils::TfLiteTensorToFloat32Array(
+          tensor,
+          absl::MakeSpan(
+              feature.mutable_float_list()->mutable_value()->mutable_data(),
+              feature.float_list().value_size()));
+    case kTfLiteUInt8:
+    case kTfLiteInt8:
+    case kTfLiteUInt16:
+    case kTfLiteInt16:
+    case kTfLiteInt32:
+    case kTfLiteUInt32:
+    case kTfLiteUInt64:
+    case kTfLiteInt64:
+      feature.mutable_int64_list()->mutable_value()->Resize(total_elements, 0);
+      return utils::TfLiteTensorToInt64Array(
+          tensor,
+          absl::MakeSpan(
+              feature.mutable_int64_list()->mutable_value()->mutable_data(),
+              feature.int64_list().value_size()));
+    default:
+      return kTfLiteError;
+  }
+}
 
 // Dumps ruy profiling events if the ruy profiler is enabled.
 class RuyProfileListener : public BenchmarkListener {
@@ -144,23 +202,66 @@ class OutputSaver : public BenchmarkListener {
   }
 
   void OnBenchmarkEnd(const BenchmarkResults& results) override {
-    std::string path = params_->Get<std::string>("output_filepath");
-    if (path.empty()) return;
-
-    std::ofstream ofs(path, std::ofstream::out);
-    if (ofs.good()) {
-      for (int i = 0; i < interpreter_runner_->outputs().size(); i++) {
-        int tensor_index = interpreter_runner_->outputs()[i];
-        ofs.write(interpreter_runner_->tensor(tensor_index)->data.raw,
-                  interpreter_runner_->tensor(tensor_index)->bytes);
+    // If the output_filepath is specified, save the output tensors to the file.
+    const std::string path = params_->Get<std::string>("output_filepath");
+    if (!path.empty()) {
+      std::ofstream ofs(path, std::ofstream::out);
+      if (ofs.good()) {
+        for (int i = 0; i < interpreter_runner_->outputs().size(); i++) {
+          int tensor_index = interpreter_runner_->outputs()[i];
+          ofs.write(interpreter_runner_->tensor(tensor_index)->data.raw,
+                    interpreter_runner_->tensor(tensor_index)->bytes);
+        }
+        ofs.close();
       }
-      ofs.close();
+    }
+
+    // If the output_proto_filepath is specified, save the output tensors as
+    // tensorflow::Example proto and serialize it to the file.
+    const std::string output_proto_path =
+        params_->Get<std::string>("output_proto_filepath");
+    if (!output_proto_path.empty()) {
+      tensorflow::Example example;
+      for (int i = 0; i < interpreter_runner_->outputs().size(); i++) {
+        const int tensor_index = interpreter_runner_->outputs()[i];
+        const TfLiteTensor& tensor =
+            *(interpreter_runner_->tensor(tensor_index));
+        MaybeSetFeatureValuesFromTensor(tensor, example);
+      }
+      std::ofstream ofs(output_proto_path, std::ios::out | std::ios::binary);
+      if (ofs.good()) {
+        example.SerializeToOstream(&ofs);
+        ofs.close();
+      }
     }
   }
 
  private:
   BenchmarkInterpreterRunner* const interpreter_runner_;
   const BenchmarkParams* params_ = nullptr;
+};
+
+// Dumps the Model Runtime Info if enabled when export_model_runtime_info is
+// set to true.
+class ModelRuntimeInfoListener : public BenchmarkListener {
+ public:
+  explicit ModelRuntimeInfoListener(Interpreter* interpreter)
+      : interpreter_(interpreter) {}
+
+  // At this stage, the graph is fully modified with delegates.
+  // So the interpreter can be used to capture the ModelRuntimeDetails.
+  void OnBenchmarkStart(const BenchmarkParams& params) override {
+    const std::string output_file_path =
+        params.Get<std::string>("model_runtime_info_output_file");
+    const auto status =
+        profiling::GenerateModelRuntimeInfo(*interpreter_, output_file_path);
+    if (status != kTfLiteOk) {
+      TFLITE_LOG(ERROR) << "Failed to generate model runtime info: " << status;
+    }
+  }
+
+ private:
+  Interpreter* const interpreter_ = nullptr;  // not own the memory.
 };
 
 std::vector<std::string> Split(const std::string& str, const char delim) {
@@ -310,10 +411,14 @@ TfLiteStatus PopulateInputLayerInfo(
 }
 
 std::shared_ptr<profiling::ProfileSummaryFormatter>
-CreateProfileSummaryFormatter(bool format_as_csv) {
-  return format_as_csv
-             ? std::make_shared<profiling::ProfileSummaryCSVFormatter>()
-             : std::make_shared<profiling::ProfileSummaryDefaultFormatter>();
+CreateProfileSummaryFormatter(const std::string& output_mode) {
+  if (output_mode == kOpProfilingOutputModeCsv) {
+    return std::make_shared<profiling::ProfileSummaryCSVFormatter>();
+  } else if (output_mode == kOpProfilingOutputModeProto) {
+    return std::make_shared<profiling::ProfileSummaryProtoFormatter>();
+  } else {
+    return std::make_shared<profiling::ProfileSummaryDefaultFormatter>();
+  }
 }
 
 }  // namespace
@@ -479,13 +584,21 @@ BenchmarkParams BenchmarkTfLiteModel::DefaultParams() {
   default_params.AddParam(
       "enable_op_profiling",
       BenchmarkParam::Create<bool>(kOpProfilingEnabledDefault));
+  default_params.AddParam(
+      "op_profiling_output_mode",
+      BenchmarkParam::Create<std::string>(kOpProfilingOutputModeStdout));
+  default_params.AddParam("op_profiling_output_file",
+                          BenchmarkParam::Create<std::string>(""));
   default_params.AddParam("max_profiling_buffer_entries",
                           BenchmarkParam::Create<int32_t>(1024));
   default_params.AddParam("allow_dynamic_profiling_buffer_increase",
                           BenchmarkParam::Create<bool>(false));
   default_params.AddParam("profiling_output_csv_file",
                           BenchmarkParam::Create<std::string>(""));
-
+  default_params.AddParam("export_model_runtime_info",
+                          BenchmarkParam::Create<bool>(false));
+  default_params.AddParam("model_runtime_info_output_file",
+                          BenchmarkParam::Create<std::string>(""));
   default_params.AddParam("print_preinvoke_state",
                           BenchmarkParam::Create<bool>(false));
   default_params.AddParam("print_postinvoke_state",
@@ -499,6 +612,8 @@ BenchmarkParams BenchmarkTfLiteModel::DefaultParams() {
   default_params.AddParam("enable_builtin_cast_constant_cache",
                           BenchmarkParam::Create<bool>(false));
   default_params.AddParam("output_filepath",
+                          BenchmarkParam::Create<std::string>(""));
+  default_params.AddParam("output_proto_filepath",
                           BenchmarkParam::Create<std::string>(""));
 
   default_params.AddParam("tensor_name_display_length",
@@ -565,14 +680,25 @@ std::vector<Flag> BenchmarkTfLiteModel::GetFlags() {
       CreateFlag<bool>("require_full_delegation", &params_,
                        "require delegate to run the entire graph"),
       CreateFlag<bool>("enable_op_profiling", &params_, "enable op profiling"),
+      CreateFlag<std::string>(
+          "op_profiling_output_mode", &params_,
+          "Output mode for op profiling results. Supported values are: "
+          "'stdout', 'csv' and 'proto'."),
+      CreateFlag<std::string>("op_profiling_output_file", &params_,
+                              "Output file for op profiling results."),
       CreateFlag<int32_t>("max_profiling_buffer_entries", &params_,
                           "max initial profiling buffer entries"),
       CreateFlag<bool>("allow_dynamic_profiling_buffer_increase", &params_,
                        "allow dynamic increase on profiling buffer entries"),
-      CreateFlag<std::string>(
-          "profiling_output_csv_file", &params_,
-          "File path to export profile data as CSV, if not set "
-          "prints to stdout."),
+      CreateFlag<std::string>("profiling_output_csv_file", &params_,
+                              "[DEPRECATED: Use op_profiling_output_file and "
+                              "op_profiling_output_mode instead] File path to "
+                              "export profile data as CSV, if not set "
+                              "prints to stdout."),
+      CreateFlag<bool>("export_model_runtime_info", &params_,
+                       "Enable Model Runtime Info Export"),
+      CreateFlag<std::string>("model_runtime_info_output_file", &params_,
+                              "Proto File to export model runtime info to"),
       CreateFlag<bool>(
           "print_preinvoke_state", &params_,
           "print out the interpreter internals just before calling Invoke. The "
@@ -597,6 +723,9 @@ std::vector<Flag> BenchmarkTfLiteModel::GetFlags() {
       CreateFlag<std::string>(
           "output_filepath", &params_,
           "File path to export outputs layer as binary data."),
+      CreateFlag<std::string>(
+          "output_proto_filepath", &params_,
+          "File path to export outputs layer as tf example proto."),
       CreateFlag<int32_t>(
           "tensor_name_display_length", &params_,
           "The number of characters to show for the tensor's name when "
@@ -650,6 +779,10 @@ void BenchmarkTfLiteModel::LogParams() {
                       "Require full delegation", verbose);
   LOG_BENCHMARK_PARAM(bool, "enable_op_profiling", "Enable op profiling",
                       verbose);
+  LOG_BENCHMARK_PARAM(std::string, "op_profiling_output_mode",
+                      "Op profiling output mode.", verbose);
+  LOG_BENCHMARK_PARAM(std::string, "op_profiling_output_file",
+                      "Op profiling output file.", verbose);
   LOG_BENCHMARK_PARAM(int32_t, "max_profiling_buffer_entries",
                       "Max initial profiling buffer entries", verbose);
   LOG_BENCHMARK_PARAM(bool, "allow_dynamic_profiling_buffer_increase",
@@ -657,6 +790,10 @@ void BenchmarkTfLiteModel::LogParams() {
                       verbose);
   LOG_BENCHMARK_PARAM(std::string, "profiling_output_csv_file",
                       "CSV File to export profiling data to", verbose);
+  LOG_BENCHMARK_PARAM(bool, "export_model_runtime_info",
+                      "Enable Model Runtime Info Export", verbose);
+  LOG_BENCHMARK_PARAM(std::string, "model_runtime_info_output_file",
+                      "Proto File to export model runtime info to", verbose);
   LOG_BENCHMARK_PARAM(bool, "print_preinvoke_state",
                       "Print pre-invoke interpreter state", verbose);
   LOG_BENCHMARK_PARAM(bool, "print_postinvoke_state",
@@ -671,6 +808,9 @@ void BenchmarkTfLiteModel::LogParams() {
                       "Constant CAST output cache", verbose);
   LOG_BENCHMARK_PARAM(std::string, "output_filepath",
                       "File path to export outputs layer to", verbose);
+  LOG_BENCHMARK_PARAM(std::string, "output_proto_filepath",
+                      "File path to export outputs layer as tf example to",
+                      verbose);
   LOG_BENCHMARK_PARAM(int32_t, "tensor_name_display_length",
                       "Tensor name display length", verbose);
   LOG_BENCHMARK_PARAM(int32_t, "tensor_type_display_length",
@@ -691,6 +831,31 @@ TfLiteStatus BenchmarkTfLiteModel::ValidateParams() {
     TFLITE_LOG(ERROR)
         << "Please specify the name of your TF Lite input file with --graph";
     return kTfLiteError;
+  }
+
+  if (params_.Get<bool>("enable_op_profiling")) {
+    bool found =
+        std::find(std::begin(kOpProfilingOutputModes),
+                  std::end(kOpProfilingOutputModes),
+                  params_.Get<std::string>("op_profiling_output_mode")) !=
+        std::end(kOpProfilingOutputModes);
+
+    if (!found) {
+      TFLITE_LOG(ERROR) << "Output mode"
+                        << params_.Get<std::string>("op_profiling_output_mode")
+                        << " is not supported. Supported values are: 'stdout', "
+                           "'csv' and 'proto'.";
+      return kTfLiteError;
+    }
+
+    if (!params_.Get<std::string>("profiling_output_csv_file").empty()) {
+      // Backward compatibility for profiling_output_csv_file.
+      params_.Set<std::string>("op_profiling_output_mode",
+                               kOpProfilingOutputModeCsv);
+      params_.Set<std::string>(
+          "op_profiling_output_file",
+          params_.Get<std::string>("profiling_output_csv_file"));
+    }
   }
 
   return PopulateInputLayerInfo(
@@ -936,6 +1101,11 @@ TfLiteStatus BenchmarkTfLiteModel::Init() {
   AddOwnedListener(std::unique_ptr<BenchmarkListener>(
       new InterpreterStatePrinter(interpreter_.get())));
 
+  if (params_.Get<bool>("export_model_runtime_info")) {
+    AddOwnedListener(std::unique_ptr<BenchmarkListener>(
+        new ModelRuntimeInfoListener(interpreter_.get())));
+  }
+
   interpreter_->SetAllowFp16PrecisionForFp32(params_.Get<bool>("allow_fp16"));
 
   std::pair<TfLiteStatus, std::unique_ptr<BenchmarkInterpreterRunner>>
@@ -1123,9 +1293,9 @@ BenchmarkTfLiteModel::MayCreateProfilingListener() const {
   return std::unique_ptr<BenchmarkListener>(new ProfilingListener(
       interpreter_.get(), params_.Get<int32_t>("max_profiling_buffer_entries"),
       params_.Get<bool>("allow_dynamic_profiling_buffer_increase"),
-      params_.Get<std::string>("profiling_output_csv_file"),
+      params_.Get<std::string>("op_profiling_output_file"),
       CreateProfileSummaryFormatter(
-          !params_.Get<std::string>("profiling_output_csv_file").empty())));
+          params_.Get<std::string>("op_profiling_output_mode"))));
 }
 
 TfLiteStatus BenchmarkTfLiteModel::RunImpl() {

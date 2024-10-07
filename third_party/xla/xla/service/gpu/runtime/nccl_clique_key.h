@@ -24,10 +24,12 @@ limitations under the License.
 #include <string_view>
 #include <vector>
 
+#include "absl/crc/crc32c.h"
 #include "absl/status/statusor.h"
+#include "absl/strings/string_view.h"
 #include "absl/types/span.h"
 #include "xla/service/global_device_id.h"
-#include "tsl/lib/gtl/int_type.h"
+#include "xla/tsl/lib/gtl/int_type.h"
 
 namespace xla::gpu {
 
@@ -54,10 +56,11 @@ enum class AsyncStreamKind : int64_t {
   kCollective = 0,  // Stream for asynchronous collective ops.
   kP2P0 = 1,        // One Stream for P2P Send and Recv ops.
   kP2P1 = 2,        // Another Stream for P2P Send and Recv ops.
+  kMemCpyP2P = 3,   // Stream for MemCpyP2P
 };
 
 constexpr static int64_t kAsyncStreamTotal =
-    static_cast<int64_t>(AsyncStreamKind::kP2P1) + 1;
+    static_cast<int64_t>(AsyncStreamKind::kMemCpyP2P) + 1;
 
 // Assigns a unique ID to a stream for asynchronous or synchronous execution.
 // These IDs can be used, for example, to look up the NCCL communicator.
@@ -80,7 +83,8 @@ class NcclCliqueKey {
   explicit NcclCliqueKey(
       std::vector<GlobalDeviceId> devices,
       NcclStreamId stream_id = NcclStreamId(0),
-      AsyncStreamKind stream_kind = AsyncStreamKind::kCollective);
+      AsyncStreamKind stream_kind = AsyncStreamKind::kCollective,
+      std::vector<std::vector<GlobalDeviceId>> participant_groups = {});
 
   absl::Span<const GlobalDeviceId> devices() const;
 
@@ -111,11 +115,23 @@ class NcclCliqueKey {
   std::vector<GlobalDeviceId> devices_;
   NcclStreamId stream_id_;
   AsyncStreamKind stream_kind_;
+  // The full list of groups across all devices which this clique is a part of.
+  // When enable_nccl_comm_splitting is enabled, this is used to distinguish
+  // which cliques can be reused from the cache or must be split in order to
+  // prevent a deadlock situation.
+  // For example, imagine we have a communicator with devices = [0,1] and groups
+  // = [0, 1] Later on, we may want to create communicators [0, 1] and [2, 3] by
+  // splitting [0, 1, 2, 3] If ranks 0 and 1 reuse the exisiting [0, 1] clique
+  // but ranks 2 and 3 initiate a split, there will be a deadlock since ranks 2,
+  // 3 and will be waiting forever for 0, 1 to join the split. Having the
+  // particating groups as part of the cache key will prevent such situations
+  std::vector<std::vector<GlobalDeviceId>> participant_groups_;
 };
 
 template <typename H>
 H AbslHashValue(H h, const NcclCliqueKey& k) {
-  return H::combine(std::move(h), k.devices_, k.stream_id_);
+  return H::combine(std::move(h), k.devices_, k.stream_id_,
+                    k.participant_groups_);
 }
 
 bool operator==(const NcclCliqueKey& a, const NcclCliqueKey& b);
@@ -144,6 +160,11 @@ class NcclCliqueId {
 
   absl::Span<const char> data() const;
   std::string ToString() const;
+
+  uint32_t fingerprint() const {
+    return static_cast<uint32_t>(
+        absl::ComputeCrc32c(absl::string_view(data_.data(), kSize)));
+  }
 
   template <typename H>
   friend H AbslHashValue(H h, const NcclCliqueId& id);

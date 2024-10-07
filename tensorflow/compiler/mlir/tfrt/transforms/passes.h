@@ -16,11 +16,16 @@ limitations under the License.
 #ifndef TENSORFLOW_COMPILER_MLIR_TFRT_TRANSFORMS_PASSES_H_
 #define TENSORFLOW_COMPILER_MLIR_TFRT_TRANSFORMS_PASSES_H_
 
+#include <cstdint>
 #include <memory>
 
 #include "llvm/Support/CommandLine.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"  // from @llvm-project
+#include "mlir/IR/BuiltinOps.h"  // from @llvm-project
+#include "mlir/IR/PatternMatch.h"  // from @llvm-project
 #include "mlir/Pass/Pass.h"  // from @llvm-project
+#include "mlir/Pass/PassOptions.h"  // from @llvm-project
+#include "mlir/Support/LogicalResult.h"  // from @llvm-project
 #include "mlir/Transforms/DialectConversion.h"  // from @llvm-project
 #include "tensorflow/compiler/mlir/tensorflow/analysis/side_effect_analysis.h"
 #include "tensorflow/compiler/mlir/tfrt/transforms/tfrt_pipeline_options.h"
@@ -67,8 +72,13 @@ std::unique_ptr<mlir::OperationPass<mlir::ModuleOp>>
 CreateDeduplicateFunctionsInovkedByBatchFunctionPass();
 
 // Create a pass to lower bound the number of threads in tf.BatchFunction.
-std::unique_ptr<mlir::OperationPass<mlir::ModuleOp>>
-CreateLowerBoundBatchThreadsPass(int64_t min_num_batch_threads);
+struct ReconfigBatchOpPassOptions {
+  int64_t min_num_batch_threads = 1;
+  int64_t min_max_enqueued_batches = 1;
+  std::string batch_padding_policy = "";
+};
+std::unique_ptr<mlir::OperationPass<mlir::ModuleOp>> CreateReconfigBatchOpPass(
+    ReconfigBatchOpPassOptions options);
 
 // Create a pass to fuse the TPU Ops for TFRT.
 std::unique_ptr<mlir::OperationPass<mlir::func::FuncOp>>

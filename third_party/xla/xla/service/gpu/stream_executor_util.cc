@@ -39,7 +39,8 @@ limitations under the License.
 #include "absl/synchronization/mutex.h"
 #include "absl/time/time.h"
 #include "absl/types/span.h"
-#include "Eigen/Core"  // from @eigen_archive
+#include "Eigen/Core"
+#include "xla/autotuning.pb.h"
 #include "xla/hlo/ir/hlo_instruction.h"
 #include "xla/layout.h"
 #include "xla/layout_util.h"
@@ -52,15 +53,15 @@ limitations under the License.
 #include "xla/stream_executor/device_memory.h"
 #include "xla/stream_executor/dnn.h"
 #include "xla/stream_executor/kernel.h"
-#include "xla/stream_executor/kernel_factory.h"
 #include "xla/stream_executor/kernel_spec.h"
 #include "xla/stream_executor/launch_dim.h"
 #include "xla/stream_executor/platform.h"
 #include "xla/stream_executor/stream.h"
 #include "xla/stream_executor/typed_kernel_factory.h"
-#include "xla/tsl/util/env_var.h"
+#include "xla/tsl/protobuf/dnn.pb.h"
 #include "xla/tsl/util/proto/proto_utils.h"
 #include "xla/util.h"
+#include "xla/xla_data.pb.h"
 #include "tsl/platform/ml_dtypes.h"
 #include "tsl/platform/status.h"
 #include "tsl/platform/statusor.h"
@@ -68,17 +69,24 @@ limitations under the License.
 namespace xla {
 namespace gpu {
 
-se::dnn::VersionInfo GetDnnVersionInfo(
-    stream_executor::StreamExecutor* stream_exec,
-    se::dnn::VersionInfo fallback_version) {
+absl::StatusOr<se::dnn::VersionInfo> GetDnnVersionInfo(
+    stream_executor::StreamExecutor* stream_exec) {
   if (!stream_exec) {
-    return fallback_version;
+    return absl::InvalidArgumentError("StreamExecutor is null");
   }
   stream_executor::dnn::DnnSupport* dnn = stream_exec->AsDnn();
   if (!dnn) {
-    return fallback_version;
+    return absl::FailedPreconditionError(
+        "DNN library initialization failed. Look at the errors above for more "
+        "details.");
   }
-  return dnn->GetVersion().value_or(fallback_version);
+  return dnn->GetVersion();
+}
+
+se::dnn::VersionInfo GetDnnVersionInfoOrDefault(
+    stream_executor::StreamExecutor* stream_exec,
+    se::dnn::VersionInfo fallback_version) {
+  return GetDnnVersionInfo(stream_exec).value_or(fallback_version);
 }
 
 namespace {
@@ -370,7 +378,7 @@ absl::StatusOr<std::unique_ptr<se::Kernel>> CreateKernel(
   }
 
   TF_ASSIGN_OR_RETURN(std::unique_ptr<se::Kernel> kernel,
-                      se::KernelFactory::Create(stream_exec, loader_spec));
+                      stream_exec->LoadKernel(loader_spec));
 
   se::KernelMetadata m;
   m.set_shared_memory_bytes(shared_mem_bytes);
@@ -386,8 +394,8 @@ absl::Status ExecuteKernelOnStream(const se::Kernel& kernel,
       std::unique_ptr<se::KernelArgsPackedArrayBase> kernel_args,
       se::PackKernelArgs(args, kernel.metadata()));
 
-  return stream->parent()->Launch(stream, dims.thread_counts_per_block(),
-                                  dims.block_counts(), kernel, *kernel_args);
+  return stream->Launch(dims.thread_counts_per_block(), dims.block_counts(),
+                        kernel, *kernel_args);
 }
 
 absl::Status ExecuteKernelOnStream(const se::Kernel& kernel,
@@ -399,9 +407,8 @@ absl::Status ExecuteKernelOnStream(const se::Kernel& kernel,
       std::unique_ptr<se::KernelArgsPackedArrayBase> kernel_args,
       se::PackKernelArgs(args, kernel.metadata()));
 
-  return stream->parent()->Launch(stream, dims.thread_counts_per_block(),
-                                  dims.block_counts(), cluster_dim, kernel,
-                                  *kernel_args);
+  return stream->Launch(dims.thread_counts_per_block(), dims.block_counts(),
+                        cluster_dim, kernel, *kernel_args);
 }
 
 // Unimplemented for integers yet.
@@ -431,7 +438,7 @@ static void InitializeTypedBuffer(se::Stream* stream,
 
   // Use a large prime number to fragment the accesses.
   constexpr int host_buffer_size = 10069;
-  static std::vector<T>* host_buffer = [] {
+  static std::vector<T>* host_buffer = [&] {
     auto* ret = new std::vector<T>(host_buffer_size);
     // Default-seeded random numbers.
     std::mt19937 gen;
@@ -615,16 +622,8 @@ absl::StatusOr<se::dnn::DataType> GetDNNDataTypeFromPrimitiveType(
 }
 
 bool RequireDeterminism(const HloModuleConfig& config) {
-  static bool require_cudnn_determinism = [] {
-    // TODO(reedwm): Remove the TF_CUDNN_DETERMINISTIC env var.
-    bool cudnn_deterministic = false;
-    TF_CHECK_OK(tsl::ReadBoolFromEnvVar("TF_CUDNN_DETERMINISTIC",
-                                        /*default_val=*/false,
-                                        &cudnn_deterministic));
-    return cudnn_deterministic;
-  }();
-  return require_cudnn_determinism ||
-         config.debug_options().xla_gpu_deterministic_ops();
+  return config.debug_options().xla_gpu_deterministic_ops() ||
+         config.debug_options().xla_gpu_exclude_nondeterministic_ops();
 }
 
 namespace {

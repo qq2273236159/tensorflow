@@ -22,6 +22,7 @@ limitations under the License.
 #include <string>
 #include <utility>
 #include <variant>
+#include <vector>
 
 #include "absl/container/flat_hash_set.h"
 #include "absl/log/check.h"
@@ -31,6 +32,7 @@ limitations under the License.
 #include "absl/strings/str_join.h"
 #include "xla/hlo/ir/hlo_computation.h"
 #include "xla/hlo/ir/hlo_instruction.h"
+#include "xla/hlo/ir/hlo_instructions.h"
 #include "xla/hlo/ir/hlo_module.h"
 #include "xla/hlo/ir/hlo_opcode.h"
 #include "xla/hlo/utils/hlo_query.h"
@@ -39,10 +41,10 @@ limitations under the License.
 #include "xla/service/gpu/triton_tiling_propagation.h"
 #include "xla/service/instruction_fusion.h"
 #include "xla/shape_util.h"
-#include "xla/status.h"
 #include "xla/status_macros.h"
 #include "xla/tools/hlo_decomposer.h"
 #include "xla/util.h"
+#include "xla/xla_data.pb.h"
 #include "tsl/platform/errors.h"
 #include "tsl/platform/statusor.h"
 
@@ -111,16 +113,6 @@ namespace triton_fusion {
   return context;
 }
 
-/*static*/ FusionContext FusionContext::FromSoftmaxRoot(
-    const HloInstruction& root) {
-  FusionContext context(
-      SoftmaxProperties{DimensionOrder::kSoftmaxReductionDimension,
-                        DimensionOrder::kSoftmaxBatchDimension},
-      SoftmaxRequirements{});
-  context.dim_orders_[&root] = DimensionOrder::FromSoftmaxRoot(root);
-  return context;
-}
-
 namespace {
 
 // Tells how many new parameters does a fusion gain by fusing the operation as
@@ -147,17 +139,19 @@ bool FusionContext::CombineDimOrdersAndReqs(const DimOrdersAndReqs& update) {
     }
   }
 
-  RequirementsOrError requirements_or_error =
-      CombineRequirements(requirements_, update.requirements);
+  DotRequirementsOrError requirements_or_error =
+      CombineDotRequirements(requirements_, update.requirements);
   if (std::holds_alternative<FusionDecision>(requirements_or_error)) {
     return false;
   }
 
-  requirements_ = std::move(std::get<Requirements>(requirements_or_error));
+  requirements_ = std::move(std::get<DotRequirements>(requirements_or_error));
   dim_orders_.insert(update.dim_orders.begin(), update.dim_orders.end());
   return true;
 }
 
+// Returns the list of parameters that are inputs to the given instruction.
+// Also updates the dimension orders and iteration specs for the parameters.
 absl::Status FusionContext::PropagateDimensionOrdersToParameters(
     const HloInstruction& origin, ConstHloInstructionSet& parameters,
     ConstHloInstructionMap<TensorIterationSpec>& iter_specs) {
@@ -219,24 +213,16 @@ absl::StatusOr<TritonFusionAnalysis> TritonFusionAnalysis::Execute(
   TritonFusionAnalysis analysis;
   const HloInstruction* dot =
       hlo_query::GetFirstInstructionWithOpcode(computation, HloOpcode::kDot);
-  if (dot != nullptr) {
-    TF_RETURN_IF_ERROR(analysis.ExecuteForDotFusion(*dot, split_k));
-  } else {
-    TF_RETURN_IF_ERROR(
-        analysis.ExecuteForSoftmaxFusion(*computation.root_instruction()));
-  }
+  TF_RET_CHECK(dot != nullptr);
+  TF_RETURN_IF_ERROR(analysis.ExecuteForDotFusion(*dot, split_k));
   return analysis;
 }
 
-absl::Status TritonFusionAnalysis::ExecuteForSoftmaxFusion(
-    const HloInstruction& root) {
-  auto context = FusionContext::FromSoftmaxRoot(root);
-  // Softmax fusion uses one tiled scope.
-  TF_RETURN_IF_ERROR(context.PropagateDimensionOrdersToParameters(
-      root, parameters_[Scope::OUTPUT], iter_specs_[Scope::OUTPUT]));
-  iter_specs_[Scope::LHS] = {};
-  iter_specs_[Scope::RHS] = {};
-  return absl::OkStatus();
+absl::StatusOr<TritonFusionAnalysis> TritonFusionAnalysis::Execute(
+    const HloDotInstruction& dot, int split_k) {
+  TritonFusionAnalysis analysis;
+  TF_RETURN_IF_ERROR(analysis.ExecuteForDotFusion(dot, split_k));
+  return analysis;
 }
 
 absl::Status TritonFusionAnalysis::ExecuteForProducerConsumer(
@@ -274,6 +260,31 @@ absl::Status TritonFusionAnalysis::ExecuteForProducerConsumer(
   return Execute(*fused_computation, split_k).status();
 }
 
+bool TritonFusionAnalysis::IsBatchDimMinorForInt4Parameter(
+    const HloInstruction& dot, Scope scope) const {
+  CHECK(scope == Scope::LHS || scope == Scope::RHS);
+  const auto& dims = dot.dot_dimension_numbers();
+  const auto& batch_dims = (scope == Scope::LHS) ? dims.lhs_batch_dimensions()
+                                                 : dims.rhs_batch_dimensions();
+
+  if (batch_dims.empty()) return true;
+
+  int32_t batch_dim = batch_dims.Get(0);
+  CHECK_EQ(batch_dims.size(), 1);
+  const auto& params = parameters_.at(scope);
+  for (const auto& param : params) {
+    if (param->shape().element_type() != S4) continue;
+
+    const auto* strides = IterSpec(scope, param, batch_dim);
+    if (strides == nullptr) continue;
+    // The hacky way to check if the batch dimension is minor.
+    // It also covers the case when the batch dimension is second to last but
+    // the minor dimension is equal to 1.
+    if (strides->front().stride == 1) return false;
+  }
+  return true;
+}
+
 absl::Status TritonFusionAnalysis::ExecuteForDotFusion(
     const HloInstruction& dot, const int split_k) {
   DotRequirements lhs_requirements(kNoSplitRequirement);
@@ -287,7 +298,7 @@ absl::Status TritonFusionAnalysis::ExecuteForDotFusion(
     TF_RETURN_IF_ERROR(context.PropagateDimensionOrdersToParameters(
         *dot.operand(operand_number), parameters_[scope], iter_specs_[scope]));
     if (scope == Scope::LHS) {
-      lhs_requirements = std::get<DotRequirements>(context.requirements());
+      lhs_requirements = context.requirements();
     }
   }
 
@@ -308,8 +319,12 @@ absl::Status TritonFusionAnalysis::ExecuteForDotFusion(
     output = output->users()[0];
     DimOrdersAndReqsOrError result = GetPropagatedDimOrdersAndRequirements(
         *output, context.dim_orders().at(input),
-        TransformDirection::kInputToOutput, context.hero_properties());
-    TF_RET_CHECK(std::holds_alternative<DimOrdersAndReqs>(result));
+        TransformDirection::kInputToOutput, context.dot_properties());
+    if (std::holds_alternative<FusionDecision>(result)) {
+      auto decision = std::get<FusionDecision>(result);
+      return FailedPrecondition("Failed to propagate tiling with error: %s",
+                                decision.Explain());
+    }
     TF_RET_CHECK(
         context.CombineDimOrdersAndReqs(std::get<DimOrdersAndReqs>(result)));
   }

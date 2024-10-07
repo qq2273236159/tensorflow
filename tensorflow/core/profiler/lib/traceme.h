@@ -15,21 +15,12 @@ limitations under the License.
 #ifndef TENSORFLOW_CORE_PROFILER_LIB_TRACEME_H_
 #define TENSORFLOW_CORE_PROFILER_LIB_TRACEME_H_
 
-#include <new>
-#include <string>
-#include <utility>
-
 #include "absl/base/macros.h"
-#include "absl/strings/string_view.h"
-#include "tensorflow/core/platform/logging.h"
-#include "tensorflow/core/platform/macros.h"
-#include "tensorflow/core/platform/platform.h"
-#include "tensorflow/core/platform/types.h"
 #include "tensorflow/core/profiler/lib/traceme_encode.h"  // IWYU pragma: export
 #include "tsl/profiler/lib/traceme.h"
 
 #if !defined(IS_MOBILE_PLATFORM)
-#include "tsl/profiler/utils/time_utils.h"
+#include "xla/tsl/profiler/utils/time_utils.h"
 #endif
 
 // TODO: b/323943471 - This macro should eventually be provided by Abseil.

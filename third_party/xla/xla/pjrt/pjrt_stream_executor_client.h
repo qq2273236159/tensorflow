@@ -33,15 +33,18 @@ limitations under the License.
 #include "absl/container/flat_hash_set.h"
 #include "absl/container/inlined_vector.h"
 #include "absl/functional/any_invocable.h"
+#include "absl/log/check.h"
+#include "absl/status/status.h"
+#include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
 #include "absl/synchronization/mutex.h"
 #include "absl/types/span.h"
-#include "mlir/IR/BuiltinOps.h"  // from @llvm-project
+#include "mlir/IR/BuiltinOps.h"
 #include "xla/client/executable_build_options.h"
 #include "xla/client/local_client.h"
-#include "xla/client/xla_computation.h"
 #include "xla/executable_run_options.h"
+#include "xla/hlo/builder/xla_computation.h"
 #include "xla/hlo/ir/hlo_module.h"
 #include "xla/layout.h"
 #include "xla/literal.h"
@@ -54,6 +57,7 @@ limitations under the License.
 #include "xla/pjrt/pjrt_future.h"
 #include "xla/pjrt/tracked_device_buffer.h"
 #include "xla/pjrt/transpose.h"
+#include "xla/pjrt/utils.h"
 #include "xla/service/computation_placer.h"
 #include "xla/service/executable.h"
 #include "xla/service/gpu/gpu_executable_run_options.h"
@@ -62,12 +66,10 @@ limitations under the License.
 #include "xla/service/shaped_buffer.h"
 #include "xla/shape.h"
 #include "xla/shape_tree.h"
-#include "xla/status.h"
-#include "xla/statusor.h"
 #include "xla/stream_executor/stream.h"
+#include "xla/tsl/framework/allocator.h"
 #include "xla/util.h"
 #include "xla/xla_data.pb.h"
-#include "tsl/framework/allocator.h"
 #include "tsl/platform/casts.h"
 #include "tsl/platform/threadpool.h"
 
@@ -91,8 +93,6 @@ class PjRtStreamExecutorDeviceDescription : public PjRtDeviceDescription {
 
   absl::string_view DebugString() const override { return debug_string_; }
 
-  int core_on_chip() const { return core_index_; }
-
   absl::Span<int const> coords() const { return absl::MakeSpan(coords_); }
 
   const absl::flat_hash_map<std::string, PjRtDeviceAttribute>& Attributes()
@@ -113,13 +113,10 @@ class PjRtStreamExecutorDeviceDescription : public PjRtDeviceDescription {
 
   void SetCoords(std::array<int, 1> coords) { coords_ = coords; }
 
-  void SetCoreOnChip(int core_index) { core_index_ = core_index; }
-
  private:
   const int id_;
   const int process_index_;
   const std::string device_kind_;
-  int core_index_ = -1;
   std::string debug_string_ = "<unknown SE device>";
   std::string to_string_ = "<unknown SE device>";
   absl::flat_hash_map<std::string, PjRtDeviceAttribute> attributes_;
@@ -147,8 +144,11 @@ class PjRtStreamExecutorDevice : public PjRtDevice {
     client_ = client;
     // We have to define debug_string_ and to_string_ here, because
     // platform_name() requires client_ to be set.
+    std::string device_name =
+        absl::StrCat(MakeAsciiTitlecase(platform_name()), "Device");
+
     description().SetDebugString(absl::StrCat(platform_name(), ":", id()));
-    description().SetToString(absl::StrCat(platform_name(), "(id=", id(), ")"));
+    description().SetToString(absl::StrCat(device_name, "(id=", id(), ")"));
   }
 
   PjRtStreamExecutorDeviceDescription& description() { return description_; }
@@ -166,15 +166,11 @@ class PjRtStreamExecutorDevice : public PjRtDevice {
 
   bool IsAddressable() const override { return local_device_id_ != -1; }
 
-  int local_hardware_id() const override {
-    return local_hardware_id_typed().value();
-  }
-
   PjRtLocalDeviceId local_device_id() const override {
     return local_device_id_;
   }
 
-  PjRtLocalHardwareId local_hardware_id_typed() const override {
+  PjRtLocalHardwareId local_hardware_id() const override {
     return local_hardware_id_;
   }
 
@@ -286,8 +282,6 @@ class PjRtStreamExecutorClient : public PjRtClient {
                            global_device_id.value());
   }
 
-  absl::StatusOr<PjRtDevice*> LookupAddressableDevice(
-      int local_hardware_id) const override;
   absl::StatusOr<PjRtDevice*> LookupAddressableDevice(
       PjRtLocalDeviceId local_device_id) const override;
 
@@ -405,9 +399,6 @@ class PjRtStreamExecutorClient : public PjRtClient {
   absl::StatusOr<ChannelHandle> CreateDeviceToHostChannelHandle() override {
     return client()->CreateDeviceToHostChannelHandle();
   }
-  absl::StatusOr<ChannelHandle> CreateHostToDeviceChannelHandle() override {
-    return client()->CreateHostToDeviceChannelHandle();
-  }
 
   // TODO(zhangqiaorjc): Experimental. Will be removed.
   absl::Status Defragment() override {
@@ -416,7 +407,8 @@ class PjRtStreamExecutorClient : public PjRtClient {
 
   LocalDeviceState& device_state(int device_ordinal) const {
     return *tensorflow::down_cast<PjRtStreamExecutorDevice*>(
-                LookupAddressableDevice(device_ordinal).value())
+                LookupAddressableDevice(xla::PjRtLocalDeviceId(device_ordinal))
+                    .value())
                 ->local_device_state();
   }
   LocalClient* client() const { return client_; }
@@ -478,6 +470,20 @@ class PjRtStreamExecutorClient : public PjRtClient {
     std::vector<PjRtDevice*> addressable_devices;
   };
   absl::StatusOr<ExecutableExtras> GetExecutableExtras(CompileOptions* options);
+
+  absl::StatusOr<std::unique_ptr<PjRtLoadedExecutable>> CompileInternal(
+      const XlaComputation& computation,
+      const std::vector<const Shape*>& argument_layout_pointers,
+      LayoutCanonicalizationCallback layout_canonicalization_callback,
+      CompileOptions options);
+
+  absl::StatusOr<std::unique_ptr<PjRtBuffer>> BufferFromHostBufferInternal(
+      const void* data, PrimitiveType type, absl::Span<int64_t const> dims,
+      std::optional<absl::Span<int64_t const>> byte_strides,
+      HostBufferSemantics host_buffer_semantics,
+      absl::AnyInvocable<void() &&> on_done_with_host_buffer,
+      PjRtDevice* device, const Layout* device_layout,
+      PjRtMemorySpace* memory_space);
 
   const PjRtPlatformId platform_id_;
   const std::string platform_name_;
@@ -685,7 +691,8 @@ class PjRtStreamExecutorBuffer : public PjRtBuffer {
     void SetState(State state) { state_ = state; }
 
     // Sets buffer_ and status_. Called by parent_ to initialize the hold.
-    void Acquire(StatusOr<std::shared_ptr<TrackedDeviceBuffer>>&& buffer_or);
+    void Acquire(
+        absl::StatusOr<std::shared_ptr<TrackedDeviceBuffer>>&& buffer_or);
     // Releases the contents of *this, so *this can subsequently be
     // deleted without releasing the parent's hold. Should be passed to the
     // appropriate constructor of another ScopedHold, e.g., when a hold must be
@@ -854,10 +861,13 @@ class PjRtStreamExecutorBuffer : public PjRtBuffer {
   absl::StatusOr<std::pair<std::unique_ptr<PjRtBuffer>,
                            std::shared_ptr<BufferSequencingEvent>>>
   CopyToDeviceHelper(PjRtDevice* dst_device, LocalDeviceState* dst_local_device,
+                     PjRtMemorySpace* dst_memory_space,
                      LocalDeviceState* transfer_local_device,
                      LocalDeviceState* src_local_device,
                      se::Stream* transfer_stream,
                      std::shared_ptr<TrackedDeviceBuffer> src_device_buffer);
+  absl::StatusOr<std::unique_ptr<PjRtBuffer>> CopyToDeviceMemorySpace(
+      PjRtDevice* dst_device, PjRtMemorySpace* dst_memory_space = nullptr);
 
   PjRtStreamExecutorClient* const client_;
   const Shape on_device_shape_;
@@ -888,7 +898,8 @@ AllocateDestinationBuffer(
     const Shape& on_host_shape, PjRtDevice* device,
     LocalDeviceState* local_device, se::Stream* copy_stream,
     bool is_uninitialized_create, PjRtStreamExecutorClient* client,
-    std::shared_ptr<BufferSequencingEvent> definition_event = nullptr);
+    std::shared_ptr<BufferSequencingEvent> definition_event = nullptr,
+    PjRtMemorySpace* memory_space = nullptr);
 
 // Wraps one or more XLA LocalExecutables (one per partition, as specified by
 // the build options).
@@ -998,7 +1009,9 @@ class PjRtStreamExecutorLoadedExecutable : public PjRtLoadedExecutable {
     return compile_options_;
   }
 
-  absl::StatusOr<std::string> FingerprintExecutable() const override;
+  absl::StatusOr<std::string> FingerprintExecutable() const override {
+    return fingerprint_;
+  };
 
  protected:
   bool parameter_is_tupled_arguments() const {
@@ -1035,13 +1048,14 @@ class PjRtStreamExecutorLoadedExecutable : public PjRtLoadedExecutable {
       std::shared_ptr<DeviceAssignment> device_assignment,
       std::vector<std::function<void()>>& compute_callbacks) const;
 
-  virtual std::vector<std::unique_ptr<PjRtBuffer>> MakeOutputBuffers(
-      int device_ordinal, const ExecuteOptions& options,
-      ScopedShapedBuffer result_buffer,
-      std::shared_ptr<BufferSequencingEvent> definition_event,
-      PjRtDevice* device, std::vector<std::function<void()>>& compute_callbacks,
-      std::vector<std::shared_ptr<TrackedDeviceBuffer>>& buffers_to_release)
-      const;
+  virtual absl::StatusOr<std::vector<std::unique_ptr<PjRtBuffer>>>
+  MakeOutputBuffers(int device_ordinal, const ExecuteOptions& options,
+                    ScopedShapedBuffer result_buffer,
+                    std::shared_ptr<BufferSequencingEvent> definition_event,
+                    PjRtDevice* device,
+                    std::vector<std::function<void()>>& compute_callbacks,
+                    std::vector<std::shared_ptr<TrackedDeviceBuffer>>&
+                        buffers_to_release) const;
 
   absl::StatusOr<Result> ExecuteHelper(
       absl::Span<PjRtBuffer* const> argument_handles, int replica,
@@ -1077,6 +1091,7 @@ class PjRtStreamExecutorLoadedExecutable : public PjRtLoadedExecutable {
   // addressable_device_logical_ids_[i] is assigned. shared_ptrs instead of
   // unique_ptrs to play well with the Python bindings (see xla.cc).
   std::vector<PjRtDevice*> addressable_devices_;
+  std::string fingerprint_;
 };
 
 }  // namespace xla

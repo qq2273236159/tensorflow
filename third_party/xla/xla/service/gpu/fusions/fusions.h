@@ -23,6 +23,7 @@ limitations under the License.
 #include "xla/service/buffer_assignment.h"
 #include "xla/service/gpu/fusions/fusion_emitter.h"
 #include "xla/service/gpu/hlo_fusion_analysis.h"
+#include "xla/service/gpu/ir_emission_utils.h"
 
 namespace xla {
 namespace gpu {
@@ -73,8 +74,9 @@ class PreBufferAssignmentFusionInfo : public FusionInfo {
       : FusionInfo(analysis) {}
 
   bool CanEmitDynamicUpdateSliceInPlace() const override {
-    // Optimistically assume all DUS fusions are in-place.
-    return true;
+    auto ret = CanEmitFusedDynamicUpdateSliceInPlaceForGpu(
+        analysis().fusion(), /*get_allocation_slice=*/{});
+    return ret.value_or(false);
   }
 
   std::optional<std::unique_ptr<FusionInterface>> GetCopyFusion()
@@ -89,7 +91,7 @@ class PreBufferAssignmentFusionInfo : public FusionInfo {
 
 // Returns the emitter for the given fusion.
 std::unique_ptr<FusionInterface> GetFusionEmitter(
-    const FusionInfo& fusion_info, bool is_emission_phase = false);
+    const FusionInfo& fusion_info);
 
 }  // namespace gpu
 }  // namespace xla

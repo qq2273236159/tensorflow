@@ -40,7 +40,6 @@ limitations under the License.
 #include "xla/service/gpu/backend_configs.pb.h"
 #include "xla/shape.h"
 #include "xla/shape_util.h"
-#include "xla/status.h"
 #include "xla/status_macros.h"
 #include "xla/stream_executor/blas.h"
 #include "xla/stream_executor/device_memory.h"
@@ -367,8 +366,12 @@ absl::StatusOr<bool> CanFoldTransposeOperandIntoDot(const HloInstruction& dot,
     // for matmuls with FP8 inputs and outputs, C must instead have the same
     // dtype as the vector bias if present, and either BF16 or F16 otherwise. So
     // we set the dtype of C here.
+#if GOOGLE_CUDA
+    // hipBlasLt does not yet support the C matrix to be BF16 for fp8 matmul
+    // with fp8 output. Thus only do this for CUDA side.
     c_matrix_shape.set_element_type(
         bias_shape_ptr != nullptr ? bias_shape_ptr->element_type() : BF16);
+#endif
   }
 
   TF_ASSIGN_OR_RETURN(MatrixLayout c_layout,
@@ -453,7 +456,11 @@ bool IsTf32Allowed(PrecisionConfig::Algorithm algorithm,
     const HloInstruction* gemm) {
   TF_ASSIGN_OR_RETURN(GpuBackendConfig gpu_config,
                       gemm->backend_config<GpuBackendConfig>());
-  const GemmBackendConfig& config = gpu_config.gemm_backend_config();
+  return For(gemm, gpu_config.gemm_backend_config());
+}
+
+/*static*/ absl::StatusOr<GemmConfig> GemmConfig::For(
+    const HloInstruction* gemm, const GemmBackendConfig& config) {
   std::optional<int64_t> algorithm;
   if (config.algorithm_case() != GemmBackendConfig::ALGORITHM_NOT_SET) {
     algorithm = config.selected_algorithm();
@@ -477,8 +484,8 @@ bool IsTf32Allowed(PrecisionConfig::Algorithm algorithm,
   if (has_vector_bias) {
     int vector_bias_index = has_matrix_bias ? 3 : 2;
     if (primitive_util::IsF8Type(lhs_shape.element_type())) {
-      // FP8 gemms have 4 scales as inputs which come before the vector bias.
-      vector_bias_index += 4;
+      // FP8 gemms have 2 scales as inputs which come before the vector bias.
+      vector_bias_index += 2;
     }
     vector_bias_shape = gemm->operand(vector_bias_index)->shape();
   }
@@ -617,15 +624,15 @@ absl::Status DoGemm(const se::gpu::MatrixDescriptor& lhs,
     return absl::InternalError("No Blas support for stream");
   }
 
-  // Set a workspace for all Blas operations launched below.
-  se::blas::BlasSupport::ScopedWorkspace scoped_workspace(blas, &workspace);
-
   if (algorithm) {
     return DoGemmWithAlgorithm<Scale, Input, Output>(
         lhs, rhs, output, workspace, alpha, beta, stream, precision_algorithm,
         *algorithm, compute_precision, numeric_options, profile_result,
         context);
   }
+
+  // Set a workspace for all Blas operations launched below.
+  se::blas::BlasSupport::ScopedWorkspace scoped_workspace(blas, &workspace);
 
   if (output.batch_size != 1) {
     return blas->BlasGemmStridedBatched(

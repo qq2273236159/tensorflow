@@ -29,6 +29,8 @@ limitations under the License.
 #include "absl/container/inlined_vector.h"
 #include "absl/log/check.h"
 #include "absl/log/log.h"
+#include "absl/status/status.h"
+#include "absl/status/statusor.h"
 #include "absl/strings/numbers.h"
 #include "xla/debug_options_flags.h"
 #include "xla/hlo/ir/hlo_casting_utils.h"
@@ -36,18 +38,16 @@ limitations under the License.
 #include "xla/hlo/ir/hlo_instruction.h"
 #include "xla/hlo/ir/hlo_instructions.h"
 #include "xla/hlo/ir/hlo_opcode.h"
+#include "xla/hlo/pass/hlo_pass_pipeline.h"
 #include "xla/literal.h"
 #include "xla/map_util.h"
 #include "xla/service/hlo_cse.h"
 #include "xla/service/hlo_dce.h"
-#include "xla/service/hlo_pass_pipeline.h"
 #include "xla/service/hlo_verifier.h"
 #include "xla/service/tuple_simplifier.h"
 #include "xla/shape.h"
 #include "xla/shape_util.h"
-#include "xla/status.h"
 #include "xla/status_macros.h"
-#include "xla/statusor.h"
 #include "xla/types.h"
 #include "xla/util.h"
 #include "tsl/platform/errors.h"
@@ -1005,6 +1005,7 @@ class MoveOperandIntoBranch {
       CHECK_NE(new_tuple, nullptr);
       VLOG(5) << "Cloned new tuple:" << new_tuple->parent()->ToString() << "\n";
       std::vector<std::vector<HloInstruction*>> gte_users;
+      gte_users.reserve(branch_param->shape().tuple_shapes_size());
       for (int64_t j = 0; j < branch_param->shape().tuple_shapes_size(); ++j) {
         gte_users.push_back(std::vector<HloInstruction*>());
       }

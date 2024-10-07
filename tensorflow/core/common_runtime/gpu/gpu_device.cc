@@ -46,6 +46,9 @@ limitations under the License.
 #include "absl/strings/str_split.h"
 #include "unsupported/Eigen/CXX11/Tensor"  // from @eigen_archive
 #include "xla/stream_executor/gpu/gpu_init.h"
+#include "xla/tsl/framework/allocator.h"
+#include "xla/tsl/framework/device_id.h"
+#include "xla/tsl/framework/device_id_utils.h"
 #include "tensorflow/core/common_runtime/device/device_event_mgr.h"
 #include "tensorflow/core/common_runtime/device_factory.h"
 #include "tensorflow/core/common_runtime/device_id_utils.h"
@@ -68,12 +71,8 @@ limitations under the License.
 #include "tensorflow/core/lib/strings/numbers.h"
 #include "tensorflow/core/lib/strings/str_util.h"
 #include "tensorflow/core/lib/strings/strcat.h"
-#include "tsl/framework/allocator.h"
-#include "tsl/framework/device_id.h"
-#include "tsl/framework/device_id_utils.h"
 #if GOOGLE_CUDA
 #include "third_party/gpus/cudnn/cudnn.h"
-#include "xla/stream_executor/cuda/cuda_activation.h"
 #elif TENSORFLOW_USE_ROCM
 #include "tensorflow/core/platform/rocm.h"
 #endif
@@ -86,7 +85,7 @@ limitations under the License.
 #include "xla/stream_executor/integrations/device_host_allocator.h"
 #endif  // TF_GPU_USE_PJRT
 #include "xla/stream_executor/gpu/gpu_stream.h"
-#include "xla/stream_executor/platform/dso_loader.h"
+#include "xla/stream_executor/gpu/scoped_activate_context.h"
 #include "tensorflow/core/framework/log_memory.h"
 #include "tensorflow/core/platform/fingerprint.h"
 #include "tensorflow/core/platform/logging.h"
@@ -96,6 +95,7 @@ limitations under the License.
 #include "tensorflow/core/profiler/lib/scoped_annotation.h"
 #include "tensorflow/core/profiler/lib/scoped_memory_debug_annotation.h"
 #include "tensorflow/core/public/session_options.h"
+#include "tsl/platform/dso_loader.h"
 #ifdef TF_GPU_USE_PJRT
 #include "tensorflow/core/tfrt/common/pjrt_util.h"
 #endif  // TF_GPU_USE_PJRT
@@ -141,14 +141,14 @@ int GetPriority(const int tf_device_id, const GPUOptions& options) {
 typedef cudaStream_t gpuStream_t;
 typedef cudaDeviceProp gpuDeviceProp_t;
 #define EIGEN_GPU_SCRATCH_SIZE (Eigen::kGpuScratchSize)
-using se::cuda::ScopedActivateExecutorContext;
+using se::gpu::ScopedActivateContext;
 
 #elif TENSORFLOW_USE_ROCM
 
 typedef hipStream_t gpuStream_t;
 typedef hipDeviceProp_t gpuDeviceProp_t;
 #define EIGEN_GPU_SCRATCH_SIZE (Eigen::kGpuScratchSize)
-using se::rocm::ScopedActivateExecutorContext;
+using se::gpu::ScopedActivateContext;
 
 #endif
 
@@ -790,7 +790,7 @@ void BaseGPUDevice::Compute(OpKernel* op_kernel, OpKernelContext* context) {
       kernel_tracker_->PauseWhilePendingExceeds(pending_cap_);
     }
   }
-  ScopedActivateExecutorContext scoped_activation{stream->parent()};
+  ScopedActivateContext scoped_activation{stream->parent()};
   profiler::ScopedMemoryDebugAnnotation op_annotation(
       op_kernel->name_view().data(), context->step_id());
   bool should_log_inputs_and_outputs = ShouldLogInputsAndOutputs(op_kernel);
@@ -884,7 +884,7 @@ void BaseGPUDevice::ComputeAsync(AsyncOpKernel* op_kernel,
     };
   }
 
-  ScopedActivateExecutorContext scoped_activation{stream->parent()};
+  ScopedActivateContext scoped_activation{stream->parent()};
   op_kernel->ComputeAsync(context, std::move(done));
 }
 
@@ -1930,7 +1930,8 @@ Status BaseGPUDeviceFactory::CreateDevices(
               /*allocator=*/std::move(allocator_adapter),
               /*host_memory_allocator=*/std::move(pjrt_gpu_host_allocator),
               /*should_stage_host_to_device_transfers=*/true,
-              /*gpu_run_options=*/std::move(gpu_run_options));
+              /*gpu_run_options=*/std::move(gpu_run_options),
+              /*kv_store=*/nullptr, /*gpu_topology=*/nullptr);
 
       return SetPjRtClientInTFGlobalResourceManager(DeviceType(DEVICE_GPU),
                                                     std::move(pjrt_client));
@@ -2338,7 +2339,7 @@ Status BaseGPUDeviceFactory::GetValidDeviceIds(
 
 #if GOOGLE_CUDA || TENSORFLOW_USE_ROCM
   // Try to dlopen GPU libraries if they are supposed to be dynamically loaded.
-  auto handle_or = se::internal::DsoLoader::MaybeTryDlopenGPULibraries();
+  auto handle_or = tsl::internal::DsoLoader::MaybeTryDlopenGPULibraries();
   if (!handle_or.ok()) {
     LOG(WARNING) << "Cannot dlopen some GPU libraries. Please make sure the "
                     "missing libraries mentioned above are installed properly "

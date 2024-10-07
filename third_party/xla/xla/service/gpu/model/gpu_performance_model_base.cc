@@ -31,6 +31,7 @@ limitations under the License.
 #include "xla/service/gpu/backend_configs.pb.h"
 #include "xla/service/gpu/fusions/fusion_emitter.h"
 #include "xla/service/gpu/fusions/fusions.h"
+#include "xla/service/gpu/fusions/triton.h"
 #include "xla/service/gpu/hlo_fusion_analysis.h"
 #include "xla/service/gpu/hlo_traversal.h"
 #include "xla/service/gpu/launch_dimensions.h"
@@ -38,6 +39,7 @@ limitations under the License.
 #include "xla/shape_util.h"
 #include "xla/stream_executor/device_description.h"
 #include "xla/util.h"
+#include "xla/xla_data.pb.h"
 
 namespace xla {
 namespace gpu {
@@ -87,8 +89,6 @@ float AdjustBandwidth(const se::DeviceDescription& gpu_device_info,
 
 std::optional<EstimateRunTimeData> GpuPerformanceModelCache::Get(
     const HloInstruction& instruction) {
-  absl::MutexLock lock(&mutex_);
-
   auto it = instruction_runtime_data_.find(&instruction);
   if (it != instruction_runtime_data_.end()) {
     return it->second;
@@ -110,10 +110,18 @@ std::optional<absl::Duration> GpuPerformanceModelCache::Get(
   return std::nullopt;
 }
 
+const absl::flat_hash_map<const HloInstruction*, absl::Duration>&
+GpuPerformanceModelCache::GetAllConsumers(const HloInstruction& producer) {
+  return fusion_runtime_data_[&producer];
+}
+
+bool GpuPerformanceModelCache::ContainsConsumers(
+    const HloInstruction& producer) {
+  return fusion_runtime_data_.contains(&producer);
+}
+
 void GpuPerformanceModelCache::Set(const HloInstruction& instruction,
                                    const EstimateRunTimeData& runtime_data) {
-  absl::MutexLock lock(&mutex_);
-
   instruction_runtime_data_[&instruction] = runtime_data;
 }
 
@@ -125,8 +133,6 @@ void GpuPerformanceModelCache::Set(const HloInstruction& producer,
 }
 
 void GpuPerformanceModelCache::Invalidate(const HloInstruction& instruction) {
-  absl::MutexLock lock(&mutex_);
-
   // Remove runtime data for the instruction.
   instruction_runtime_data_.erase(&instruction);
 
@@ -155,6 +161,15 @@ LaunchDimensions GpuPerformanceModelBase::EstimateFusionLaunchDimensions(
   if (const auto* kernel_emitter =
           dynamic_cast<const KernelFusionInterface*>(emitter.get())) {
     return kernel_emitter->launch_dimensions();
+  }
+
+  // TritonFusion does not implement KernelFusionInterface, because it provides
+  // launch dimensions only for SoftMax fusions.
+  if (const auto* triton_emitter =
+          dynamic_cast<const TritonFusion*>(emitter.get())) {
+    if (auto launch_config = triton_emitter->launch_config()) {
+      return launch_config->launch_dimensions;
+    }
   }
 
   // This estimate should never be reached in fusion code. Fusions that don't
@@ -394,12 +409,16 @@ absl::Duration GpuPerformanceModelBase::WriteTime(
 /*static*/
 absl::Duration GpuPerformanceModelBase::ComputeTime(
     const se::DeviceDescription& gpu_device_info, int64_t flops,
-    int64_t num_threads) {
-  int64_t fpu_count =
-      gpu_device_info.core_count() * gpu_device_info.fpus_per_core();
-  int64_t n_threads_active = std::min(num_threads, fpu_count);
+    int64_t num_blocks, int64_t num_threads_per_block) {
+  int64_t n_active_fpus_per_core =
+      std::min<int64_t>(num_threads_per_block, gpu_device_info.fpus_per_core());
+
+  int64_t n_active_core =
+      std::min<int64_t>(num_blocks, gpu_device_info.core_count());
+  int64_t fpu_count = n_active_core * n_active_fpus_per_core;
+
   int64_t flop_per_ns_per_fpu = gpu_device_info.clock_rate_ghz() * /*fma:*/ 2;
-  int64_t flop_per_ns_effective = flop_per_ns_per_fpu * n_threads_active;
+  int64_t flop_per_ns_effective = flop_per_ns_per_fpu * fpu_count;
   return absl::Nanoseconds(1.0f * flops / flop_per_ns_effective);
 }
 

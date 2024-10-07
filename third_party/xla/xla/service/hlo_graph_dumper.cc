@@ -23,6 +23,7 @@ limitations under the License.
 #include "absl/hash/hash.h"
 #include "absl/log/check.h"
 #include "absl/log/log.h"
+#include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/string_view.h"
 #include "absl/synchronization/mutex.h"
@@ -30,8 +31,6 @@ limitations under the License.
 #include "xla/hlo/ir/hlo_instruction.h"
 #include "xla/hlo/ir/hlo_sharding.h"
 #include "xla/shape.h"
-#include "xla/status.h"
-#include "xla/statusor.h"
 #include "tsl/platform/errors.h"
 #include "tsl/platform/file_system.h"
 #include "tsl/platform/statusor.h"
@@ -74,12 +73,12 @@ limitations under the License.
 #include "xla/service/pattern_matcher.h"
 #include "xla/shape_util.h"
 #include "xla/stream_executor/dnn.h"
+#include "xla/tsl/lib/gtl/map_util.h"
+#include "xla/tsl/lib/io/zlib_compression_options.h"
+#include "xla/tsl/lib/io/zlib_outputbuffer.h"
 #include "xla/types.h"
 #include "xla/util.h"
 #include "xla/window_util.h"
-#include "tsl/lib/gtl/map_util.h"
-#include "tsl/lib/io/zlib_compression_options.h"
-#include "tsl/lib/io/zlib_outputbuffer.h"
 #include "tsl/platform/base64.h"
 #include "tsl/platform/env.h"
 #include "tsl/platform/numbers.h"
@@ -1308,8 +1307,8 @@ std::string HloDotDumper::GetInstructionNodeLabel(const HloInstruction* instr) {
                  ? ""
                  : StrCat(":", xla::ToString(instr->fusion_kind())));
   // If the name does not contain the opcode, render both.
-  return StrFormat("<b>%s</b><br/>%s", HtmlLikeStringSanitize(extended_opcode),
-                   HtmlLikeStringSanitize(instr->name()));
+  return StrFormat("<b>%s</b><br/>%s", HtmlLikeStringSanitize(instr->name()),
+                   HtmlLikeStringSanitize(extended_opcode));
 }
 
 std::string HloDotDumper::GetInstructionNodeMetadata(

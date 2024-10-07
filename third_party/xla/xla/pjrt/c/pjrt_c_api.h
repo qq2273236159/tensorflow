@@ -53,7 +53,7 @@ typedef enum {
 typedef struct PJRT_Extension_Base {
   size_t struct_size;
   PJRT_Extension_Type type;
-  PJRT_Extension_Base* next;
+  struct PJRT_Extension_Base* next;
 } PJRT_Extension_Base;
 PJRT_DEFINE_STRUCT_TRAITS(PJRT_Extension_Base, next);
 
@@ -79,7 +79,7 @@ PJRT_DEFINE_STRUCT_TRAITS(PJRT_Extension_Base, next);
 // Changes include:
 // * Adding a new field to the PJRT_Api or argument structs
 // * Renaming a method or argument (doesn't affect ABI)
-#define PJRT_API_MINOR 53
+#define PJRT_API_MINOR 55
 
 // The plugin should set the major_version and minor_version of
 // PJRT_Api.pjrt_api_version to be the `PJRT_API_MAJOR` and `PJRT_API_MINOR` in
@@ -644,6 +644,10 @@ typedef enum {
   // 2-bit integer types
   PJRT_Buffer_Type_S2,
   PJRT_Buffer_Type_U2,
+
+  // More truncated 8 bit floating-point formats.
+  PJRT_Buffer_Type_F8E4M3,
+  PJRT_Buffer_Type_F8E3M4,
 } PJRT_Buffer_Type;
 
 typedef enum {
@@ -1685,6 +1689,8 @@ struct PJRT_Buffer_GetMemoryLayout_Args {
 };
 PJRT_DEFINE_STRUCT_TRAITS(PJRT_Buffer_GetMemoryLayout_Args, layout);
 
+// DEPRECATED. Please use layout extension instead.
+// https://github.com/openxla/xla/blob/main/xla/pjrt/c/pjrt_c_api_layouts_extension.h
 // Returns the memory layout of the data in this buffer.
 typedef PJRT_Error* PJRT_Buffer_GetMemoryLayout(
     PJRT_Buffer_GetMemoryLayout_Args* args);
@@ -2116,7 +2122,7 @@ typedef PJRT_Error* PJRT_Compile(PJRT_Compile_Args* args);
 #define _PJRT_API_STRUCT_FIELD(fn_type) fn_type* fn_type
 
 // Please modify PJRT_Api_STRUCT_SIZE if the last field of PJRT_Api is changed.
-typedef struct {
+typedef struct PJRT_Api {
   size_t struct_size;
   PJRT_Extension_Base* extension_start;
 

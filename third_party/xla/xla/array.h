@@ -29,9 +29,10 @@ limitations under the License.
 #include <type_traits>
 
 #include "absl/functional/function_ref.h"
+#include "absl/log/check.h"
+#include "absl/status/status.h"
 #include "absl/strings/str_cat.h"
 #include "absl/types/span.h"
-#include "xla/status.h"
 #include "xla/types.h"
 
 namespace xla {
@@ -602,12 +603,12 @@ class Array {
       std::fill(data.get(), data.get() + size, init);
     }
 
-    OwnedBuffer(OwnedBuffer&& other)
+    OwnedBuffer(OwnedBuffer&& other) noexcept
         : data(std::move(other.data)), size(other.size) {
       other.size = 0;
     }
 
-    OwnedBuffer& operator=(OwnedBuffer&& other) {
+    OwnedBuffer& operator=(OwnedBuffer&& other) noexcept {
       data = std::move(other.data);
       size = other.size;
       other.size = 0;

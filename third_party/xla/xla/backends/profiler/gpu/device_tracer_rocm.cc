@@ -26,6 +26,11 @@ limitations under the License.
 #include "absl/strings/str_join.h"
 #include "xla/backends/profiler/gpu/rocm_collector.h"
 #include "xla/backends/profiler/gpu/rocm_tracer.h"
+#include "xla/tsl/profiler/backends/cpu/annotation_stack.h"
+#include "xla/tsl/profiler/utils/parse_annotation.h"
+#include "xla/tsl/profiler/utils/xplane_builder.h"
+#include "xla/tsl/profiler/utils/xplane_schema.h"
+#include "xla/tsl/profiler/utils/xplane_utils.h"
 #include "xla/tsl/util/env_var.h"
 #include "tsl/platform/abi.h"
 #include "tsl/platform/env_time.h"
@@ -33,13 +38,8 @@ limitations under the License.
 #include "tsl/platform/macros.h"
 #include "tsl/platform/mutex.h"
 #include "tsl/platform/thread_annotations.h"
-#include "tsl/profiler/backends/cpu/annotation_stack.h"
 #include "tsl/profiler/lib/profiler_factory.h"
 #include "tsl/profiler/lib/profiler_interface.h"
-#include "tsl/profiler/utils/parse_annotation.h"
-#include "tsl/profiler/utils/xplane_builder.h"
-#include "tsl/profiler/utils/xplane_schema.h"
-#include "tsl/profiler/utils/xplane_utils.h"
 
 namespace xla {
 namespace profiler {
@@ -112,6 +112,7 @@ RocmTracerOptions GpuTracer::GetRocmTracerOptions() {
       HIP_API_ID_hipModuleLaunchKernel,
       HIP_API_ID_hipHccModuleLaunchKernel,
       HIP_API_ID_hipLaunchKernel,
+      HIP_API_ID_hipExtLaunchKernel,
       // MEMCPY
       HIP_API_ID_hipMemcpy,
       HIP_API_ID_hipMemcpyAsync,
@@ -162,13 +163,16 @@ RocmTracerOptions GpuTracer::GetRocmTracerOptions() {
     HIP_API_ID_hipHostMalloc,
     HIP_API_ID_hipSetDevice  //  added to track default device
   };
+
   // clang-format on
 
   hip_api_domain_ops.insert(hip_api_domain_ops.end(), hip_api_aux_ops.begin(),
                             hip_api_aux_ops.end());
 
-  options.api_callbacks.emplace(ACTIVITY_DOMAIN_HIP_API, hip_api_domain_ops);
-  options.activity_tracing.emplace(ACTIVITY_DOMAIN_HCC_OPS, empty_vec);
+  // options.api_callbacks.emplace(ACTIVITY_DOMAIN_HIP_API, hip_api_domain_ops);
+  options.api_callbacks.emplace(ACTIVITY_DOMAIN_HIP_API, empty_vec);
+
+  options.activity_tracing.emplace(ACTIVITY_DOMAIN_HIP_OPS, empty_vec);
 
   return options;
 }
@@ -196,10 +200,6 @@ absl::Status GpuTracer::DoStart() {
   uint64_t start_walltime_ns = tsl::EnvTime::NowNanos();
   rocm_trace_collector_ = CreateRocmCollector(
       trace_collector_options, start_walltime_ns, start_gputime_ns);
-  // rocm_trace_collector_ =
-  // std::make_unique<RocmTraceCollectorImpl>(trace_collector_options,
-  // start_walltime_ns,
-  //                                                  start_gputime_ns);
 
   RocmTracerOptions tracer_options = GetRocmTracerOptions();
   rocm_tracer_->Enable(tracer_options, rocm_trace_collector_.get());

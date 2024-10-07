@@ -27,7 +27,6 @@ limitations under the License.
 #include "xla/service/gpu/runtime/nccl_api.h"
 #include "xla/service/gpu/runtime/nccl_collective_thunk.h"
 #include "xla/service/gpu/runtime/thunk.h"
-#include "xla/status.h"
 #include "xla/stream_executor/device_memory.h"
 #include "xla/stream_executor/stream.h"
 #include "xla/xla_data.pb.h"
@@ -38,7 +37,8 @@ namespace xla::gpu {
 
 NcclCollectiveBroadcastStartThunk::NcclCollectiveBroadcastStartThunk(
     ThunkInfo thunk_info, NcclApi* nccl_api,
-    const HloCollectiveBroadcastInstruction* instr, std::vector<Buffer> buffers)
+    const HloCollectiveBroadcastInstruction* instr, std::vector<Buffer> buffers,
+    bool p2p_memcpy_enabled)
     : NcclCollectiveThunk(Thunk::kNcclCollectiveBroadcastStart, thunk_info,
                           nccl_api, IsSyncCollective(instr)),
       config_(GetNcclCollectiveConfig(instr, std::nullopt)),

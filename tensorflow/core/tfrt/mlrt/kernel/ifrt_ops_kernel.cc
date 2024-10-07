@@ -13,6 +13,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
+#include <cstdint>
 #include <memory>
 #include <optional>
 #include <string>
@@ -24,35 +25,31 @@ limitations under the License.
 #include "absl/status/status.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
-#include "absl/types/span.h"
-#include "tensorflow/compiler/mlir/tfrt/transforms/ifrt/ifrt_types.h"
 #include "xla/python/ifrt/future.h"
 #include "xla/xla_data.pb.h"
 #include "tensorflow/core/framework/attr_value.pb.h"
 #include "tensorflow/core/framework/device_base.h"
-#include "tensorflow/core/framework/node_def_util.h"
 #include "tensorflow/core/framework/op_kernel.h"
 #include "tensorflow/core/framework/resource_handle.h"
+#include "tensorflow/core/framework/resource_var.h"
 #include "tensorflow/core/framework/tensor.h"
 #include "tensorflow/core/framework/tensor_shape.h"
 #include "tensorflow/core/framework/types.pb.h"
 #include "tensorflow/core/platform/protobuf.h"  // IWYU pragma: keep
-#include "tensorflow/core/tfrt/fallback/op_kernel_runner.h"
+#include "tensorflow/core/tfrt/ifrt/checkpoint_loader.h"
 #include "tensorflow/core/tfrt/ifrt/ifrt_config.pb.h"
 #include "tensorflow/core/tfrt/ifrt/ifrt_loaded_variable_utils.h"
 #include "tensorflow/core/tfrt/ifrt/ifrt_model_context.h"
+#include "tensorflow/core/tfrt/ifrt/ifrt_model_restore_context.h"
 #include "tensorflow/core/tfrt/ifrt/ifrt_restore_tensor_registry.h"
 #include "tensorflow/core/tfrt/mlrt/bytecode/bytecode.h"
 #include "tensorflow/core/tfrt/mlrt/interpreter/context.h"
 #include "tensorflow/core/tfrt/mlrt/interpreter/future.h"
 #include "tensorflow/core/tfrt/mlrt/kernel/context.h"
 #include "tensorflow/core/tfrt/mlrt/kernel/kernel.h"
-#include "tensorflow/core/tfrt/mlrt/kernel/kernel_runner_utils.h"
 #include "tensorflow/core/tfrt/utils/fallback_tensor.h"
 #include "tsl/platform/errors.h"
-#include "tsl/platform/statusor.h"
 #include "tsl/platform/tstring.h"
-#include "tfrt/host_context/concurrent_work_queue.h"  // from @tf_runtime
 
 using tensorflow::ifrt_serving::IfrtModelContext;
 
@@ -83,6 +80,10 @@ struct MlrtIfrtRestoreVariableKernel : mlrt::KernelFrame {
     return attributes().GetAs<mlrt::bc::Vector<tensorflow::DataType>>(0);
   }
 
+  mlrt::bc::Vector<bool> truncate_in_cast() const {
+    return attributes().GetAs<mlrt::bc::Vector<bool>>(1);
+  }
+
   std::vector<tensorflow::tfrt_stub::FallbackTensor> var_handles() const {
     DCHECK_GT(arguments().size(), 3);
     std::vector<tensorflow::tfrt_stub::FallbackTensor> result;
@@ -98,7 +99,13 @@ struct MlrtIfrtRestoreVariableKernel : mlrt::KernelFrame {
   void Invoke();
 
  private:
+  // TODO(b/335247101): Consider exposing this as an option for tuning or
+  // dynamically decide it based on the size of the variables.
+  static constexpr int kNumRestoreClusters = 4;
+
   absl::Status InvokeHelper();
+
+  absl::Status ValidateInput();
 };
 
 void MlrtIfrtRestoreVariableKernel::Invoke() {
@@ -109,122 +116,74 @@ void MlrtIfrtRestoreVariableKernel::Invoke() {
   }
 }
 
-absl::Status MlrtIfrtRestoreVariableKernel::InvokeHelper() {
-  std::optional<IfrtModelContext*> ifrt_model_context =
-      context().resource_context().GetResource<IfrtModelContext>(
-          "IfrtModelContext");
-  if (!ifrt_model_context.has_value()) {
-    return absl::FailedPreconditionError(
-        "RestoreVariableOp: failed to fetch IfrtModelContext");
+absl::Status MlrtIfrtRestoreVariableKernel::ValidateInput() {
+  if (prefix().tensor().NumElements() != 1) {
+    return absl::InvalidArgumentError(
+        "The prefix tensor must be a scalar tensor.");
   }
-  const int num_outputs = var_handles().size();
-  DCHECK_EQ(num_outputs, tensor_names().tensor().NumElements());
-  auto& fallback_request_state = context().fallback_request_state();
-  tensorflow::AttrValue dtypes_attr_value;
-  for (const auto& dtype : restored_dtypes()) {
-    dtypes_attr_value.mutable_list()->mutable_type()->Add(dtype);
-  }
-  // Use `tf.RestoreV2` to restore tensor. This will also populate
-  // tensorflow::ResourceManager.
-  // TODO(b/319045348): avoid populating tensorflow::ResourceManager if the
-  // variable is only used by device/IFRT.
-  // TODO(b/319045348): consider directly calling restore function such as that
-  // in /tensorflow/core/kernels/save_restore_v2_ops.cc
-  auto runner = tfrt_stub::OpKernelRunner::Create(
-                    /*op_name=*/
-                    "RestoreV2", /*node_name=*/"RestoreV2",
-                    context().params().device->name(),
-                    /*num_args=*/3,
-                    [&](tensorflow::AttrValueMap* attr_value_map) {
-                      attr_value_map->insert({"dtypes", dtypes_attr_value});
-                      return absl::OkStatus();
-                    },
-                    fallback_request_state.device_manager(),
-                    fallback_request_state.process_function_library_runtime())
-                    .value();
-
-  // Prepare the input tensors.
-  std::vector<tensorflow::TensorValue> input_tf_tensor_values;
-  input_tf_tensor_values.resize(arguments().size());
-  for (int i = 0; i < arguments().size(); ++i) {
-    auto& fallback_tensor =
-        arguments()[i].Get<tensorflow::tfrt_stub::FallbackTensor>();
-    input_tf_tensor_values[i].tensor = &fallback_tensor.tensor();
+  if (!TensorShapeUtils::IsVector(tensor_names().tensor().shape()) ||
+      !TensorShapeUtils::IsVector(shape_and_slices().tensor().shape())) {
+    return absl::InvalidArgumentError(
+        absl::StrCat("Input tensor_names and shape_and_slices "
+                     "should be an 1-D tensors, got ",
+                     tensor_names().tensor().shape().DebugString(), " and ",
+                     shape_and_slices().tensor().shape().DebugString()));
   }
 
-  auto& params = context().params();
-  SetUpParams(runner, input_tf_tensor_values, params);
-  // Use persistent device instead of the per request device.
-  params.device = context().fallback_request_state().device_manager().HostCPU();
-
-  struct AsyncState {
-    explicit AsyncState(
-        const std::vector<tensorflow::TensorValue>& input_tf_tensor_values,
-        const OpKernelContext::Params& params, int num_outputs)
-        : run_state(input_tf_tensor_values, params),
-          context(&run_state.params, num_outputs) {}
-
-    tfrt_stub::OpKernelRunState run_state;
-    OpKernelContext context;
-    std::vector<xla::ifrt::Promise<tensorflow::Tensor>> results;
-  };
-  auto async_state =
-      std::make_unique<AsyncState>(input_tf_tensor_values, params, num_outputs);
-
-  async_state->results.reserve(num_outputs);
-
-  ifrt_serving::IfrtRestoreTensorRegistry& ifrt_restore_tensor_registry =
-      (*ifrt_model_context)->GetRestoreTensorRegistry();
-  for (int i = 0; i < num_outputs; ++i) {
-    auto promise = xla::ifrt::Future<tensorflow::Tensor>::CreatePromise();
-    auto future = xla::ifrt::Future<tensorflow::Tensor>(promise);
-    const ResourceHandle& var_handle =
-        var_handles()[i].tensor().scalar<ResourceHandle>()();
-
-    TF_ASSIGN_OR_RETURN(ifrt_serving::DtypeAndShape dtype_and_shape,
-                        ifrt_serving::GetDtypeAndShape(var_handle));
-
-    std::string runtime_name =
-        ifrt_serving::GetRuntimeNameFromVarHandle(var_handle);
-    ifrt_serving::IfrtRestoreTensorRegistry::RestoredTensorInfo
-        restored_tensor_info = {false, std::move(dtype_and_shape),
-                                std::move(future)};
-    if (auto status = ifrt_restore_tensor_registry.TryRegister(
-            runtime_name, restored_tensor_info);
-        !status.ok()) {
-      // Propagate errors so that if already-registered futures are being waited
-      // on, they can be unblocked.
-      for (auto& result : async_state->results) {
-        std::move(result).Set(status);
-      };
-      return status;
-    }
-    async_state->results.push_back(std::move(promise));
+  if (tensor_names().tensor().NumElements() !=
+      shape_and_slices().tensor().NumElements()) {
+    return absl::InvalidArgumentError(
+        "The tensor_names and shape_and_slices tensors must have the same "
+        "number of elements.");
   }
 
-  // Use dedicated work queue for restore operation.
-  DCHECK((*ifrt_model_context)->checkpoint_loader_queue() != nullptr);
-  (*ifrt_model_context)
-      ->checkpoint_loader_queue()
-      ->AddTask(
-          [runner = std::move(runner), async_state = std::move(async_state)]() {
-            auto* op_kernel_context_ptr = &async_state->context;
-            runner.Run(op_kernel_context_ptr);
+  if (tensor_names().tensor().NumElements() != var_handles().size()) {
+    return absl::InvalidArgumentError(
+        "The tensor_names and var_handles must have the same number of "
+        "elements.");
+  }
+  if (tensor_names().tensor().NumElements() != restored_dtypes().size()) {
+    return absl::InvalidArgumentError(
+        "The tensor_names and restored_dtypes must have the same number of "
+        "elements.");
+  }
 
-            auto& op_kernel_context = async_state->context;
-            if (!op_kernel_context.status().ok()) {
-              for (auto& result : async_state->results) {
-                std::move(result).Set(op_kernel_context.status());
-              }
-              return;
-            }
-            for (int i = 0; i < op_kernel_context.num_outputs(); ++i) {
-              DCHECK(op_kernel_context.mutable_output(i));
-              std::move(async_state->results[i])
-                  .Set(std::move(*op_kernel_context.mutable_output(i)));
-            }
-          });
+  if (tensor_names().tensor().NumElements() != truncate_in_cast().size()) {
+    return absl::InvalidArgumentError(
+        "The tensor_names and truncate_in_cast must have the same number of "
+        "elements.");
+  }
+
   return absl::OkStatus();
+}
+
+absl::Status MlrtIfrtRestoreVariableKernel::InvokeHelper() {
+  std::optional<ifrt_serving::IfrtModelRestoreContext*> model_restore_context =
+      context()
+          .resource_context()
+          .GetResource<ifrt_serving::IfrtModelRestoreContext>(
+              ifrt_serving::kIfrtModelRestoreContextName);
+  if (!model_restore_context.has_value()) {
+    return absl::InternalError(
+        "Did not find IfrtModelRestoreContext resource.");
+  }
+  if (*model_restore_context == nullptr) {
+    return absl::InternalError("IfrtModelRestoreContext must not be null.");
+  }
+  ifrt_serving::CheckpointLoader* checkpoint_loader =
+      (*model_restore_context)->checkpoint_loader();
+  if (!checkpoint_loader) {
+    return absl::InternalError("CheckpointLoader must not be null.");
+  }
+  TF_RETURN_IF_ERROR(ValidateInput());
+
+  std::vector<tensorflow::DataType> restored_dtypes_vec(
+      restored_dtypes().begin(), restored_dtypes().end());
+  std::vector<bool> truncate_in_cast_vec(truncate_in_cast().begin(),
+                                         truncate_in_cast().end());
+  return checkpoint_loader->Load(prefix(), var_handles(), tensor_names(),
+                                 shape_and_slices(), restored_dtypes_vec,
+                                 truncate_in_cast_vec, context());
 }
 
 class MlrtIfrtLoadVariableKernel : public mlrt::KernelFrame {
@@ -277,27 +236,49 @@ absl::Status MlrtIfrtLoadVariableKernel::InvokeHelper() {
   ifrt_serving::IfrtRestoreTensorRegistry& ifrt_restore_tensor_registry =
       (*ifrt_model_context)->GetRestoreTensorRegistry();
 
-  std::string runtime_name = ifrt_serving::GetRuntimeNameFromVarHandle(
-      variable_handler_tensor().scalar<ResourceHandle>()());
+  auto& resource_handle = variable_handler_tensor().scalar<ResourceHandle>()();
+  std::string runtime_name =
+      ifrt_serving::GetRuntimeNameFromVarHandle(resource_handle);
 
   if (used_by_host()) {
-    TF_RETURN_IF_ERROR(
-        ifrt_restore_tensor_registry.SetUsedByHost(runtime_name));
+    if (ifrt_restore_tensor_registry.SetUsedByHost(runtime_name).ok()) {
+      xla::ifrt::Future<tensorflow::Tensor> restored_tensor_future =
+          ifrt_restore_tensor_registry.GetRestoredTensor(runtime_name);
 
-    xla::ifrt::Future<tensorflow::Tensor> restored_tensor_future =
-        ifrt_restore_tensor_registry.GetRestoredTensor(runtime_name);
-
-    restored_tensor_future.OnReady(
-        [tensor_promise = std::move(tensor_promise)](
-            absl::StatusOr<tensorflow::Tensor> restored_tensor) mutable {
-          if (!restored_tensor.ok()) {
-            std::move(tensor_promise).SetError(restored_tensor.status());
-            return;
-          }
-          std::move(tensor_promise)
-              .Set<tensorflow::tfrt_stub::FallbackTensor>(
-                  tensorflow::tfrt_stub::FallbackTensor(*restored_tensor));
-        });
+      restored_tensor_future.OnReady(
+          [tensor_promise = std::move(tensor_promise)](
+              absl::StatusOr<tensorflow::Tensor> restored_tensor) mutable {
+            if (!restored_tensor.ok()) {
+              std::move(tensor_promise).SetError(restored_tensor.status());
+              return;
+            }
+            std::move(tensor_promise)
+                .Set<tensorflow::tfrt_stub::FallbackTensor>(
+                    tensorflow::tfrt_stub::FallbackTensor(*restored_tensor));
+          });
+    } else {
+      // If not at IfrtRestoreTensorRegistry, try ResourceManager
+      auto resource_manager = context()
+                                  .fallback_request_state()
+                                  .device_manager()
+                                  .HostCPU()
+                                  ->resource_manager();
+      DCHECK(resource_manager);
+      Var* variable;
+      TF_RETURN_IF_ERROR(resource_manager->Lookup(
+          resource_handle.container(), resource_handle.name(), &variable));
+      if (tensorflow::Tensor* t = variable->tensor(); t != nullptr) {
+        std::move(tensor_promise)
+            .Set<tensorflow::tfrt_stub::FallbackTensor>(
+                tensorflow::tfrt_stub::FallbackTensor(*t));
+      } else {
+        std::move(tensor_promise)
+            .SetError(absl::InternalError(
+                absl::StrCat("Variable ", resource_handle.name(),
+                             " is not found in either "
+                             "IfrtRestoreTensorRegistry or ResourceManager")));
+      }
+    }
   } else {
     // If not used by host, set the future to be ready immediately with an empty
     // tensor so that it does not block the graph execution.

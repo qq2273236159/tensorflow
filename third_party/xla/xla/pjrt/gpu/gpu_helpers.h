@@ -22,12 +22,12 @@ limitations under the License.
 #include <set>
 #include <string>
 
+#include "absl/status/statusor.h"
 #include "absl/types/span.h"
 #include "xla/client/local_client.h"
-#include "xla/statusor.h"
 #include "xla/stream_executor/stream_executor.h"
+#include "xla/tsl/framework/bfc_allocator.h"
 #include "xla/types.h"
-#include "tsl/framework/bfc_allocator.h"
 
 namespace xla {
 
@@ -50,7 +50,7 @@ struct GpuAllocatorConfig {
   Kind kind = Kind::kDefault;
 
   // Only used if kind == kBFC. The maximum fraction of available memory to
-  // allocate. This is the default value of XLA_PYTHON_CLIENT_MEM_FRACTION.
+  // allocate. This is the default value of XLA_CLIENT_MEM_FRACTION.
   //
   // If `gpu_system_memory_size` is set, it determines memory allocation.
   // `memory_fraction` won't be used in this case.

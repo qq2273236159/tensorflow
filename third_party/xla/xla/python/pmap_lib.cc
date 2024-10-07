@@ -39,15 +39,16 @@ limitations under the License.
 #include "absl/strings/str_join.h"
 #include "absl/synchronization/notification.h"
 #include "absl/types/span.h"
-#include "third_party/nanobind/include/nanobind/nanobind.h"
-#include "third_party/nanobind/include/nanobind/stl/shared_ptr.h"  // IWYU pragma: keep
-#include "third_party/nanobind/include/nanobind/stl/string.h"  // IWYU pragma: keep
-#include "third_party/nanobind/include/nanobind/stl/variant.h"  // IWYU pragma: keep
-#include "third_party/nanobind/include/nanobind/stl/vector.h"  // IWYU pragma: keep
+#include "nanobind/nanobind.h"
+#include "nanobind/stl/shared_ptr.h"  // IWYU pragma: keep
+#include "nanobind/stl/string.h"  // IWYU pragma: keep
+#include "nanobind/stl/variant.h"  // IWYU pragma: keep
+#include "nanobind/stl/vector.h"  // IWYU pragma: keep
 #include "xla/pjrt/exceptions.h"
 #include "xla/pjrt/status_casters.h"
 #include "xla/python/ifrt/array.h"
 #include "xla/python/ifrt/device.h"
+#include "xla/python/ifrt/device_list.h"
 #include "xla/python/ifrt/memory.h"
 #include "xla/python/ifrt/shape.h"
 #include "xla/python/ifrt/sharding.h"
@@ -150,20 +151,21 @@ absl::StatusOr<ShardArgResult> ShardArg(
         if (result.ifrt_array == nullptr) {
           return xla::InvalidArgument("Array has been deleted.");
         }
-        if (result.ifrt_array->sharding().devices().devices() != devices) {
-          xla::ifrt::DeviceList::Devices ifrt_devices;
+        if (result.ifrt_array->sharding().devices()->devices() != devices) {
+          xla::ifrt::BasicDeviceList::Devices ifrt_devices;
           ifrt_devices.reserve(devices.size());
           ifrt_devices.insert(ifrt_devices.end(), devices.begin(),
                               devices.end());
           // pmap does not support memory_kind for now.
-          auto sharding = xla::ifrt::OpaqueSharding::Create(
-              xla::ifrt::DeviceList(std::move(ifrt_devices)),
-              xla::ifrt::MemoryKind());
-          TF_ASSIGN_OR_RETURN(auto copied_ifrt_array,
-                              result.ifrt_array->Reshard(
-                                  std::move(sharding),
-                                  xla::ifrt::ArrayCopySemantics::kReuseInput));
-          result.ifrt_array = std::move(copied_ifrt_array);
+          auto* ifrt_client = result.ifrt_array->client();
+          TF_ASSIGN_OR_RETURN(
+              auto copied_ifrt_arrays,
+              ifrt_client->CopyArrays(
+                  absl::MakeSpan(&result.ifrt_array, 1),
+                  xla::ifrt::BasicDeviceList::Create(std::move(ifrt_devices)),
+                  xla::ifrt::MemoryKind(),
+                  xla::ifrt::ArrayCopySemantics::kReuseInput));
+          result.ifrt_array = std::move(copied_ifrt_arrays.front());
         }
         return result;
       }
@@ -184,7 +186,7 @@ absl::StatusOr<ShardArgResult> ShardArg(
 
     std::vector<tsl::RCReference<xla::ifrt::Array>> per_device_arrays;
     per_device_arrays.reserve(n_devices);
-    xla::ifrt::DeviceList::Devices devices;
+    xla::ifrt::BasicDeviceList::Devices devices;
     devices.reserve(n_devices);
     // TODO(hyeontaek): The created array will never be disassembled. We should
     // omit collecting shapes and make the OpaqueSharding non-disassemblable?
@@ -223,7 +225,8 @@ absl::StatusOr<ShardArgResult> ShardArg(
     }
     for (auto& device_put : device_puts) {
       per_device_arrays.push_back(std::move(device_put.ifrt_array));
-      devices.push_back(per_device_arrays.back()->sharding().devices().front());
+      devices.push_back(
+          per_device_arrays.back()->sharding().devices()->devices().front());
       shapes.push_back(per_device_arrays.back()->shape());
       if (device_put.owning_pybuffer) {
         owning_pylist.append(device_put.owning_pybuffer);
@@ -236,7 +239,8 @@ absl::StatusOr<ShardArgResult> ShardArg(
     xla::ifrt::Shape shape = per_device_arrays.front()->shape();
     // pmap does not support memory_kind for now.
     auto ifrt_sharding = xla::ifrt::ConcreteSharding::Create(
-        xla::ifrt::DeviceList(std::move(devices)), xla::ifrt::MemoryKind(),
+        xla::ifrt::BasicDeviceList::Create(std::move(devices)),
+        xla::ifrt::MemoryKind(),
         /*shape=*/shape,
         /*shard_shapes=*/std::move(shapes));
     TF_ASSIGN_OR_RETURN(result.ifrt_array,
@@ -794,10 +798,8 @@ void JaxPmapFunction_tp_dealloc(PyObject* self) {
 
 int JaxPmapFunction_tp_traverse(PyObject* self, visitproc visit, void* arg) {
   JaxPmapFunctionObject* o = reinterpret_cast<JaxPmapFunctionObject*>(self);
-#if PY_VERSION_HEX >= 0x03090000
   // https://docs.python.org/3/c-api/typeobj.html#c.PyTypeObject.tp_traverse
   Py_VISIT(Py_TYPE(self));
-#endif
   Py_VISIT(o->dict);
   Py_VISIT(o->fun.fun().ptr());
   Py_VISIT(o->fun.cache_miss().ptr());

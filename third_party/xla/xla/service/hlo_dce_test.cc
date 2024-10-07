@@ -19,6 +19,7 @@ limitations under the License.
 #include <memory>
 
 #include <gmock/gmock.h>
+#include <gtest/gtest.h>
 #include "absl/types/span.h"
 #include "xla/hlo/ir/hlo_casting_utils.h"
 #include "xla/hlo/ir/hlo_computation.h"
@@ -35,9 +36,9 @@ limitations under the License.
 #include "xla/tests/hlo_test_base.h"
 #include "xla/tests/literal_test_util.h"
 #include "xla/tests/test_utils.h"
+#include "xla/tsl/lib/core/status_test_util.h"
 #include "xla/types.h"
 #include "xla/xla_data.pb.h"
-#include "tsl/lib/core/status_test_util.h"
 
 namespace xla {
 namespace {
@@ -193,8 +194,7 @@ TEST_F(HloDceTest, ShardingCustomCallInstruction) {
       HloInstruction::CreateCustomCall(p0->shape(),
                                        /*operands=*/{add},
                                        /*custom_call_target=*/"Sharding"));
-  dangling_sharding->set_sharding(
-      HloSharding::Tile(TileAssignment((absl::Span<const int64_t>){2, 1})));
+  dangling_sharding->set_sharding(HloSharding::Tile(TileAssignment({2, 1})));
   builder.AddInstruction(HloInstruction::CreateBinary(
       p0->shape(), HloOpcode::kMultiply, add, add));
   auto module = CreateNewVerifiedModule();
@@ -219,8 +219,7 @@ TEST_F(HloDceTest, ShardingCustomCallInstructionWithDeadOperand) {
       HloInstruction::CreateCustomCall(p0->shape(),
                                        /*operands=*/{add},
                                        /*custom_call_target=*/"Sharding"));
-  dangling_sharding->set_sharding(
-      HloSharding::Tile(TileAssignment((absl::Span<const int64_t>){2, 1})));
+  dangling_sharding->set_sharding(HloSharding::Tile(TileAssignment({2, 1})));
   builder.AddInstruction(
       HloInstruction::CreateBinary(p0->shape(), HloOpcode::kMultiply, p0, p0));
   auto module = CreateNewVerifiedModule();
@@ -652,6 +651,114 @@ TEST_F(HloDceTest, MultiOutputFusionRemoveUnusedTupleElementsRemoveTuple) {
   EXPECT_EQ(module->MakeComputationPostOrder().size(), 2);
 }
 
+TEST_F(
+    HloDceTest,
+    MultiOutputFusionRemoveUnusedTupleElementsRemoveTupleMultiUsersPerOutput) {
+  constexpr char kHloString[] = R"(
+  HloModule test_module
+  fused_add {
+    p0 = f32[32,32]{1,0} parameter(0)
+    p1 = f32[32,32]{1,0} parameter(1)
+    p2 = f32[32,32]{1,0} parameter(2) // becomes dead
+    add = f32[32,32]{1,0} add(p0, p1)
+    ROOT res = (f32[32,32]{1,0}, f32[32,32]{1,0}, f32[32,32]{1,0}) tuple(p2, add, p2)
+  }
+
+  ENTRY reduce {
+    param0 = f32[32,32]{1,0} parameter(0)
+    param1 = f32[32,32]{1,0} parameter(1)
+    param2 = f32[32,32]{1,0} parameter(2)
+    fusion = (f32[32,32]{1,0}, f32[32,32]{1,0}, f32[32,32]{1,0}) fusion(param0, param1, param2), kind=kLoop, calls=fused_add
+    gte.1 = f32[32,32]{1,0} get-tuple-element(fusion), index=1
+    gte.1.again = f32[32,32]{1,0} get-tuple-element(fusion), index=1
+    ROOT res = (f32[32,32]{1,0}, f32[32,32]{1,0}) tuple(gte.1, gte.1.again)
+  })";
+  TF_ASSERT_OK_AND_ASSIGN(auto module,
+                          ParseAndReturnVerifiedModule(kHloString));
+  HloDCE dce;
+  auto changed = dce.Run(module.get());
+  ASSERT_TRUE(changed.ok());
+  EXPECT_TRUE(*changed);
+
+  HloInstruction* gte_0 = FindInstruction(module.get(), "gte.0");
+  EXPECT_EQ(gte_0, nullptr);
+  HloInstruction* gte_1 = FindInstruction(module.get(), "gte.1");
+  EXPECT_EQ(gte_1, nullptr);
+  HloInstruction* gte_1_again = FindInstruction(module.get(), "gte.1.again");
+  EXPECT_EQ(gte_1_again, nullptr);
+
+  HloInstruction* fusion = FindInstruction(module.get(), "fusion");
+  ASSERT_NE(fusion, nullptr);
+  EXPECT_FALSE(fusion->shape().IsTuple());
+
+  HloInstruction* root = module->entry_computation()->root_instruction();
+  EXPECT_EQ(root->opcode(), HloOpcode::kTuple);
+  EXPECT_EQ(root->operand_count(), 2);
+  EXPECT_EQ(root->operand(0), fusion);
+  EXPECT_EQ(root->operand(1), fusion);
+}
+
+TEST_F(
+    HloDceTest,
+    MultiOutputFusionRemoveUnusedTupleElementsRemoveTupleNonContiguousRemoval) {
+  constexpr char kHloString[] = R"(
+  HloModule test_module
+  fused_add {
+    p0 = f32[32,32]{1,0} parameter(0)
+    p1 = f32[32,32]{1,0} parameter(1)
+    p2 = f32[32,32]{1,0} parameter(2) // becomes dead
+    add = f32[32,32]{1,0} add(p0, p1)
+    ROOT res = (f32[32,32]{1,0}, f32[32,32]{1,0}, f32[32,32]{1,0}, f32[32,32]{1,0}) tuple(p2, add, p2, p2)
+  }
+
+  ENTRY reduce {
+    param0 = f32[32,32]{1,0} parameter(0)
+    param1 = f32[32,32]{1,0} parameter(1)
+    param2 = f32[32,32]{1,0} parameter(2)
+    fusion = (f32[32,32]{1,0}, f32[32,32]{1,0}, f32[32,32]{1,0}, f32[32,32]{1,0}) fusion(param0, param1, param2), kind=kLoop, calls=fused_add
+    gte.0 = f32[32,32]{1,0} get-tuple-element(fusion), index=0  // dead
+    gte.1 = f32[32,32]{1,0} get-tuple-element(fusion), index=1
+    gte.1.again = f32[32,32]{1,0} get-tuple-element(fusion), index=1
+    gte.3 = f32[32,32]{1,0} get-tuple-element(fusion), index=3
+    ROOT res = (f32[32,32]{1,0}, f32[32,32]{1,0}, f32[32,32]{1,0}) tuple(gte.1, gte.1.again, gte.3)
+  })";
+  TF_ASSERT_OK_AND_ASSIGN(auto module,
+                          ParseAndReturnVerifiedModule(kHloString));
+  HloDCE dce;
+  auto changed = dce.Run(module.get());
+  ASSERT_TRUE(changed.ok());
+  EXPECT_TRUE(*changed);
+
+  // We expect that the dead parameter and the dead tuple entry are removed.
+  HloInstruction* gte_0 = FindInstruction(module.get(), "gte.0");
+  EXPECT_EQ(gte_0, nullptr);
+  HloInstruction* gte_1 = FindInstruction(module.get(), "gte.1");
+  EXPECT_NE(gte_1, nullptr);
+  EXPECT_EQ(static_cast<HloGetTupleElementInstruction*>(gte_1)->tuple_index(),
+            0);
+  HloInstruction* gte_1_again = FindInstruction(module.get(), "gte.1.again");
+  EXPECT_EQ(
+      static_cast<HloGetTupleElementInstruction*>(gte_1_again)->tuple_index(),
+      0);
+  EXPECT_NE(gte_1_again, nullptr);
+  HloInstruction* gte_3 = FindInstruction(module.get(), "gte.3");
+  EXPECT_NE(gte_3, nullptr);
+  EXPECT_EQ(static_cast<HloGetTupleElementInstruction*>(gte_3)->tuple_index(),
+            1);
+
+  HloInstruction* fusion = FindInstruction(module.get(), "fusion");
+  ASSERT_NE(fusion, nullptr);
+  EXPECT_TRUE(fusion->shape().IsTuple());
+  EXPECT_EQ(fusion->shape().tuple_shapes_size(), 2);
+
+  HloInstruction* root = module->entry_computation()->root_instruction();
+  EXPECT_EQ(root->opcode(), HloOpcode::kTuple);
+  EXPECT_EQ(root->operand_count(), 3);
+  EXPECT_EQ(root->operand(0), gte_1);
+  EXPECT_EQ(root->operand(1), gte_1_again);
+  EXPECT_EQ(root->operand(2), gte_3);
+}
+
 TEST_F(HloDceTest, MultiOutputFusionRemoveUnusedTupleElementAdjustTuple) {
   constexpr char kHloString[] = R"(
   HloModule test_module
@@ -692,6 +799,38 @@ TEST_F(HloDceTest, MultiOutputFusionRemoveUnusedTupleElementAdjustTuple) {
           m::Tuple(m::Negate(), m::Add()).WithShapeEqualTo(&expected_shape)));
   EXPECT_EQ(module->MakeComputationPostOrder().size(), 2);
 }
+TEST_F(HloDceTest,
+       MultiOutputFusionRemoveUnusedTupleElementWithControlAdjustTupleAndDep) {
+  constexpr char kHloString[] = R"(
+  HloModule test_module
+  fused_add {
+    p0 = f32[32,32]{1,0} parameter(0)
+    p1 = f32[32,32]{1,0} parameter(1)
+    add = f32[32,32]{1,0} add(p0, p1)
+    ROOT res = (f32[32,32]{1,0}, f32[32,32]{1,0}) tuple(p0, add)
+  }
 
+  ENTRY reduce {
+    param0 = f32[32,32]{1,0} parameter(0)
+    param1 = f32[32,32]{1,0} parameter(1)
+    fusion = (f32[32,32]{1,0}, f32[32,32]{1,0}) fusion(param0, param1), kind=kLoop, calls=fused_add
+    gte.1 = f32[32,32]{1,0} get-tuple-element(fusion), index=1
+    add.2 = f32[32,32]{1,0} add(param0, param1), control-predecessors={gte.1}
+    ROOT add = f32[32,32]{1,0} add(add.2, gte.1)
+  })";
+  TF_ASSERT_OK_AND_ASSIGN(auto module,
+                          ParseAndReturnVerifiedModule(kHloString));
+  HloDCE dce;
+  auto changed = dce.Run(module.get());
+  ASSERT_TRUE(changed.ok());
+  EXPECT_TRUE(*changed);
+  HloInstruction* fusion;
+  HloInstruction* add2;
+  EXPECT_THAT(module->entry_computation()->root_instruction(),
+              GmockMatch(m::Add(m::Add(&add2, m::Parameter(), m::Parameter()),
+                                m::Fusion(&fusion))));
+  EXPECT_EQ(add2->control_predecessors().size(), 1);
+  EXPECT_EQ(add2->control_predecessors()[0], fusion);
+}
 }  // namespace
 }  // namespace xla

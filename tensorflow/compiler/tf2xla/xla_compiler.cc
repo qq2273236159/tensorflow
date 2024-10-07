@@ -53,8 +53,8 @@ limitations under the License.
 #include "tensorflow/compiler/tf2xla/xla_context.h"
 #include "tensorflow/compiler/tf2xla/xla_helpers.h"
 #include "xla/client/client_library.h"
-#include "xla/client/xla_builder.h"
-#include "xla/client/xla_computation.h"
+#include "xla/hlo/builder/xla_builder.h"
+#include "xla/hlo/builder/xla_computation.h"
 #include "xla/protobuf_util.h"
 #include "xla/service/hlo.pb.h"
 #include "xla/shape_util.h"
@@ -729,7 +729,7 @@ std::vector<std::string> GetValidControlRets(
   // the map with nodes in FunctionDef control_ret_nodes and later query it
   // using the nodes in `graph`. The Node pointers would be different but the
   // Node name is expected to remain the same between the two.
-  absl::flat_hash_map<const string, int> control_ret_nodes_map;
+  absl::flat_hash_map<string, int> control_ret_nodes_map;
   for (int i = 0; i < orig_control_ret_nodes.size(); ++i) {
     const Node* n = orig_control_ret_nodes[i];
     control_ret_nodes_map[n->name()] = i;
@@ -910,7 +910,7 @@ Status XlaCompiler::XLAShapeForArgument(
     case XlaCompiler::Argument::kParameter: {
       if (is_entry_computation) {
         TensorShape shape;
-        if (absl::holds_alternative<TensorShape>(arg.shape)) {
+        if (std::holds_alternative<TensorShape>(arg.shape)) {
           shape = std::get<TensorShape>(arg.shape);
         } else {
           TF_RETURN_IF_ERROR(
@@ -928,16 +928,17 @@ Status XlaCompiler::XLAShapeForArgument(
             arg_sharding, /*use_fast_memory=*/false,
             options_.shape_determination_fns, xla_shape));
         // If the arg is dynamic then we update the shape to reflect that. The
-        // arg's value_dynamism is a Tensor of bools set to the dynamism of each
-        // dimension.
-        if (arg.value_dynamism.has_value()) {
-          auto dynamism = arg.value_dynamism.value().vec<bool>();
-          for (int i = 0; i < dynamism.size(); ++i) {
-            xla_shape->set_dynamic_dimension(i, dynamism(i));
+        // layout etc above lose it by forcing a swap to TensorShape.
+        if (std::holds_alternative<xla::Shape>(arg.shape) &&
+            std::get<xla::Shape>(arg.shape).is_dynamic()) {
+          xla::Shape dynamic_shape = std::get<xla::Shape>(arg.shape);
+          for (int i = 0; i < xla_shape->dimensions_size(); ++i) {
+            xla_shape->set_dynamic_dimension(
+                i, dynamic_shape.is_dynamic_dimension(i));
           }
         }
       } else {
-        if (absl::holds_alternative<xla::Shape>(arg.shape)) {
+        if (std::holds_alternative<xla::Shape>(arg.shape)) {
           *xla_shape = std::get<xla::Shape>(arg.shape);
         } else {
           TF_RETURN_IF_ERROR(TensorShapeToXLAShape(
@@ -1392,6 +1393,7 @@ void ConvertConstantsToExpressions(xla::XlaBuilder* builder,
 // TODO(b/265059672): Remove when end-to-end stack trace handling is in place
 class DummyStackTrace : public AbstractStackTrace {
   absl::Span<StackFrame const> ToFrames() const override { return frames_; }
+  std::vector<StackFrame> ToUncachedFrames() const override { return frames_; }
 
   StackFrame LastUserFrame() const override { return frames_.back(); }
 

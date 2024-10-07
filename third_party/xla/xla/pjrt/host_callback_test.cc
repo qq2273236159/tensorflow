@@ -23,7 +23,7 @@ limitations under the License.
 #include "absl/status/status.h"
 #include "xla/pjrt/pjrt_client.h"
 #include "xla/tests/literal_test_util.h"
-#include "tsl/lib/core/status_test_util.h"
+#include "xla/tsl/lib/core/status_test_util.h"
 
 namespace xla {
 namespace {
@@ -63,7 +63,7 @@ class TestStream : public CopyToDeviceStream {
     CHECK(!done_.HasBeenNotified());
     chunk_ = std::move(chunk);
     done_.Notify();
-    return PjRtFuture<>(OkStatus());
+    return PjRtFuture<>(absl::OkStatus());
   }
 
  private:

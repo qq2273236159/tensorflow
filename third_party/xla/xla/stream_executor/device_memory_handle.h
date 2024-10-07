@@ -16,10 +16,9 @@ limitations under the License.
 #ifndef XLA_STREAM_EXECUTOR_DEVICE_MEMORY_HANDLE_H_
 #define XLA_STREAM_EXECUTOR_DEVICE_MEMORY_HANDLE_H_
 
-#include <utility>
 
 #include "xla/stream_executor/device_memory.h"
-#include "xla/stream_executor/stream_executor_interface.h"
+#include "xla/stream_executor/stream_executor.h"
 
 namespace stream_executor {
 
@@ -30,8 +29,7 @@ class DeviceMemoryHandle {
 
   // A helper constructor to generate a scoped device memory given an already
   // allocated memory and a stream executor.
-  DeviceMemoryHandle(StreamExecutorInterface *executor,
-                     DeviceMemoryBase memory);
+  DeviceMemoryHandle(StreamExecutor *executor, DeviceMemoryBase memory);
   ~DeviceMemoryHandle();
 
   // Moves ownership of the memory from other to the constructed
@@ -50,7 +48,7 @@ class DeviceMemoryHandle {
   void Free();
 
   DeviceMemoryBase memory_;            // Value we wrap with scoped-release.
-  StreamExecutorInterface *executor_;  // Null if this object is inactive.
+  StreamExecutor *executor_;           // Null if this object is inactive.
 };
 }  // namespace stream_executor
 

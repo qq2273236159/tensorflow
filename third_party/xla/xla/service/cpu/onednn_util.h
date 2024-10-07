@@ -20,12 +20,13 @@ limitations under the License.
 
 #define EIGEN_USE_THREADS
 
+#include "unsupported/Eigen/CXX11/Tensor"
 #include "dnnl.hpp"
 #include "xla/hlo/ir/hlo_instruction.h"
+#include "xla/service/cpu/backend_config.pb.h"
 #include "xla/tsl/util/onednn_threadpool.h"
 #include "xla/xla_data.pb.h"
 #include "tsl/platform/cpu_info.h"
-#include "unsupported/Eigen/CXX11/Tensor"
 
 namespace xla {
 namespace cpu {
@@ -41,10 +42,10 @@ inline bool IsSupportedType(xla::PrimitiveType dtype) {
              TestCPUFeature(CPUFeature::AVX_NE_CONVERT) ||
              TestCPUFeature(CPUFeature::AMX_BF16);
     case F16:
-      return TestCPUFeature(CPUFeature::AVX512BW) &&
-             (TestCPUFeature(CPUFeature::AVX512_FP16) ||
-              TestCPUFeature(CPUFeature::AMX_FP16) ||
-              TestCPUFeature(CPUFeature::AVX_NE_CONVERT));
+      return (TestCPUFeature(CPUFeature::AVX512BW) &&
+              (TestCPUFeature(CPUFeature::AVX512_FP16) ||
+               TestCPUFeature(CPUFeature::AMX_FP16))) ||
+             TestCPUFeature(CPUFeature::AVX_NE_CONVERT);
     default:
       return false;
   }
@@ -58,10 +59,19 @@ dnnl::stream MakeOneDnnStream(
     const dnnl::engine& cpu_engine,
     dnnl::threadpool_interop::threadpool_iface* thread_pool);
 
-// This template function must have explicit specialization at the definition
+typedef BackendConfig::BackendConfigOneofCase BackendConfigOneofCase;
+
+// These template functions must have explicit specialization at the definition
 // site.
 template <typename PrimDesc>
 std::unique_ptr<PrimDesc> CreateOneDnnPrimDesc(HloInstruction*);
+
+template <BackendConfigOneofCase config>
+struct PrimitiveTrait;
+
+template <BackendConfigOneofCase config>
+typename PrimitiveTrait<config>::pointer_type GetKernelConfig(
+    absl::StatusOr<BackendConfig>*);
 
 }  // namespace cpu
 }  // namespace xla

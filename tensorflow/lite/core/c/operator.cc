@@ -24,17 +24,19 @@ limitations under the License.
 #include "tensorflow/lite/core/c/c_api_types.h"
 
 TfLiteOperator* TfLiteOperatorCreate(TfLiteBuiltinOperator builtin_code,
-                                     const char* custom_name, int version) {
-  return new TfLiteOperator{.custom_name = custom_name,
-                            .version = version,
-                            .init = nullptr,
-                            .free = nullptr,
-                            .prepare = nullptr,
-                            .invoke = nullptr,
-                            .async_kernel = nullptr,
-                            .builtin_code = builtin_code,
-                            .node_index = -1,
-                            .inplace_operator = kTfLiteInplaceOpNone};
+                                     const char* custom_name, int version,
+                                     void* user_data) {
+  return new TfLiteOperator{/*custom_name=*/custom_name,
+                            /*version=*/version,
+                            /*init=*/nullptr,
+                            /*free=*/nullptr,
+                            /*prepare=*/nullptr,
+                            /*invoke=*/nullptr,
+                            /*async_kernel=*/nullptr,
+                            /*builtin_code=*/builtin_code,
+                            /*node_index=*/-1,
+                            /*inplace_operator=*/kTfLiteInplaceOpNone,
+                            /*user_data=*/user_data};
 }
 
 void TfLiteOperatorDelete(TfLiteOperator* reg) { delete reg; }
@@ -45,10 +47,25 @@ void TfLiteOperatorSetInit(TfLiteOperator* registration,
   registration->init = init;
 }
 
+TfLiteStatus TfLiteOperatorSetInitWithData(
+    TfLiteOperator* registration,
+    void* (*init)(void* user_data, TfLiteOpaqueContext* context,
+                  const char* buffer, size_t length)) {
+  registration->init_with_data = init;
+  return kTfLiteOk;
+}
+
 void TfLiteOperatorSetFree(TfLiteOperator* registration,
                            void (*free)(TfLiteOpaqueContext* context,
                                         void* data)) {
   registration->free = free;
+}
+
+TfLiteStatus TfLiteOperatorSetFreeWithData(
+    TfLiteOperator* registration,
+    void (*free)(void* user_data, TfLiteOpaqueContext* context, void* data)) {
+  registration->free_with_data = free;
+  return kTfLiteOk;
 }
 
 void TfLiteOperatorSetPrepare(
@@ -58,6 +75,14 @@ void TfLiteOperatorSetPrepare(
   registration->prepare = prepare;
 }
 
+TfLiteStatus TfLiteOperatorSetPrepareWithData(
+    TfLiteOperator* registration,
+    TfLiteStatus (*prepare)(void* user_data, TfLiteOpaqueContext* context,
+                            TfLiteOpaqueNode* node)) {
+  registration->prepare_with_data = prepare;
+  return kTfLiteOk;
+}
+
 void TfLiteOperatorSetInvoke(
     TfLiteOperator* registration,
     TfLiteStatus (*invoke)(TfLiteOpaqueContext* context,
@@ -65,11 +90,28 @@ void TfLiteOperatorSetInvoke(
   registration->invoke = invoke;
 }
 
+TfLiteStatus TfLiteOperatorSetInvokeWithData(
+    TfLiteOperator* registration,
+    TfLiteStatus (*invoke)(void* user_data, TfLiteOpaqueContext* context,
+                           TfLiteOpaqueNode* node)) {
+  registration->invoke_with_data = invoke;
+  return kTfLiteOk;
+}
+
 void TfLiteOperatorSetAsyncKernel(
     TfLiteOperator* registration,
     TfLiteAsyncKernel* (*async_kernel)(TfLiteOpaqueContext* context,
                                        TfLiteOpaqueNode* node)) {
   registration->async_kernel = async_kernel;
+}
+
+TfLiteStatus TfLiteOperatorSetAsyncKernelWithData(
+    TfLiteOperator* registration,
+    TfLiteAsyncKernel* (*async_kernel)(void* user_data,
+                                       TfLiteOpaqueContext* context,
+                                       TfLiteOpaqueNode* node)) {
+  registration->async_kernel_with_data = async_kernel;
+  return kTfLiteOk;
 }
 
 void TfLiteOperatorSetInplaceOperator(TfLiteOperator* registration,
@@ -91,4 +133,11 @@ int TfLiteOperatorGetVersion(const TfLiteOperator* registration) {
     return -1;
   }
   return registration->version;
+}
+
+void* TfLiteOperatorGetUserData(const TfLiteOperator* registration) {
+  if (!registration) {
+    return nullptr;
+  }
+  return registration->user_data;
 }

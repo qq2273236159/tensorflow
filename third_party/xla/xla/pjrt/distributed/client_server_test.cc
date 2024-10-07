@@ -13,6 +13,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <optional>
@@ -20,15 +21,23 @@ limitations under the License.
 #include <string_view>
 #include <vector>
 
+#include "absl/log/log.h"
 #include "absl/status/status.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
 #include "absl/synchronization/barrier.h"
+#include "absl/synchronization/mutex.h"
 #include "absl/synchronization/notification.h"
 #include "absl/time/clock.h"
 #include "absl/time/time.h"
-#include "grpcpp/grpcpp.h"
+#include "absl/types/span.h"
+#include "grpcpp/channel.h"
+#include "grpcpp/create_channel.h"
+#include "grpcpp/security/credentials.h"
+#include "grpcpp/security/server_credentials.h"
 #include "grpcpp/server.h"
+#include "grpcpp/server_builder.h"
+#include "grpcpp/support/channel_arguments.h"
 #include "xla/pjrt/distributed/client.h"
 #include "xla/pjrt/distributed/protocol.pb.h"
 #include "xla/pjrt/distributed/service.h"
@@ -36,10 +45,12 @@ limitations under the License.
 #include "xla/protobuf_util.h"
 #include "xla/status_macros.h"
 #include "xla/tsl/distributed_runtime/coordination/coordination_service_agent.h"
-#include "tsl/lib/core/status_test_util.h"
+#include "xla/tsl/lib/core/status_test_util.h"
 #include "tsl/platform/env.h"
 #include "tsl/platform/errors.h"
+#include "tsl/platform/statusor.h"
 #include "tsl/platform/test.h"
+#include "tsl/platform/threadpool.h"
 
 namespace xla {
 namespace {
@@ -226,7 +237,8 @@ TEST_F(ClientServerTest, ConnectAndEnumerateDevices) {
         ExchangeTopologies("cuda", /*node_id=*/0, /*num_nodes=*/2,
                            /*get_local_topology_timeout=*/absl::Minutes(1),
                            /*get_global_topology_timeout=*/absl::Minutes(1),
-                           kv_store.get(), locals[0], &topology));
+                           kv_store.get(), locals[0], &topology,
+                           /*assign_global_device_ids=*/true));
     TF_RET_CHECK(
         xla::protobuf_util::ProtobufEquals(topology, expected_topology))
         << topology.DebugString();
@@ -248,11 +260,11 @@ TEST_F(ClientServerTest, ConnectAndEnumerateDevices) {
     // within the call that would cause a deadlock.
     n.Notify();
     auto kv_store = GetDistributedKeyValueStore(client, /*key_prefix=*/"");
-    TF_RETURN_IF_ERROR(
-        ExchangeTopologies("cuda", /*node_id=*/1, /*num_nodes=*/2,
-                           /*get_local_topology_timeout=*/absl::Minutes(1),
-                           /*get_global_topology_timeout=*/absl::Minutes(1),
-                           kv_store.get(), locals[1], &topology));
+    TF_RETURN_IF_ERROR(ExchangeTopologies(
+        "cuda", /*node_id=*/1, /*num_nodes=*/2,
+        /*get_local_topology_timeout=*/absl::Minutes(1),
+        /*get_global_topology_timeout=*/absl::Minutes(1), kv_store.get(),
+        locals[1], &topology, /*assign_global_device_ids=*/true));
     TF_RET_CHECK(
         xla::protobuf_util::ProtobufEquals(topology, expected_topology))
         << topology.DebugString();
@@ -307,11 +319,11 @@ TEST_F(ClientServerTest, EnumerateElevenDevices) {
     GlobalTopologyProto topology;
     TF_RETURN_IF_ERROR(client->Connect());
     auto kv_store = GetDistributedKeyValueStore(client, /*key_prefix=*/"");
-    TF_RETURN_IF_ERROR(
-        ExchangeTopologies("cuda", /*node_id=*/node_id, num_nodes,
-                           /*get_local_topology_timeout=*/absl::Minutes(1),
-                           /*get_global_topology_timeout=*/absl::Minutes(1),
-                           kv_store.get(), locals[node_id], &topology));
+    TF_RETURN_IF_ERROR(ExchangeTopologies(
+        "cuda", /*node_id=*/node_id, num_nodes,
+        /*get_local_topology_timeout=*/absl::Minutes(1),
+        /*get_global_topology_timeout=*/absl::Minutes(1), kv_store.get(),
+        locals[node_id], &topology, /*assign_global_device_ids=*/true));
     TF_RET_CHECK(
         xla::protobuf_util::ProtobufEquals(topology, expected_topology))
         << topology.DebugString();
@@ -367,13 +379,15 @@ TEST_F(ClientServerTest, ZeroInitTimeoutShouldStillWaitForOtherTasks) {
   }
 }
 
-TEST_F(ClientServerTest, ClientsTerminateShutdownIfAnyClientGoesAway) {
+TEST_F(ClientServerTest,
+       ClientsTerminateShutdownIfAnyClientGoesAway_WithoutErrorPolling) {
   int num_nodes = 3;
   StartService(num_nodes);
 
   auto thread_fn = [&](int node_id) -> absl::Status {
     DistributedRuntimeClient::Options client_options;
     client_options.shutdown_on_destruction = node_id != 0;
+    client_options.poll_for_error_from_service_at_startup = false;
     client_options.missed_heartbeat_callback =
         [&](absl::Status status, bool coordinator_initiated) {};
     auto client = GetClient(node_id, client_options);
@@ -407,12 +421,81 @@ TEST_F(ClientServerTest, ClientsTerminateShutdownIfAnyClientGoesAway) {
     // 1. Internal: node turns into ERROR state during the shutdown call.
     // 2. Failed Precondition: node is already in ERROR state before the
     // shutdown call (note: agent will still stop sending heartbeats).
-    EXPECT_TRUE(tsl::errors::IsInternal(statuses[i]) ||
-                tsl::errors::IsFailedPrecondition(statuses[i]));
+    EXPECT_TRUE(absl::IsInternal(statuses[i]) ||
+                absl::IsFailedPrecondition(statuses[i]));
   }
 }
 
-TEST_F(ClientServerTest, ClientsReceiveMissedHeartbeatIfAnyClientGoesAway) {
+TEST_F(ClientServerTest, ClientsTerminateShutdownIfAnyClientGoesAway) {
+  int num_nodes = 3;
+  StartService(num_nodes);
+
+  auto thread_fn = [&](int node_id) -> absl::Status {
+    DistributedRuntimeClient::Options client_options;
+    client_options.shutdown_on_destruction = node_id != 0;
+    client_options.missed_heartbeat_callback =
+        [&](absl::Status status, bool coordinator_initiated) {};
+    auto client = GetClient(node_id, client_options);
+
+    TF_RETURN_IF_ERROR(client->Connect());
+
+    if (node_id == 0) {
+      return absl::OkStatus();
+    }
+
+    // The call to Shutdown() should be interrupted if a worker stops issuing
+    // heartbeats.
+    return client->Shutdown();
+  };
+
+  std::vector<absl::Status> statuses(num_nodes);
+  {
+    tsl::thread::ThreadPool thread_pool(tsl::Env::Default(), "test_threads",
+                                        num_nodes);
+    for (int i = 0; i < num_nodes; ++i) {
+      thread_pool.Schedule([&, i]() { statuses[i] = thread_fn(i); });
+    }
+  }
+  TF_EXPECT_OK(statuses[0]);
+  for (int i = 1; i < num_nodes; ++i) {
+    // The error type depends on whether the node turns into ERROR state during
+    // or before the shutdown call.
+    EXPECT_TRUE(absl::IsInternal(statuses[i]) ||
+                absl::IsFailedPrecondition(statuses[i]));
+  }
+}
+
+TEST_F(ClientServerTest, ClientsShutdownSuccessfully) {
+  int num_nodes = 3;
+  StartService(num_nodes);
+
+  auto thread_fn = [&](int node_id) -> absl::Status {
+    DistributedRuntimeClient::Options client_options;
+    client_options.shutdown_on_destruction = true;
+    client_options.missed_heartbeat_callback =
+        [&](absl::Status status, bool coordinator_initiated) {};
+    auto client = GetClient(node_id, client_options);
+
+    TF_RETURN_IF_ERROR(client->Connect());
+    return client->Shutdown();
+    // The error polling request will be cancelled automatically when the
+    // client is shutting down.
+  };
+
+  std::vector<absl::Status> statuses(num_nodes);
+  {
+    tsl::thread::ThreadPool thread_pool(tsl::Env::Default(), "test_threads",
+                                        num_nodes);
+    for (int i = 0; i < num_nodes; ++i) {
+      thread_pool.Schedule([&, i]() { statuses[i] = thread_fn(i); });
+    }
+  }
+  for (int i = 0; i < num_nodes; ++i) {
+    TF_EXPECT_OK(statuses[i]);
+  }
+}
+
+TEST_F(ClientServerTest, MissedHeartbeatCallbackIsExecutedIfAnyClientGoesAway) {
   int num_nodes = 3;
   StartService(num_nodes);
 
@@ -424,6 +507,44 @@ TEST_F(ClientServerTest, ClientsReceiveMissedHeartbeatIfAnyClientGoesAway) {
                                                    bool coordinator_initiated) {
       shutdown.Notify();
     };
+    auto client = GetClient(node_id, client_options);
+
+    TF_RETURN_IF_ERROR(client->Connect());
+
+    if (node_id == 0) {
+      return absl::OkStatus();
+    }
+    shutdown.WaitForNotification();
+    return absl::OkStatus();
+  };
+
+  std::vector<absl::Status> statuses(num_nodes);
+  {
+    tsl::thread::ThreadPool thread_pool(tsl::Env::Default(), "test_threads",
+                                        num_nodes);
+    for (int i = 0; i < num_nodes; ++i) {
+      thread_pool.Schedule([&, i]() { statuses[i] = thread_fn(i); });
+    }
+  }
+  for (int i = 0; i < num_nodes; ++i) {
+    TF_EXPECT_OK(statuses[i]);
+  }
+}
+
+TEST_F(ClientServerTest,
+       ClientsReceiveMissedHeartbeatIfAnyClientGoesAway_WithoutErrorPolling) {
+  int num_nodes = 3;
+  StartService(num_nodes);
+
+  auto thread_fn = [&](int node_id) -> absl::Status {
+    DistributedRuntimeClient::Options client_options;
+    client_options.shutdown_on_destruction = (node_id != 0);
+    absl::Notification shutdown;
+    client_options.missed_heartbeat_callback = [&](absl::Status status,
+                                                   bool coordinator_initiated) {
+      shutdown.Notify();
+    };
+    client_options.poll_for_error_from_service_at_startup = false;
     auto client = GetClient(node_id, client_options);
 
     TF_RETURN_IF_ERROR(client->Connect());
@@ -810,6 +931,32 @@ TEST_F(ClientServerTest, KeyValueDirGet) {
   EXPECT_THAT(kvs, UnorderedElementsAre(Pair("test_dir/sub_dir/1", "1"),
                                         Pair("test_dir/sub_dir/2", "2"),
                                         Pair("test_dir/3", "3")));
+}
+
+TEST_F(ClientServerTest, KeyValueSet_Duplicate_Fails) {
+  StartService(/*num_nodes=*/1);
+  auto client = GetClient(/*node_id=*/0);
+  TF_ASSERT_OK(client->Connect());
+  TF_ASSERT_OK(client->KeyValueSet("test_key", "original_value"));
+  EXPECT_TRUE(
+      absl::IsAlreadyExists(client->KeyValueSet("test_key", "never_added")));
+  auto result =
+      client->BlockingKeyValueGet("test_key", absl::Milliseconds(100));
+  TF_ASSERT_OK(result.status());
+  EXPECT_EQ(result.value(), "original_value");
+}
+
+TEST_F(ClientServerTest, KeyValueSet_Duplicate_Overwrites) {
+  StartService(/*num_nodes=*/1);
+  auto client = GetClient(/*node_id=*/0);
+  TF_ASSERT_OK(client->Connect());
+  TF_ASSERT_OK(client->KeyValueSet("test_key", "original_value"));
+  TF_EXPECT_OK(client->KeyValueSet("test_key", "overwritten_value",
+                                   /*allow_overwrite=*/true));
+  auto result =
+      client->BlockingKeyValueGet("test_key", absl::Milliseconds(100));
+  TF_ASSERT_OK(result.status());
+  EXPECT_EQ(result.value(), "overwritten_value");
 }
 
 TEST_F(ClientServerTest, KeyValueDelete) {

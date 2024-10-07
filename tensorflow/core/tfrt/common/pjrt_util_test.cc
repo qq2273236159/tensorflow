@@ -17,16 +17,14 @@ limitations under the License.
 #include <memory>
 #include <utility>
 
-#include "xla/pjrt/tfrt_cpu_pjrt_client.h"
-#include "tensorflow/core/framework/resource_mgr.h"
+#include "xla/pjrt/cpu/cpu_client.h"
+#include "xla/tsl/lib/core/status_test_util.h"
+#include "xla/tsl/protobuf/error_codes.pb.h"
 #include "tensorflow/core/framework/types.h"
-#include "tensorflow/core/tfrt/common/global_state.h"
 #include "tensorflow/core/tfrt/common/pjrt_state.h"
-#include "tsl/lib/core/status_test_util.h"
 #include "tsl/platform/status_matchers.h"
 #include "tsl/platform/statusor.h"
 #include "tsl/platform/test.h"
-#include "tsl/protobuf/error_codes.pb.h"
 
 namespace tensorflow {
 namespace {

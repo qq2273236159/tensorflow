@@ -26,6 +26,7 @@ limitations under the License.
 #include "absl/base/attributes.h"
 #include "absl/base/thread_annotations.h"
 #include "absl/container/inlined_vector.h"
+#include "absl/hash/hash.h"
 #include "absl/log/check.h"
 #include "absl/strings/string_view.h"
 #include "absl/synchronization/mutex.h"
@@ -33,14 +34,33 @@ limitations under the License.
 #include "llvm/Support/ExtensibleRTTI.h"
 #include "xla/pjrt/pjrt_layout.h"
 #include "xla/python/ifrt/array.h"
+#include "xla/python/ifrt/device.h"
+#include "xla/python/ifrt/device_list.h"
 #include "xla/python/ifrt/dtype.h"
 #include "xla/python/ifrt/future.h"
+#include "xla/python/ifrt/memory.h"
 #include "xla/python/ifrt/shape.h"
 #include "xla/python/ifrt/sharding.h"
 #include "xla/tsl/concurrency/ref_count.h"
 
 namespace xla {
 namespace ifrt {
+
+// Describes the layout of a `BasicStringArray`.
+class BasicStringArrayLayout : public PjRtLayout {
+ public:
+  BasicStringArrayLayout() = default;
+  BasicStringArrayLayout(const BasicStringArrayLayout& other) = delete;
+
+  ~BasicStringArrayLayout() override = default;
+
+  std::string Serialize() const override;
+  std::string ToString() const override;
+  bool operator==(const PjRtLayout& other) const override;
+
+ protected:
+  void Hash(absl::HashState state) const override;
+};
 
 // `BasicStringArray` implements an `ifrt::Array` by wrapping a local (aka host)
 // string buffer. This object is expected to live exclusively in the IFRT layer,
@@ -111,9 +131,10 @@ class BasicStringArray final
       void* data, std::optional<absl::Span<const int64_t>> byte_strides,
       ArrayCopySemantics semantics) override;
 
-  absl::StatusOr<tsl::RCReference<Array>> Reshard(
-      std::shared_ptr<const Sharding> new_sharding,
-      ArrayCopySemantics semantics) override;
+  absl::StatusOr<tsl::RCReference<Array>> Copy(
+      std::optional<tsl::RCReference<xla::ifrt::DeviceList>> devices,
+      std::optional<xla::ifrt::MemoryKind> memory_kind,
+      ArrayCopySemantics semantics);
 
   Future<> GetReadyFuture() const override;
 
@@ -138,7 +159,7 @@ class BasicStringArray final
 
   BasicStringArray(Client* client, Shape shape,
                    std::shared_ptr<const Sharding> sharding,
-                   Future<Buffers> buffers,
+                   Future<Buffers> buffers, Future<> ready_future,
                    OnDoneWithBuffer on_done_with_buffer);
 
   // Internal implementation of delete.
@@ -148,15 +169,11 @@ class BasicStringArray final
   Shape shape_;
   std::shared_ptr<const Sharding> sharding_;
   Future<Buffers> buffers_;
-
-  // TODO(b/337922817): Consider checking the buffers when they become available
-  // (i.e., the future above becomes ready) to ensure that they are consistent
-  // with the Shape and Sharding provided at the construction time.
+  Future<> ready_future_;
 
   mutable absl::Mutex mu_;
   OnDoneWithBuffer on_done_with_buffer_ ABSL_GUARDED_BY(mu_);
   bool is_deleted_ ABSL_GUARDED_BY(mu_) = false;
-  mutable Future<> ready_future_ ABSL_GUARDED_BY(mu_);
 };
 
 }  // namespace ifrt

@@ -60,7 +60,7 @@ struct PrepareForExportPass
 
 // Materializes some splat before export because it may be more efficient in
 // HLOInstruction.
-void prepareConstantOp(Operation *op, SplatElementsAttr attr) {
+static void prepareConstantOp(Operation *op, SplatElementsAttr attr) {
   // Arbitrarily chosen "small" number. This could be chosen based on the proto
   // size too.
   if (attr.getNumElements() < 32) return;
@@ -87,57 +87,7 @@ void prepareConstantOp(Operation *op, SplatElementsAttr attr) {
   op->erase();
 }
 
-// Ensure that there aren't any implicit capture before exporting.
-void prepareWhileOp(WhileOp whileOp) {
-  llvm::SetVector<Value> implicitInputs;
-  getUsedValuesDefinedAbove(whileOp->getRegions(), implicitInputs);
-  if (implicitInputs.empty()) return;
-  // Each captured value has to be passed as operand to the while, become then
-  // an operand to the condition region and the body region, and an extra
-  // operand to the return op in the body. It also becomes an extra result for
-  // the while operation, even if it is unused.
-  // We'll process the captured values one at a time and patch the body and
-  // condition regions as we go, but we'll accumulate the new operands and
-  // result type and recreate a new while op to replace the existing one at the
-  // end.
-  SmallVector<Type> returnedTypes(whileOp->getResultTypes().begin(),
-                                  whileOp->getResultTypes().end());
-  SmallVector<Value> operands(whileOp->getOperands().begin(),
-                              whileOp->getOperands().end());
-  Region &condRegion = whileOp.getCond();
-  Region &bodyRegion = whileOp.getBody();
-
-  for (Value input : implicitInputs) {
-    returnedTypes.push_back(input.getType());
-    operands.push_back(input);
-
-    Value condArg =
-        condRegion.front().addArgument(input.getType(), input.getLoc());
-    Value bodyArg =
-        bodyRegion.front().addArgument(input.getType(), input.getLoc());
-    for (OpOperand &operand : llvm::make_early_inc_range(input.getUses())) {
-      if (condRegion.isAncestor(operand.getOwner()->getParentRegion()))
-        operand.set(condArg);
-      else if (bodyRegion.isAncestor(operand.getOwner()->getParentRegion()))
-        operand.set(bodyArg);
-    }
-    auto returnOp = cast<mhlo::ReturnOp>(bodyRegion.front().back());
-    returnOp->insertOperands(returnOp->getNumOperands(), bodyArg);
-  }
-  OpBuilder builder(whileOp);
-  auto newWhileOp =
-      builder.create<mhlo::WhileOp>(whileOp.getLoc(), returnedTypes, operands);
-  newWhileOp.getCond().getBlocks().clear();
-  newWhileOp.getCond().takeBody(whileOp.getCond());
-  newWhileOp.getBody().getBlocks().clear();
-  newWhileOp.getBody().takeBody(whileOp.getBody());
-  for (auto zippedResults :
-       llvm::zip_first(whileOp.getResults(), newWhileOp.getResults()))
-    std::get<0>(zippedResults).replaceAllUsesWith(std::get<1>(zippedResults));
-  whileOp->erase();
-}
-
-void prepareBroadcastInDim(BroadcastInDimOp bcast) {
+static void prepareBroadcastInDim(BroadcastInDimOp bcast) {
   DenseIntElementsAttr dims = bcast.getBroadcastDimensions();
   // If dimensions aren't sorted, there is a transpose fused into the op, which
   // XLA Builder does not support, we unfuse here.
@@ -166,7 +116,7 @@ void prepareBroadcastInDim(BroadcastInDimOp bcast) {
 }
 
 // Make implicitly captured constant explicit before exporting
-void prepareExplicitCapturedConstants(Operation *op) {
+static void prepareExplicitCapturedConstants(Operation *op) {
   for (Region &region : op->getRegions()) {
     assert(region.getBlocks().size() == 1 &&
            "Only OPs with single block regions are allowed");
@@ -200,7 +150,6 @@ void PrepareForExportPass::runOnOperation() {
     mlir::SplatElementsAttr attr;
     if (matchPattern(op, m_Constant(&attr))) return prepareConstantOp(op, attr);
 
-    if (auto whileOp = dyn_cast<WhileOp>(op)) return prepareWhileOp(whileOp);
     if (auto bcastOp = dyn_cast<BroadcastInDimOp>(op))
       return prepareBroadcastInDim(bcastOp);
     // IfOp, CaseOp, WhileOp are already being handled during

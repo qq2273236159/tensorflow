@@ -24,6 +24,7 @@ limitations under the License.
 #include "absl/container/flat_hash_set.h"
 #include "absl/log/check.h"
 #include "absl/log/log.h"
+#include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/string_view.h"
 #include "xla/comparison_util.h"
@@ -41,7 +42,6 @@ limitations under the License.
 #include "xla/service/tuple_util.h"
 #include "xla/shape.h"
 #include "xla/shape_util.h"
-#include "xla/status.h"
 #include "xla/util.h"
 #include "tsl/platform/errors.h"
 #include "tsl/platform/statusor.h"
@@ -496,7 +496,7 @@ absl::StatusOr<bool> HloControlFlowFlattening::Run(
           TF_RETURN_IF_ERROR(RemoveCollective(instruction).status());
         }
         changed = true;
-      } else if (remove_comm_ &&
+      } else if ((remove_comm_ || remove_id_) &&
                  (instruction->opcode() == HloOpcode::kPartitionId ||
                   instruction->opcode() == HloOpcode::kReplicaId ||
                   (instruction->opcode() == HloOpcode::kCustomCall &&

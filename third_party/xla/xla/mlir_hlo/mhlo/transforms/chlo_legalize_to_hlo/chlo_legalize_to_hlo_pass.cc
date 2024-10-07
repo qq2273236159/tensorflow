@@ -17,7 +17,6 @@ limitations under the License.
 #include <utility>
 
 #include "mhlo/IR/hlo_ops.h"
-#include "mhlo/transforms/passes.h"
 #include "mhlo/transforms/rewriters.h"
 #include "mhlo/utils/type_conversion.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -58,7 +57,7 @@ struct ChloLegalizeToHighLevelMhloPass
     // Consider the mhlo dialect legal for tests. Also add helper dialects
     // that are needed by the patterns.
     conversionTarget.addLegalDialect<chlo::ChloDialect, mhlo::MhloDialect>();
-    conversionTarget.addIllegalOp<chlo::TopKOp, chlo::ErfOp, chlo::TanOp>();
+    conversionTarget.addIllegalOp<chlo::TopKOp, chlo::ErfOp>();
 
     if (failed(applyPartialConversion(getOperation(), conversionTarget,
                                       std::move(conversionPatterns)))) {

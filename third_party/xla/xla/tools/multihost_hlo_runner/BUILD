@@ -24,26 +24,32 @@ build_test(
     ],
 )
 
-xla_cc_binary(
-    name = "hlo_runner_main",
+cc_library(
+    name = "hlo_runner_main_lib",
     testonly = True,
     srcs = ["hlo_runner_main.cc"],
+    compatible_with = None,
     tags = [
-        "noasan",  # Exceeds linker limit.
-        "nomac",
-    ] + tf_gpu_tests_tags(),
+        "no_mac",
+    ],
     deps = [
+        ":create_client",
         ":functional_hlo_runner",
-        ":hlo_runner_flags",
         "//xla:debug_options_flags",
-        "//xla:status",
-        "//xla:statusor",
+        "//xla:status_macros",
         "//xla/pjrt:pjrt_client",
         "//xla/pjrt/distributed",
+        "//xla/pjrt/distributed:client",
+        "//xla/pjrt/distributed:key_value_store_interface",
+        "//xla/pjrt/distributed:service",
         "//xla/service:cpu_plugin",
         "//xla/tsl/util:command_line_flags",
         "@com_google_absl//absl/log:check",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/time",
+        "@local_tsl//tsl/platform:errors",
         "@local_tsl//tsl/platform:logging",
         "@local_tsl//tsl/platform:platform_port",
         "@local_tsl//tsl/platform:status",
@@ -52,40 +58,68 @@ xla_cc_binary(
         "//xla/service:gpu_plugin",
     ]) + if_cuda([
         "//xla/stream_executor:cuda_platform",
-    ]) + if_rocm([
+    ] + if_google(
+        [
+            "//third_party/py/jax/jaxlib:gpu_kernels",  # fixdeps: keep
+        ],
+    )) + if_rocm([
         "//xla/stream_executor:rocm_platform",
     ]),
+    alwayslink = True,
 )
 
 xla_cc_binary(
-    name = "cuda_hlo_runner_main",
+    name = "hlo_runner_main",
     testonly = True,
-    srcs = ["hlo_runner_main.cc"],
     tags = [
-        "gpu",
-        "nomac",
+        "no_mac",
     ],
     deps = [
-        ":functional_hlo_runner",
-        ":hlo_runner_flags",
-        "//xla:debug_options_flags",
-        "//xla:status",
-        "//xla:statusor",
-        "//xla/pjrt:pjrt_client",
-        "//xla/pjrt/distributed",
-        "//xla/service:cpu_plugin",
+        ":hlo_runner_main_lib",
+    ],
+)
+
+xla_cc_binary(
+    name = "hlo_runner_main_gpu",
+    testonly = True,
+    tags = [
+        "cuda-only",
+        "gpu",
+        "no_mac",
+    ] + tf_gpu_tests_tags(),
+    deps = [
+        ":hlo_runner_main_lib",
         "//xla/service:gpu_plugin",
         "//xla/stream_executor:cuda_platform",
-        "//xla/tsl/util:command_line_flags",
-        "@com_google_absl//absl/log:check",
-        "@com_google_absl//absl/strings",
-        "@local_tsl//tsl/platform:logging",
-        "@local_tsl//tsl/platform:platform_port",
-        "@local_tsl//tsl/platform:status",
-        "@local_tsl//tsl/platform:statusor",
     ] + if_google([
         "//third_party/py/jax/jaxlib:gpu_kernels",  # fixdeps: keep
     ]),
+)
+
+cc_library(
+    name = "create_client",
+    srcs = ["create_client.cc"],
+    hdrs = ["create_client.h"],
+    deps = [
+        "//xla:status_macros",
+        "//xla:xla_proto_cc",
+        "//xla/pjrt:pjrt_client",
+        "//xla/pjrt:pjrt_compiler",
+        "//xla/pjrt/cpu:cpu_client",
+        "//xla/pjrt/distributed",
+        "//xla/pjrt/distributed:client",
+        "//xla/pjrt/distributed:key_value_store_interface",
+        "//xla/pjrt/distributed:service",
+        "//xla/pjrt/gpu:se_gpu_pjrt_client",
+        "@com_google_absl//absl/log",
+        "@com_google_absl//absl/log:check",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings:string_view",
+        "@com_google_absl//absl/time",
+        "@local_tsl//tsl/platform:status",
+        "@local_tsl//tsl/platform:statusor",
+    ],
 )
 
 cc_library(
@@ -96,27 +130,25 @@ cc_library(
         "//xla:literal",
         "//xla:literal_util",
         "//xla:shape_util",
-        "//xla:status",
         "//xla:status_macros",
-        "//xla:statusor",
         "//xla:util",
+        "//xla:xla_data_proto_cc",
         "//xla:xla_proto_cc",
         "//xla/client:executable_build_options",
         "//xla/client:xla_computation",
         "//xla/hlo/ir:hlo",
+        "//xla/hlo/pass:hlo_pass_pipeline",
         "//xla/pjrt:host_memory_spaces",
         "//xla/pjrt:pjrt_client",
         "//xla/pjrt:pjrt_compiler",
         "//xla/pjrt:pjrt_executable",
         "//xla/pjrt:pjrt_future",
-        "//xla/pjrt/cpu:cpu_client",
-        "//xla/pjrt/distributed:client",
-        "//xla/pjrt/gpu:se_gpu_pjrt_client",
+        "//xla/pjrt/distributed:key_value_store_interface",
         "//xla/service:computation_layout",
         "//xla/service:computation_placer_hdr",
         "//xla/service:hlo_module_config",
         "//xla/service:hlo_parser",
-        "//xla/service:hlo_pass_pipeline",
+        "//xla/service:hlo_proto_cc",
         "//xla/tests:test_utils",
         "//xla/tools:hlo_control_flow_flattening",
         "@com_google_absl//absl/algorithm:container",
@@ -124,9 +156,9 @@ cc_library(
         "@com_google_absl//absl/log",
         "@com_google_absl//absl/log:check",
         "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings",
         "@com_google_absl//absl/synchronization",
-        "@com_google_absl//absl/time",
         "@com_google_absl//absl/types:span",
         "@local_tsl//tsl/platform:env",
         "@local_tsl//tsl/platform:errors",
@@ -136,28 +168,14 @@ cc_library(
     ],
 )
 
-cc_library(
-    name = "hlo_runner_flags",
-    srcs = ["hlo_runner_flags.cc"],
-    hdrs = ["hlo_runner_flags.h"],
-    deps = [
-        ":functional_hlo_runner",
-        "//xla/pjrt:pjrt_executable",
-        "@com_google_absl//absl/strings",
-        "@local_tsl//tsl/platform:logging",
-    ],
-)
-
 xla_test(
     name = "functional_hlo_runner_test",
     srcs = ["functional_hlo_runner_test.cc"],
     backend_tags = {
-        # This test is tagged "manual" because it requires multiple (2) GPUs.
         "gpu": [
-            "manual",
-            "multi_gpu",
+            "multi_gpu_h100",
             "no_oss",
-            "notap",
+            "nomsan",
         ],
     },
     backends = [
@@ -165,22 +183,34 @@ xla_test(
         "gpu",
     ],
     data = [
+        "data/multiple_gemm_fusions.hlo",
         "data/sharded_16_devices.hlo",
         "data/sharded_2_devices.hlo",
         "data/single_device.hlo",
         "data/single_device_tupled.hlo",
     ],
-    tags = ["nomac"],
+    tags = ["no_mac"],
     deps = [
+        ":create_client",
         ":functional_hlo_runner",
-        "//xla:statusor",
+        "//xla:debug_options_flags",
+        "//xla:xla_proto_cc",
         "//xla/pjrt:pjrt_client",
         "//xla/tests:filecheck",
-        "@com_google_googletest//:gtest_main",
-        "@local_tsl//tsl/lib/core:status_test_util",
+        "//xla/tsl/lib/core:status_test_util",
+        "//xla/tsl/util:command_line_flags",
+        "@com_google_absl//absl/log:check",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/strings:str_format",
+        "@com_google_absl//absl/time",
+        "@com_google_googletest//:gtest",
         "@local_tsl//tsl/platform:env",
+        "@local_tsl//tsl/platform:errors",
         "@local_tsl//tsl/platform:path",
         "@local_tsl//tsl/platform:statusor",
+        "@local_tsl//tsl/platform:subprocess",
         "@local_tsl//tsl/platform:test",
     ],
 )

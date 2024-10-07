@@ -33,12 +33,12 @@ limitations under the License.
 #endif
 #include "xla/stream_executor/blas.h"
 #include "xla/stream_executor/gpu/gpu_blas_lt.h"
-#include "xla/stream_executor/platform/port.h"
+#include "xla/stream_executor/gpu/gpu_executor.h"
 #include "xla/stream_executor/plugin_registry.h"
 #if TF_HIPBLASLT
 #include "xla/stream_executor/rocm/hip_blas_lt.h"
 #endif
-#include "xla/stream_executor/stream_executor_interface.h"
+#include "xla/stream_executor/stream_executor.h"
 
 namespace stream_executor {
 
@@ -74,8 +74,6 @@ using RocBlasType_t =
                         rocblas_bfloat16, std::complex<float>,
                         rocblas_float_complex, std::complex<double>,
                         rocblas_double_complex>::type;
-
-class GpuExecutor;
 
 // BLAS plugin for ROCM platform via rocBLAS library.
 //
@@ -114,9 +112,6 @@ class ROCMBlas : public blas::BlasSupport {
   // enqueue dispatch) at a given time. As a result, this generally must be
   // invoked before calling into rocBLAS.
   bool SetStream(Stream *stream) ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
-
-  // Returns the underlying ROCm stream
-  hipStream_t ROCMStream(Stream *stream);
 
   // A helper function that calls the real rocBLAS function together with error
   // handling.
@@ -188,7 +183,7 @@ class ROCMBlas : public blas::BlasSupport {
       ScratchAllocator *scratch_allocator);
 
   // mutex that guards the rocBLAS handle for this device.
-  absl::Mutex mu_;
+  mutable absl::Mutex mu_;
 
   // GpuExecutor which instantiated this ROCMBlas.
   // Immutable post-initialization.
@@ -200,7 +195,7 @@ class ROCMBlas : public blas::BlasSupport {
   // container holding solutions vector (to avoid reallocating it each time)
   std::vector<rocblas_int> solutions_;
 
-  void MaybeLogGemmOp(StreamExecutorInterface::GemmCallTrace::GemmType op,
+  void MaybeLogGemmOp(StreamExecutor::GemmCallTrace::GemmType op,
                       blas::CallContext context, uint64_t size1,
                       uint64_t size2);
 

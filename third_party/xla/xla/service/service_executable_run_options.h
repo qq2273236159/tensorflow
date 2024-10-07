@@ -20,10 +20,11 @@ limitations under the License.
 #include <utility>
 #include <vector>
 
+#include "absl/status/statusor.h"
 #include "xla/executable_run_options.h"
 #include "xla/service/stream_pool.h"
-#include "xla/statusor.h"
 #include "xla/stream_executor/stream_executor.h"
+#include "tsl/platform/statusor.h"
 
 namespace xla {
 
@@ -58,6 +59,7 @@ class ServiceExecutableRunOptions {
   }
   int device_ordinal() const { return run_options_.device_ordinal(); }
 
+  int local_device_count() const { return run_options_.local_device_count(); };
   // Borrows a stream and returns a smart pointer which returns the stream on
   // destruction.
   absl::StatusOr<StreamPool::Ptr> BorrowStream(
@@ -84,9 +86,12 @@ class ServiceExecutableRunOptions {
                               "No stream borrower");
   }
 
+  bool HasStreamBorrower() const { return stream_borrower_ != nullptr; }
+
  private:
   ExecutableRunOptions run_options_;
   StreamBorrower stream_borrower_;
+  int64_t local_device_count_;
 };
 
 }  // namespace xla

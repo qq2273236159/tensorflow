@@ -15,6 +15,9 @@ limitations under the License.
 #ifndef TENSORFLOW_LITE_C_COMMON_INTERNAL_H_
 #define TENSORFLOW_LITE_C_COMMON_INTERNAL_H_
 
+#include <stddef.h>
+#include <stdint.h>
+
 #include "tensorflow/lite/core/c/c_api_types.h"
 #include "tensorflow/lite/core/c/common.h"
 
@@ -81,6 +84,32 @@ typedef struct TfLiteOperator {
   // Indicates if an operator's output can safely overwrite its input.
   // See the comments in `TfLiteInPlaceOp`.
   uint64_t inplace_operator;
+
+  // Data supplied by the user in the `TfLiteOperatorCreate` call and then
+  // returned back to the user in the `TfLiteOperator` callbacks listed below.
+  // The user is expected to manage the memory pointed by this field and the
+  // lifetime of that memory should extend at least from the call to
+  // `TfLiteOperatorCreate` to the invocation of the callback set with
+  // `TfLiteOperatorSetFreeWithData`.
+  void* user_data;
+  // The following callbacks can be set with the `TfLiteOperatorSetXXXWithData`
+  // functions and if, so set, will pass back the value of the user_data field
+  // above as first argument.
+  //
+  // TODO(b/339641079): Remove the legacy callbacks listed above and rename
+  // these below without the `_with_data` suffix.
+  void* (*init_with_data)(void* user_data, TfLiteOpaqueContext* context,
+                          const char* buffer, size_t length);
+  void (*free_with_data)(void* user_data, TfLiteOpaqueContext* context,
+                         void* buffer);
+  TfLiteStatus (*prepare_with_data)(void* user_data,
+                                    TfLiteOpaqueContext* context,
+                                    TfLiteOpaqueNode* node);
+  TfLiteStatus (*invoke_with_data)(void* user_data,
+                                   TfLiteOpaqueContext* context,
+                                   TfLiteOpaqueNode* node);
+  struct TfLiteAsyncKernel* (*async_kernel_with_data)(
+      void* user_data, TfLiteOpaqueContext* context, TfLiteOpaqueNode* node);
 } TfLiteOperator;
 
 // Returns true iff it's safe to dereference

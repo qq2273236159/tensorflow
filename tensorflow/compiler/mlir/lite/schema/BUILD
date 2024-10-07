@@ -1,4 +1,5 @@
 load("@flatbuffers//:build_defs.bzl", "flatbuffer_cc_library")
+load("//tensorflow:tensorflow.bzl", "tf_cc_test")
 load("//tensorflow:tensorflow.default.bzl", "get_compatible_with_portable")
 
 package(
@@ -10,7 +11,27 @@ package(
 )
 
 exports_files(
-    srcs = ["schema.fbs"],
+    srcs = [
+        "conversion_metadata.fbs",
+        "debug_metadata.fbs",
+        "schema.fbs",
+        "schema_v0.fbs",
+        "schema_v1.fbs",
+        "schema_v2.fbs",
+        "schema_v3.fbs",
+        "schema_v3a.fbs",
+        "schema_v3b.fbs",
+    ],
+)
+
+filegroup(
+    name = "tflite_internal_cc_3p_api_deps_src",
+    srcs = [
+        ":debug_metadata_fbs_srcs",
+        ":schema_fbs_srcs",
+        ":schema_utils.h",
+    ],
+    visibility = ["//tensorflow/lite:__pkg__"],
 )
 
 flatbuffer_cc_library(
@@ -23,6 +44,23 @@ flatbuffer_cc_library(
 flatbuffer_cc_library(
     name = "schema_fbs_with_mutable",
     srcs = ["schema.fbs"],
+    compatible_with = get_compatible_with_portable(),
+    flatc_args = [
+        "--gen-mutable",
+        "--gen-object-api",
+    ],
+    out_prefix = "mutable/",
+)
+
+flatbuffer_cc_library(
+    name = "debug_metadata_fbs",
+    srcs = ["debug_metadata.fbs"],
+    compatible_with = get_compatible_with_portable(),
+)
+
+flatbuffer_cc_library(
+    name = "debug_metadata_fbs_with_mutable",
+    srcs = ["debug_metadata.fbs"],
     compatible_with = get_compatible_with_portable(),
     flatc_args = [
         "--gen-mutable",
@@ -67,5 +105,27 @@ cc_library(
     deps = [
         ":schema_fbs",
         "@flatbuffers",
+    ],
+)
+
+# Schema test to make sure we don't introduce backward incompatible changes
+# to schemas.
+tf_cc_test(
+    name = "flatbuffer_compatibility_test",
+    size = "small",
+    srcs = ["flatbuffer_compatibility_test.cc"],
+    data = [
+        "schema.fbs",
+        "schema_v3b.fbs",
+    ],
+    tags = [
+        "no_oss",
+        "tflite_not_portable_android",
+        "tflite_not_portable_ios",
+    ],
+    deps = [
+        "//tensorflow/core/platform",
+        "@com_google_googletest//:gtest_main",
+        "@flatbuffers//:flatc_library",
     ],
 )

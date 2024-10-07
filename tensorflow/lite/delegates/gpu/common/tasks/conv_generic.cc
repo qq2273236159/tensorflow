@@ -303,6 +303,7 @@ void ConvGeneric::GenerateCode(const GpuInfo& gpu_info) {
   }
   if (gpu_info.IsMali()) {
     compiler_options_.push_back(CompilerOptions::kClFastRelaxedMath);
+    compiler_options_.push_back(CompilerOptions::kClRegisterAllocation64);
   }
   if (conv_params_.IsPrivateMemBroadcast() &&
       (gpu_info.IsCL20OrHigher() || gpu_info.opencl_info.IsCLVK())) {
@@ -488,7 +489,7 @@ std::string ConvGeneric::GenerateConv(const GpuInfo& gpu_info,
          std::to_string(work_group_size_.y) + ", " +
          std::to_string(work_group_size_.z) + ")))\n";
   }
-  if (use_simd_broadcast && gpu_info.IsIntel() && gpu_info.IsApiOpenCl() &&
+  if (use_simd_broadcast && gpu_info.IsApiOpenCl() &&
       gpu_info.SupportsExtension("cl_intel_required_subgroup_size")) {
     c += "__attribute__((intel_reqd_sub_group_size(" +
          std::to_string(simd_size) + ")))\n";

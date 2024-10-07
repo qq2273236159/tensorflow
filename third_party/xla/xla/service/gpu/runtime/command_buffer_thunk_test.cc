@@ -19,16 +19,21 @@ limitations under the License.
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <string>
+#include <thread>  // NOLINT
 #include <utility>
 #include <vector>
 
 #include "absl/status/statusor.h"
 #include "absl/strings/ascii.h"
+#include "absl/types/span.h"
 #include "xla/service/buffer_assignment.h"
 #include "xla/service/gpu/buffer_allocations.h"
 #include "xla/service/gpu/launch_dimensions.h"
 #include "xla/service/gpu/matmul_utils.h"
 #include "xla/service/gpu/runtime/command_buffer_cmd.h"
+#include "xla/service/gpu/runtime/memset_thunk.h"
+#include "xla/service/gpu/runtime/sequential_thunk.h"
 #include "xla/service/gpu/runtime/thunk.h"
 #include "xla/service/platform_util.h"
 #include "xla/service/service_executable_run_options.h"
@@ -38,6 +43,7 @@ limitations under the License.
 #include "xla/stream_executor/device_memory.h"
 #include "xla/stream_executor/device_memory_allocator.h"
 #include "xla/stream_executor/gpu/gpu_test_kernels.h"
+#include "xla/stream_executor/gpu/gpu_test_kernels_fatbin.h"
 #include "xla/stream_executor/gpu/gpu_types.h"  // IWYU pragma: keep
 #include "xla/stream_executor/kernel.h"
 #include "xla/stream_executor/kernel_spec.h"
@@ -45,11 +51,12 @@ limitations under the License.
 #include "xla/stream_executor/platform_manager.h"
 #include "xla/stream_executor/stream_executor.h"
 #include "xla/stream_executor/stream_executor_memory_allocator.h"
+#include "xla/tsl/lib/core/status_test_util.h"
 #include "xla/types.h"  // IWYU pragma: keep
 #include "xla/xla_data.pb.h"
-#include "tsl/lib/core/status_test_util.h"
 #include "tsl/platform/statusor.h"
 #include "tsl/platform/test.h"
+#include "tsl/profiler/lib/profiler_lock.h"
 
 #ifdef GOOGLE_CUDA
 #include "third_party/gpus/cuda/include/cuda.h"
@@ -60,27 +67,29 @@ namespace xla::gpu {
 using MemoryAccess = CommandBufferCmd::MemoryAccess;
 using KernelArgsPacking = se::MultiKernelLoaderSpec::KernelArgsPacking;
 
-static se::StreamExecutor* GpuExecutor() {
+namespace {
+se::StreamExecutor* GpuExecutor() {
   auto name =
       absl::AsciiStrToUpper(PlatformUtil::CanonicalPlatformName("gpu").value());
   auto* platform = se::PlatformManager::PlatformWithName(name).value();
   return platform->ExecutorForDevice(0).value();
 }
 
-static Thunk::ExecutableSource ExecutableSource() {
-  Thunk::ExecutableSource source = {
-#if defined(GOOGLE_CUDA)
-      /*text=*/se::gpu::internal::kAddI32Kernel,
-      /*binary=*/{}
-#elif defined(TENSORFLOW_USE_ROCM)
-      /*text=*/{},
-      /*binary=*/se::gpu::internal::kAddI32KernelModule
-#endif
-  };
-  return source;
+struct OwningExecutableSource {
+  std::string text;
+  std::vector<uint8_t> binary;
+
+  explicit operator Thunk::ExecutableSource() const { return {text, binary}; }
+};
+
+absl::StatusOr<OwningExecutableSource> ExecutableSource() {
+  TF_ASSIGN_OR_RETURN(std::vector<uint8_t> fatbin,
+                      se::gpu::GetGpuTestKernelsFatbin());
+  return OwningExecutableSource{/*text=*/{},
+                                /*binary=*/fatbin};
 }
 
-static KernelArgsPacking CreateDefaultArgsPacking() {
+KernelArgsPacking CreateDefaultArgsPacking() {
   using Packed = absl::StatusOr<std::unique_ptr<se::KernelArgsPackedArrayBase>>;
 
   return [=](const se::Kernel& kernel, const se::KernelArgs& args) -> Packed {
@@ -92,7 +101,7 @@ static KernelArgsPacking CreateDefaultArgsPacking() {
 }
 
 // Some of the tests rely on CUDA 12.3+ features.
-static bool IsAtLeastCuda12300() {
+bool IsAtLeastCuda12300() {
 #if defined(TENSORFLOW_USE_ROCM)
   return false;
 #endif
@@ -103,8 +112,9 @@ static bool IsAtLeastCuda12300() {
 }
 
 // Give a short aliases to execution threads.
-static constexpr auto s0 = ExecutionStreamId(0);
-static constexpr auto s1 = ExecutionStreamId(1);
+constexpr auto s0 = ExecutionStreamId(0);
+constexpr auto s1 = ExecutionStreamId(1);
+}  // namespace
 
 TEST(CommandBufferThunkTest, MemcpyCmd) {
   se::StreamExecutor* executor = GpuExecutor();
@@ -249,6 +259,114 @@ TEST(CommandBufferThunkTest, Memset32Cmd) {
   ASSERT_EQ(dst, std::vector<int32_t>(4, 84));
 }
 
+TEST(CommandBufferThunkTest, Memset32CmdCommandBuffersDisabledDuringProfiling) {
+  se::StreamExecutor* executor = GpuExecutor();
+
+  TF_ASSERT_OK_AND_ASSIGN(auto stream, executor->CreateStream());
+
+  int64_t length = 4;
+  int64_t byte_length = sizeof(int32_t) * length;
+
+  // Prepare arguments: a=42
+  se::DeviceMemory<int32_t> a = executor->AllocateArray<int32_t>(length, 0);
+
+  TF_ASSERT_OK(stream->Memset32(&a, 42, byte_length));
+
+  // Prepare buffer allocations for recording command buffer.
+  BufferAllocation alloc_a(/*index=*/0, byte_length, /*color=*/0);
+  BufferAllocation::Slice slice_a(&alloc_a, 0, byte_length);
+
+  auto memset_thunk =
+      std::make_unique<Memset32BitValueThunk>(Thunk::ThunkInfo(), 84, slice_a);
+  std::vector<std::unique_ptr<Thunk>> thunks;
+  thunks.push_back(std::move(memset_thunk));
+  auto seq_thunks =
+      std::make_unique<SequentialThunk>(Thunk::ThunkInfo(), std::move(thunks));
+  // Prepare commands sequence for constructing command buffer that should not
+  // be used.
+  CommandBufferCmdSequence commands;
+  commands.Emplace<Memset32Cmd>(s0, slice_a, int32_t{12});
+
+  constexpr bool kProfileCommandBuffersEnabled = false;
+  // Construct a thunk with command sequence.
+  CommandBufferThunk thunk(std::move(commands), Thunk::ThunkInfo(),
+                           std::move(seq_thunks),
+                           kProfileCommandBuffersEnabled);
+
+  ServiceExecutableRunOptions run_options;
+  se::StreamExecutorMemoryAllocator allocator(executor);
+  BufferAllocations allocations({a}, 0, &allocator);
+
+  Thunk::ExecuteParams params = Thunk::ExecuteParams::Create(
+      run_options, allocations, stream.get(), stream.get(), nullptr, nullptr);
+
+  TF_ASSERT_OK_AND_ASSIGN(auto profiler_lock,
+                          tsl::profiler::ProfilerLock::Acquire());
+  // Execute command buffer thunk and verify that it set the memory.
+  TF_ASSERT_OK(thunk.ExecuteOnStream(params));
+  TF_ASSERT_OK(stream->BlockHostUntilDone());
+
+  // Copy `a` data back to host.
+  std::vector<int32_t> dst(4, 0);
+  TF_ASSERT_OK(stream->Memcpy(dst.data(), a, byte_length));
+
+  ASSERT_EQ(dst, std::vector<int32_t>(4, 84));
+}
+
+TEST(CommandBufferThunkTest, Memset32CmdCommandBuffersEnabledDuringProfiling) {
+  se::StreamExecutor* executor = GpuExecutor();
+
+  TF_ASSERT_OK_AND_ASSIGN(auto stream, executor->CreateStream());
+
+  int64_t length = 4;
+  int64_t byte_length = sizeof(int32_t) * length;
+
+  // Prepare arguments: a=42
+  se::DeviceMemory<int32_t> a = executor->AllocateArray<int32_t>(length, 0);
+
+  TF_ASSERT_OK(stream->Memset32(&a, 42, byte_length));
+
+  // Prepare buffer allocations for recording command buffer.
+  BufferAllocation alloc_a(/*index=*/0, byte_length, /*color=*/0);
+  BufferAllocation::Slice slice_a(&alloc_a, 0, byte_length);
+
+  auto memset_thunk =
+      std::make_unique<Memset32BitValueThunk>(Thunk::ThunkInfo(), 84, slice_a);
+  std::vector<std::unique_ptr<Thunk>> thunks;
+  thunks.push_back(std::move(memset_thunk));
+  auto seq_thunks =
+      std::make_unique<SequentialThunk>(Thunk::ThunkInfo(), std::move(thunks));
+  // Prepare commands sequence for constructing command buffer that should not
+  // be used.
+  CommandBufferCmdSequence commands;
+  commands.Emplace<Memset32Cmd>(s0, slice_a, int32_t{12});
+
+  constexpr bool kProfileCommandBuffersEnabled = true;
+  // Construct a thunk with command sequence.
+  CommandBufferThunk thunk(std::move(commands), Thunk::ThunkInfo(),
+                           std::move(seq_thunks),
+                           kProfileCommandBuffersEnabled);
+
+  ServiceExecutableRunOptions run_options;
+  se::StreamExecutorMemoryAllocator allocator(executor);
+  BufferAllocations allocations({a}, 0, &allocator);
+
+  Thunk::ExecuteParams params = Thunk::ExecuteParams::Create(
+      run_options, allocations, stream.get(), stream.get(), nullptr, nullptr);
+
+  TF_ASSERT_OK_AND_ASSIGN(auto profiler_lock,
+                          tsl::profiler::ProfilerLock::Acquire());
+  // Execute command buffer thunk and verify that it set the memory.
+  TF_ASSERT_OK(thunk.ExecuteOnStream(params));
+  TF_ASSERT_OK(stream->BlockHostUntilDone());
+
+  // Copy `a` data back to host.
+  std::vector<int32_t> dst(4, 0);
+  TF_ASSERT_OK(stream->Memcpy(dst.data(), a, byte_length));
+
+  ASSERT_EQ(dst, std::vector<int32_t>(4, 12));
+}
+
 TEST(CommandBufferThunkTest, Memset32CmdOnDifferentStreams) {
   se::StreamExecutor* executor = GpuExecutor();
 
@@ -316,7 +434,7 @@ TEST(CommandBufferThunkTest, LaunchCmd) {
 
   // Prepare commands sequence for constructing command buffer.
   CommandBufferCmdSequence commands;
-  commands.Emplace<LaunchCmd>(s0, "add", args, args_access,
+  commands.Emplace<LaunchCmd>(s0, "AddI32", args, args_access,
                               LaunchDimensions(1, 4),
                               /*shmem_bytes=*/0);
 
@@ -330,9 +448,10 @@ TEST(CommandBufferThunkTest, LaunchCmd) {
   Thunk::ExecuteParams params = Thunk::ExecuteParams::Create(
       run_options, allocations, stream.get(), stream.get(), nullptr, nullptr);
 
-  Thunk::ExecutableSource source = ExecutableSource();
+  TF_ASSERT_OK_AND_ASSIGN(OwningExecutableSource source, ExecutableSource());
   TF_ASSERT_OK(
-      thunk.Initialize({executor, source, &allocations, stream.get()}));
+      thunk.Initialize({executor, static_cast<Thunk::ExecutableSource>(source),
+                        &allocations, stream.get()}));
 
   // Execute command buffer thunk and verify that it added the value.
   TF_ASSERT_OK(thunk.ExecuteOnStream(params));
@@ -386,7 +505,7 @@ TEST(CommandBufferThunkTest, CustomAddKernelLaunchCmd) {
   spec.AddInProcessSymbol(se::gpu::internal::GetAddI32Kernel(), "add");
 
   auto custom_kernel =
-      CustomKernel("add", std::move(spec), se::BlockDim(),
+      CustomKernel("AddI32", std::move(spec), se::BlockDim(),
                    se::ThreadDim(4, 1, 1), /*shared_memory_bytes=*/0);
 
   int64_t length = 4;
@@ -412,7 +531,7 @@ TEST(CommandBufferThunkTest, CustomAddKernelLaunchCmd) {
 
   // Prepare commands sequence for constructing command buffer.
   CommandBufferCmdSequence commands;
-  commands.Emplace<LaunchCmd>(s0, "add", args, args_access,
+  commands.Emplace<LaunchCmd>(s0, "AddI32", args, args_access,
                               LaunchDimensions(1, 4),
                               /*shmem_bytes=*/0);
 
@@ -426,9 +545,10 @@ TEST(CommandBufferThunkTest, CustomAddKernelLaunchCmd) {
   Thunk::ExecuteParams params = Thunk::ExecuteParams::Create(
       run_options, allocations, stream.get(), stream.get(), nullptr, nullptr);
 
-  Thunk::ExecutableSource source = ExecutableSource();
+  TF_ASSERT_OK_AND_ASSIGN(OwningExecutableSource source, ExecutableSource());
   TF_ASSERT_OK(
-      thunk.Initialize({executor, source, &allocations, stream.get()}));
+      thunk.Initialize({executor, static_cast<Thunk::ExecutableSource>(source),
+                        &allocations, stream.get()}));
 
   // Execute command buffer thunk and verify that it added the value.
   TF_ASSERT_OK(thunk.ExecuteOnStream(params));
@@ -473,7 +593,7 @@ TEST(CommandBufferThunkTest, CustomAddKernelLaunchCmd) {
 
 TEST(CommandBufferThunkTest, GemmCmd) {
   if (!IsAtLeastCuda12300()) {
-    GTEST_SKIP() << "CUDA graph conditionals are not supported";
+    GTEST_SKIP() << "CUDA graph tracing is not supported";
   }
 
   se::StreamExecutor* executor = GpuExecutor();
@@ -587,6 +707,150 @@ TEST(CommandBufferThunkTest, GemmCmd) {
   ASSERT_EQ(dst, std::vector<float>({10, 10, 10, 26, 26, 26}));
 }
 
+TEST(CommandBufferThunkTest, CublasLtCmd) {
+  if (!IsAtLeastCuda12300()) {
+    GTEST_SKIP() << "CUDA graph tracing is not supported";
+  }
+
+  se::StreamExecutor* executor = GpuExecutor();
+
+  TF_ASSERT_OK_AND_ASSIGN(auto stream1, executor->CreateStream());
+  TF_ASSERT_OK_AND_ASSIGN(auto stream2, executor->CreateStream());
+
+  // CublasLt formula: D = alpha*(A*B) + beta*(C),
+
+  int64_t a_length = sizeof(float) * 2 * 4;
+  int64_t b_length = sizeof(float) * 4 * 3;
+  int64_t c_length = sizeof(float) * 2 * 3;
+  int64_t d_length = sizeof(float) * 2 * 3;
+
+  // Prepare buffer allocations for recording command buffer.
+  BufferAllocation alloc_a(/*index=*/0, a_length, /*color=*/0);
+  BufferAllocation alloc_b(/*index=*/1, b_length, /*color=*/0);
+  BufferAllocation alloc_c(/*index=*/2, c_length, /*color=*/0);
+  BufferAllocation alloc_d(/*index=*/3, d_length, /*color=*/0);
+  BufferAllocation alloc_workspace(/*index=*/4, 1024 * 1024, /*color=*/0);
+
+  BufferAllocation::Slice slice_a(&alloc_a, 0, a_length);
+  BufferAllocation::Slice slice_b(&alloc_b, 0, b_length);
+  BufferAllocation::Slice slice_c(&alloc_c, 0, c_length);
+  BufferAllocation::Slice slice_d(&alloc_d, 0, d_length);
+  BufferAllocation::Slice slice_workspace(&alloc_workspace, 0, 1024 * 1024);
+
+  auto config = GemmConfig::For(
+      /*lhs_shape*/ ShapeUtil::MakeShape(PrimitiveType::F32, {2, 4}),
+      /*lhs_batch_dims*/ {}, /*lhs_contracting_dims*/ {1},
+      /*rhs_shape*/ ShapeUtil::MakeShape(PrimitiveType::F32, {4, 3}),
+      /*rhs_batch_dims*/ {}, /*rhs_contracting_dims*/ {0},
+      /*c_shape*/ ShapeUtil::MakeShape(PrimitiveType::F32, {2, 3}),
+      /*bias_shape_ptr*/ nullptr,
+      /*output_shape*/ ShapeUtil::MakeShape(PrimitiveType::F32, {2, 3}),
+      /*alpha_real*/ 1.0, /*alpha_imag*/ 0,
+      /*beta*/ 1.0,
+      /*precision_algorithm*/ PrecisionConfig::ALG_UNSET,
+      /*algorithm*/ std::nullopt,
+      /*compute_precision*/ se::blas::kDefaultComputePrecision,
+      /*grad_x*/ false, /*grad_y*/ false);
+  ASSERT_TRUE(config.ok());
+
+  // Prepare commands sequence for constructing command buffer.
+  CommandBufferCmdSequence commands;
+  commands.Emplace<CublasLtCmd>(
+      s0, config.value(), se::gpu::BlasLt::Epilogue::kDefault, 0, slice_a,
+      slice_b, slice_c, slice_d, BufferAllocation::Slice(),
+      BufferAllocation::Slice(), BufferAllocation::Slice(),
+      BufferAllocation::Slice(), BufferAllocation::Slice(),
+      BufferAllocation::Slice(), BufferAllocation::Slice(), slice_workspace);
+
+  // Construct a thunk with command sequence.
+  CommandBufferThunk thunk(std::move(commands), Thunk::ThunkInfo());
+
+  std::vector<float> a_arr_1{1, 2, 3, 4, 5, 6, 7, 8};
+  std::vector<float> a_arr_2{2, 3, 4, 5, 6, 7, 8, 9};
+  std::vector<float> result_1{11, 11, 11, 27, 27, 27};
+  std::vector<float> result_2{15, 15, 15, 31, 31, 31};
+
+  auto run_cublaslt_test = [&](std::unique_ptr<se::Stream>& stream,
+                               std::vector<float> a_arr,
+                               std::vector<float> result) {
+    se::DeviceMemory<float> a = executor->AllocateArray<float>(2 * 4);
+    TF_ASSERT_OK(stream->Memcpy(&a, a_arr.data(), a_length));
+
+    se::DeviceMemory<float> b = executor->AllocateArray<float>(4 * 3);
+    std::vector<float> b_arr(12, 1);
+    TF_ASSERT_OK(stream->Memcpy(&b, b_arr.data(), b_length));
+
+    se::DeviceMemory<float> c = executor->AllocateArray<float>(2 * 3);
+    std::vector<float> c_arr(6, 1);
+    TF_ASSERT_OK(stream->Memcpy(&c, c_arr.data(), c_length));
+
+    se::DeviceMemory<float> d = executor->AllocateArray<float>(2 * 3);
+    TF_ASSERT_OK(stream->MemZero(&d, d_length));
+
+    se::DeviceMemory<float> workspace =
+        executor->AllocateArray<float>(1024 * 1024);
+    TF_ASSERT_OK(stream->MemZero(&workspace, 1024 * 1024));
+
+    ServiceExecutableRunOptions run_options;
+    se::StreamExecutorMemoryAllocator allocator(executor);
+    BufferAllocations allocations({a, b, c, d, workspace}, 0, &allocator);
+
+    Thunk::ExecuteParams params = Thunk::ExecuteParams::Create(
+        run_options, allocations, stream.get(), stream.get(), nullptr, nullptr);
+
+    Thunk::ExecutableSource source = {/*text=*/"", /*binary=*/{}};
+    TF_ASSERT_OK(thunk.Initialize(
+        {executor, source, &allocations, stream.get(), stream.get()}));
+
+    // Execute command buffer thunk and verify that it executed a GEMM.
+    TF_ASSERT_OK(thunk.ExecuteOnStream(params));
+    TF_ASSERT_OK(stream->BlockHostUntilDone());
+
+    // Copy `out` data back to host.
+    std::vector<float> dst(6, 0);
+    TF_ASSERT_OK(stream->Memcpy(dst.data(), d, d_length));
+
+    ASSERT_EQ(dst, result);
+
+    // Prepare buffer allocation for updating command buffer.
+    se::DeviceMemory<float> updated_d = executor->AllocateArray<float>(2 * 3);
+    TF_ASSERT_OK(stream->MemZero(&updated_d, d_length));
+
+    // Update buffer allocation to updated `d` buffer.
+    allocations =
+        BufferAllocations({a, b, c, updated_d, workspace}, 0, &allocator);
+
+    // Thunk execution should automatically update underlying command
+    // buffer.
+    TF_ASSERT_OK(thunk.ExecuteOnStream(params));
+    TF_ASSERT_OK(stream->BlockHostUntilDone());
+
+    // Copy `updated_out` data back to host.
+    std::fill(dst.begin(), dst.end(), 0);
+    TF_ASSERT_OK(stream->Memcpy(dst.data(), updated_d, d_length));
+
+    ASSERT_EQ(dst, result);
+
+    // Try to update the command buffer with the same buffers.
+    TF_ASSERT_OK(stream->MemZero(&updated_d, d_length));
+
+    // Thunk execution should automatically update underlying command
+    // buffer.
+    TF_ASSERT_OK(thunk.ExecuteOnStream(params));
+    TF_ASSERT_OK(stream->BlockHostUntilDone());
+
+    // Copy `updated_out` data back to host.
+    std::fill(dst.begin(), dst.end(), 0);
+    TF_ASSERT_OK(stream->Memcpy(dst.data(), updated_d, d_length));
+
+    ASSERT_EQ(dst, result);
+  };
+  std::thread t1(run_cublaslt_test, std::ref(stream1), a_arr_1, result_1);
+  std::thread t2(run_cublaslt_test, std::ref(stream2), a_arr_2, result_2);
+  t1.join();
+  t2.join();
+}
+
 TEST(CommandBufferThunkTest, MultipleLaunchCmd) {
   se::StreamExecutor* executor = GpuExecutor();
 
@@ -624,10 +888,10 @@ TEST(CommandBufferThunkTest, MultipleLaunchCmd) {
 
   // Prepare commands sequence for constructing command buffer.
   CommandBufferCmdSequence commands;
-  commands.Emplace<LaunchCmd>(s0, "add", args, args_access,
+  commands.Emplace<LaunchCmd>(s0, "AddI32", args, args_access,
                               LaunchDimensions(1, 4),
                               /*shmem_bytes=*/0);
-  commands.Emplace<LaunchCmd>(s0, "add", args_1, args_access,
+  commands.Emplace<LaunchCmd>(s0, "AddI32", args_1, args_access,
                               LaunchDimensions(1, 4),
                               /*shmem_bytes=*/0);
 
@@ -641,9 +905,10 @@ TEST(CommandBufferThunkTest, MultipleLaunchCmd) {
   Thunk::ExecuteParams params = Thunk::ExecuteParams::Create(
       run_options, allocations, stream.get(), stream.get(), nullptr, nullptr);
 
-  Thunk::ExecutableSource source = ExecutableSource();
+  TF_ASSERT_OK_AND_ASSIGN(OwningExecutableSource source, ExecutableSource());
   TF_ASSERT_OK(
-      thunk.Initialize({executor, source, &allocations, stream.get()}));
+      thunk.Initialize({executor, static_cast<Thunk::ExecutableSource>(source),
+                        &allocations, stream.get()}));
 
   // Execute command buffer thunk and verify that it added the value.
   TF_ASSERT_OK(thunk.ExecuteOnStream(params));
@@ -738,7 +1003,7 @@ TEST(CommandBufferThunkTest, IfCmd) {
 
   // Prepare commands sequence for `then` branch.
   CommandBufferCmdSequence then_commands;
-  then_commands.Emplace<LaunchCmd>(s0, "add", args, args_access,
+  then_commands.Emplace<LaunchCmd>(s0, "AddI32", args, args_access,
                                    LaunchDimensions(1, 4),
                                    /*shmem_bytes=*/0);
 
@@ -756,9 +1021,10 @@ TEST(CommandBufferThunkTest, IfCmd) {
   Thunk::ExecuteParams params = Thunk::ExecuteParams::Create(
       run_options, allocations, stream.get(), stream.get(), nullptr, nullptr);
 
-  Thunk::ExecutableSource source = ExecutableSource();
+  TF_ASSERT_OK_AND_ASSIGN(OwningExecutableSource source, ExecutableSource());
   TF_ASSERT_OK(
-      thunk.Initialize({executor, source, &allocations, stream.get()}));
+      thunk.Initialize({executor, static_cast<Thunk::ExecutableSource>(source),
+                        &allocations, stream.get()}));
 
   // Execute command buffer thunk and verify that it added the value.
   TF_ASSERT_OK(thunk.ExecuteOnStream(params));
@@ -828,14 +1094,14 @@ TEST(CommandBufferThunkTest, IfElseCmd) {
 
   {  // Then: b = a + a
     auto args = {slice_a, slice_a, slice_b};
-    then_commands.Emplace<LaunchCmd>(s0, "add", args, args_access,
+    then_commands.Emplace<LaunchCmd>(s0, "AddI32", args, args_access,
                                      LaunchDimensions(1, 4),
                                      /*shmem_bytes=*/0);
   }
 
   {  // Else: b = b + b
     auto args = {slice_b, slice_b, slice_b};
-    else_commands.Emplace<LaunchCmd>(s0, "add", args, args_access,
+    else_commands.Emplace<LaunchCmd>(s0, "AddI32", args, args_access,
                                      LaunchDimensions(1, 4),
                                      /*shmem_bytes=*/0);
   }
@@ -855,9 +1121,10 @@ TEST(CommandBufferThunkTest, IfElseCmd) {
   Thunk::ExecuteParams params = Thunk::ExecuteParams::Create(
       run_options, allocations, stream.get(), stream.get(), nullptr, nullptr);
 
-  Thunk::ExecutableSource source = ExecutableSource();
+  TF_ASSERT_OK_AND_ASSIGN(OwningExecutableSource source, ExecutableSource());
   TF_ASSERT_OK(
-      thunk.Initialize({executor, source, &allocations, stream.get()}));
+      thunk.Initialize({executor, static_cast<Thunk::ExecutableSource>(source),
+                        &allocations, stream.get()}));
 
   // Execute command buffer thunk and verify that it added the value.
   TF_ASSERT_OK(thunk.ExecuteOnStream(params));
@@ -918,14 +1185,14 @@ TEST(CommandBufferThunkTest, CaseCmd) {
 
   {  // Case 0: b = a + a
     auto args = {slice_a, slice_a, slice_b};
-    branches[0].Emplace<LaunchCmd>(s0, "add", args, args_access,
+    branches[0].Emplace<LaunchCmd>(s0, "AddI32", args, args_access,
                                    LaunchDimensions(1, 4),
                                    /*shmem_bytes=*/0);
   }
 
   {  // Case 1: b = b + b
     auto args = {slice_b, slice_b, slice_b};
-    branches[1].Emplace<LaunchCmd>(s0, "add", args, args_access,
+    branches[1].Emplace<LaunchCmd>(s0, "AddI32", args, args_access,
                                    LaunchDimensions(1, 4),
                                    /*shmem_bytes=*/0);
   }
@@ -944,9 +1211,10 @@ TEST(CommandBufferThunkTest, CaseCmd) {
   Thunk::ExecuteParams params = Thunk::ExecuteParams::Create(
       run_options, allocations, stream.get(), stream.get(), nullptr, nullptr);
 
-  Thunk::ExecutableSource source = ExecutableSource();
+  TF_ASSERT_OK_AND_ASSIGN(OwningExecutableSource source, ExecutableSource());
   TF_ASSERT_OK(
-      thunk.Initialize({executor, source, &allocations, stream.get()}));
+      thunk.Initialize({executor, static_cast<Thunk::ExecutableSource>(source),
+                        &allocations, stream.get()}));
 
   // Execute command buffer thunk and verify that it added the value.
   TF_ASSERT_OK(thunk.ExecuteOnStream(params));
@@ -1004,7 +1272,7 @@ TEST(CommandBufferThunkTest, ForCmd) {
 
   // Prepare commands sequence for loop `body`.
   CommandBufferCmdSequence body_commands;
-  body_commands.Emplace<LaunchCmd>(s0, "add", args, args_access,
+  body_commands.Emplace<LaunchCmd>(s0, "AddI32", args, args_access,
                                    LaunchDimensions(1, 4),
                                    /*shmem_bytes=*/0);
 
@@ -1023,9 +1291,10 @@ TEST(CommandBufferThunkTest, ForCmd) {
   Thunk::ExecuteParams params = Thunk::ExecuteParams::Create(
       run_options, allocations, stream.get(), stream.get(), nullptr, nullptr);
 
-  Thunk::ExecutableSource source = ExecutableSource();
+  TF_ASSERT_OK_AND_ASSIGN(OwningExecutableSource source, ExecutableSource());
   TF_ASSERT_OK(
-      thunk.Initialize({executor, source, &allocations, stream.get()}));
+      thunk.Initialize({executor, static_cast<Thunk::ExecutableSource>(source),
+                        &allocations, stream.get()}));
 
   // Execute command buffer thunk and verify that it added the value 10 times.
   TF_ASSERT_OK(thunk.ExecuteOnStream(params));

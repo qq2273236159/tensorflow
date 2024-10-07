@@ -37,7 +37,8 @@ TfLiteOperator* MakeOperator(const TfLiteRegistration* registration,
 
   auto* registration_external = TfLiteOperatorCreate(
       static_cast<TfLiteBuiltinOperator>(registration->builtin_code),
-      registration->custom_name, registration->version);
+      registration->custom_name, registration->version,
+      /*user_data=*/nullptr);
 
   registration_external->node_index = node_index;
 

@@ -15,6 +15,10 @@ limitations under the License.
 
 #include "xla/pjrt/cpu/cpu_client.h"
 
+#include "xla/service/hlo.pb.h"
+#include "xla/types.h"
+#include "xla/xla_data.pb.h"
+
 #ifndef _WIN32
 #include <unistd.h>
 #endif
@@ -30,10 +34,11 @@ limitations under the License.
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 #include "absl/status/status.h"
+#include "absl/strings/string_view.h"
 #include "absl/synchronization/notification.h"
-#include "xla/client/xla_computation.h"
 #include "xla/ffi/ffi.h"
 #include "xla/ffi/ffi_api.h"
+#include "xla/hlo/builder/xla_computation.h"
 #include "xla/literal.h"
 #include "xla/literal_util.h"
 #include "xla/pjrt/host_memory_spaces.h"
@@ -42,11 +47,10 @@ limitations under the License.
 #include "xla/service/hlo_parser.h"
 #include "xla/shape.h"
 #include "xla/shape_util.h"
-#include "xla/status.h"
 #include "xla/tests/literal_test_util.h"
 #include "xla/tests/test_utils.h"
+#include "xla/tsl/lib/core/status_test_util.h"
 #include "xla/util.h"
-#include "tsl/lib/core/status_test_util.h"
 #include "tsl/platform/env.h"
 #include "tsl/platform/errors.h"
 #include "tsl/platform/file_system.h"
@@ -64,16 +68,16 @@ using ::testing::HasSubstr;
 using ::testing::IsFalse;
 using ::tsl::testing::IsOkAndHolds;
 
-static absl::Status TestError(ffi::BufferBase, ffi::Result<ffi::BufferBase>,
-                              ffi::Result<ffi::BufferBase>) {
+static absl::Status TestError(ffi::AnyBuffer, ffi::Result<ffi::AnyBuffer>,
+                              ffi::Result<ffi::AnyBuffer>) {
   return absl::InternalError("test error.");
 }
 
 XLA_FFI_DEFINE_HANDLER(kTestError, TestError,
                        ffi::Ffi::Bind()
-                           .Arg<ffi::BufferBase>()  // in
-                           .Ret<ffi::BufferBase>()  // out0
-                           .Ret<ffi::BufferBase>()  // out1
+                           .Arg<ffi::AnyBuffer>()  // in
+                           .Ret<ffi::AnyBuffer>()  // out0
+                           .Ret<ffi::AnyBuffer>()  // out1
 );
 
 XLA_FFI_REGISTER_HANDLER(ffi::GetXlaFfiApi(), "__xla_test$$TestError", "Host",
@@ -96,7 +100,7 @@ TEST(TfrtCpuClientTest, MemorySpace) {
 }
 
 TEST(TfrtCpuClientTest, DonationWithExecutionError) {
-  constexpr char kProgram[] =
+  static constexpr char kProgram[] =
       R"(
 HloModule DonationWithExecutionError,
           input_output_alias={ {}: (0, {}, must-alias) }
@@ -131,17 +135,17 @@ ENTRY DonationWithExecutionError() -> f32[2, 2] {
   auto result = pjrt_executable->Execute(/*argument_handles=*/{{buffer.get()}},
                                          /*options=*/{});
   ASSERT_FALSE(result.ok());
-  EXPECT_THAT(result.status().message(), ::testing::HasSubstr("test error."));
+  EXPECT_THAT(result.status().message(), HasSubstr("test error."));
 
   result = pjrt_executable->Execute(/*argument_handles=*/{{buffer.get()}},
                                     /*options=*/{});
   ASSERT_FALSE(result.ok());
   EXPECT_THAT(result.status().message(),
-              ::testing::HasSubstr("buffer has been deleted or donated."));
+              HasSubstr("buffer has been deleted or donated."));
 }
 
 TEST(TfrtCpuClientTest, HloSnapshot) {
-  constexpr char kProgram[] = R"(
+  static constexpr char kProgram[] = R"(
     HloModule add
     ENTRY add {
       x = f32[3,2] parameter(0)
@@ -242,6 +246,34 @@ TEST(TfrtCpuClientTest, AsyncTransferLiteral) {
   TF_ASSERT_OK_AND_ASSIGN(auto received_literal, buffer->ToLiteralSync());
   EXPECT_THAT(received_literal->data<float>(),
               ElementsAreArray(literal.data<float>()));
+}
+
+TEST(TfrtCpuClientTest, AsyncTransferLiteralInt4) {
+  TF_ASSERT_OK_AND_ASSIGN(auto client, GetTfrtCpuClient(CpuClientOptions()));
+  xla::Shape shape = xla::ShapeUtil::MakeShape(S4, {128, 256});
+  TF_ASSERT_OK_AND_ASSIGN(auto transfer_manager,
+                          client->CreateBuffersForAsyncHostToDevice(
+                              {shape}, client->addressable_devices()[0]));
+  auto buffer = transfer_manager->RetrieveBuffer(0);
+  auto ready_future = buffer->GetReadyFuture();
+  EXPECT_THAT(ready_future.IsReady(), IsFalse());
+  TF_ASSERT_OK_AND_ASSIGN(auto literal, xla::MakeFakeLiteral(shape));
+  TF_ASSERT_OK(transfer_manager->TransferLiteralToBuffer(0, literal, []() {}));
+  TF_ASSERT_OK_AND_ASSIGN(auto received_literal, buffer->ToLiteralSync());
+  EXPECT_THAT(received_literal->data<s4>(),
+              ElementsAreArray(literal.data<s4>()));
+}
+
+TEST(TfrtCpuClientTest, BufferFromLiteralInt4) {
+  TF_ASSERT_OK_AND_ASSIGN(auto client, GetTfrtCpuClient(CpuClientOptions()));
+  xla::Shape shape = xla::ShapeUtil::MakeShape(S4, {128, 256});
+  TF_ASSERT_OK_AND_ASSIGN(auto literal, xla::MakeFakeLiteral(shape));
+  TF_ASSERT_OK_AND_ASSIGN(
+      auto buffer,
+      client->BufferFromHostLiteral(literal, client->addressable_devices()[0]));
+  TF_ASSERT_OK_AND_ASSIGN(auto received_literal, buffer->ToLiteralSync());
+  EXPECT_THAT(received_literal->data<s4>(),
+              ElementsAreArray(literal.data<s4>()));
 }
 
 TEST(TfrtCpuClientTest, AsyncTransferCallsOnDone) {
@@ -367,8 +399,8 @@ struct MemsetValue {
 static absl::Status MemsetFromValue(
     ffi::Result<ffi::BufferR1<PrimitiveType::F32>> result,
     MemsetValue* memset_value) {
-  for (size_t i = 0; i < result->dimensions.at(0); ++i) {
-    result->data.base()[i] = memset_value->value;
+  for (size_t i = 0; i < result->element_count(); ++i) {
+    result->typed_data()[i] = memset_value->value;
   }
   return absl::OkStatus();
 }

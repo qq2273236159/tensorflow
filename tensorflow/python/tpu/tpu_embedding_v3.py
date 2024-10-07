@@ -18,6 +18,7 @@ import collections
 import copy
 import dataclasses
 import functools
+import hashlib
 import operator
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
@@ -47,9 +48,11 @@ from tensorflow.python.ops import math_ops
 from tensorflow.python.ops import variable_scope
 from tensorflow.python.ops import variables as tf_variables
 from tensorflow.python.ops.ragged import ragged_tensor
-from tensorflow.python.tpu import _pywrap_tpu_embedding
+from tensorflow.python.tpu import _pywrap_sparse_core_layout
 from tensorflow.python.tpu import tpu_embedding_base
 from tensorflow.python.tpu import tpu_embedding_v2_utils
+from tensorflow.python.tpu import tpu_embedding_v3_checkpoint_adapter
+from tensorflow.python.tpu import tpu_embedding_v3_utils
 from tensorflow.python.tpu import tpu_replication
 from tensorflow.python.tpu.ops import gen_xla_ops as xla_ops
 from tensorflow.python.trackable import base
@@ -75,11 +78,13 @@ QuantizationConfig = tpu_embedding_v2_utils.QuantizationConfig
 class SparseCoreEmbeddingConfig:
   """Config for sparsecore embedding."""
 
-  disable_table_stacking: bool = True
+  disable_table_stacking: bool = False
   max_ids_per_chip_per_sample: int = 64
   max_ids_per_table: Optional[Dict[str, int]] = None
   max_unique_ids_per_table: Optional[Dict[str, int]] = None
   allow_id_dropping: bool = False
+  initialize_tables_on_host: bool = True
+  enable_fast_table_initialization: bool = False
 
 
 class EmbeddingPipeliningContext(control_flow_ops.ControlFlowContext):
@@ -334,140 +339,127 @@ def _stack_tables_with_same_table_dim_and_optimizer(
   if sparse_core_embedding_config:
     disable_table_stacking = sparse_core_embedding_config.disable_table_stacking
 
-  s = TableStacking()
-
-  # Round the table sizes to be divisible by the number of SCs.
-  num_shards = num_partitions * num_sc_per_partition * 8
-
-  s.table_to_padding_columns = {}
-  s.table_to_padding_rows = {}
-  table_name_to_table = {}
-  for table in table_config:
-    table_name_to_table[table.name] = table
-    extra_rows = (
-        num_shards - (table.vocabulary_size % num_shards)
-    ) % num_shards
-    extra_cols = (8 - (table.dim % 8)) % 8
-    if extra_rows != 0:
-      if table.vocabulary_size < num_shards:
-        logging.warning(
-            "!!! Adding %d extra rows to a small table %s!!! Table had"
-            " %d rows before padding and %d rows after padding.",
-            extra_rows,
-            table.name,
-            table.vocabulary_size,
-            table.vocabulary_size + extra_rows,
-        )
-      else:
-        logging.warning(
-            "Adding %d extra rows to table %s to get %d rows.",
-            extra_rows,
-            table.name,
-            table.vocabulary_size + extra_rows,
-        )
-    if extra_cols != 0:
-      logging.warning(
-          "Adding %d extra columns to table %s to get %d columns.",
-          extra_cols,
-          table.name,
-          table.dim + extra_cols,
-      )
-    s.table_to_padding_columns[table.name] = extra_cols
-    s.table_to_padding_rows[table.name] = extra_rows
-    table.vocabulary_size += extra_rows
-    table.dim += extra_cols
-
   if disable_table_stacking:
     logging.warn("Table stacking is disabled.")
-    table_stacks = [[table] for table in table_config]
-  else:
-    table_names = []
-    table_widths = []
-    table_heights = []
-    table_num_samples = []
-    table_groups = []
 
-    table_data_to_group = {}
-    table_to_num_samples = {table.name: 0 for table in table_config}
-    for _, feature in flat_features:
-      table_to_num_samples[feature.table.name] += functools.reduce(
+  stacker = _pywrap_sparse_core_layout.SparseCoreLayoutStacker(
+      num_partitions=num_partitions,
+      sparse_cores_per_partition=num_sc_per_partition,
+      disable_table_stacking=disable_table_stacking,
+  )
+  s = TableStacking()
+  s.table_name_to_table = {table.name: table for table in table_config}
+  table_to_num_samples = {table.name: 0 for table in table_config}
+  for _, feature in flat_features:
+    table_to_num_samples[feature.table.name] += functools.reduce(
+        operator.mul, feature.output_shape
+    )
+    # First generate stacking for any tables our caller didn't stack for us.
+    # Note that we process the tables sorted by name so the ordering is
+    # deterministic.
+    sorted_tables = sorted(table_config, key=lambda t: t.name)
+    for table in sorted_tables:
+      if not table.layout:
+        # All tables in a stack have to have the same hyperparemeters; this key
+        # contains everything we care about. The key is an arbitrary string
+        # whose value is not particularly meaningful except that it has to be
+        # different if the tables cannot be stacked together.
+        #
+        # Note that later we rewrite the stack name based on the tables in that
+        # stack; this is just a temporary initial name.
+        #
+        # The key does not need to include the embedding width; that is handled
+        # separately.
+        key_tuple = (
+            # Optimizers don't have a repr but do support hash.
+            hash(table.optimizer),
+            # Quantization configs don't have a hash but do support repr.
+            repr(table.quantization_config),
+        )
+        key_str = hashlib.sha1(
+            repr(key_tuple).encode(),
+            usedforsecurity=False,
+        ).hexdigest()
+        key = "_xxtpuv3internal_" + key_str
+        stacker.AddTable(
+            table_name=table.name,
+            table_height=table.vocabulary_size,
+            table_width=table.dim,
+            group=key,
+            output_samples=table_to_num_samples[table.name],
+        )
+    # First generate stacking for any tables our caller didn't stack for us.
+    # Note that we process the tables sorted by name so the ordering is
+    # deterministic.
+    # Put the layout information we just computed back into the tables, so we
+    # can treat tables whose layouts were given by the caller and tables whose
+    # layouts we computed the same.
+    for layout in stacker.GetLayouts().tables:
+      table = s.table_name_to_table[layout.table_name]
+      assert not table.layout  # It's a bug if it was already set.
+      table.layout = layout
+
+    # Collect all the layout information from all the tables, whether we just
+    # computed it above, or whether the caller passed it as part of the
+    # TableConfig:
+    tables_by_stack = collections.defaultdict(list)
+    for table in sorted_tables:
+      layout = table.layout
+      assert layout.table_name == table.name
+      s.table_to_layout[table.name] = layout
+      tables_by_stack[layout.stacked_table_name].append(table)
+
+    for stack_name, tables in tables_by_stack.items():
+      s.quantization_configs[stack_name] = tables[0].quantization_config
+      s.stacked_table_to_tables[stack_name] = tables
+
+      logging.vlog(1, "Stacked table name: %s", stack_name)
+      for table in tables:
+        layout = table.layout
+        logging.vlog(
+            1,
+            "  Table %s: offset %d, rotation %d",
+            table.name,
+            layout.sparse_core_shard_row_offset,
+            layout.sparse_core_shard_rotation,
+        )
+        s.table_to_stacked_table_offset[table.name] = (
+            stack_name,
+            layout.sparse_core_shard_row_offset
+            * num_partitions
+            * num_sc_per_partition,
+            layout.sparse_core_shard_rotation,
+        )
+        # Update dimensions in the table to the padded dimensions.
+        table.vocabulary_size = layout.unsharded_padded_shape[0]
+        table.dim = layout.unsharded_padded_shape[1]
+        s.table_to_padding_rows[table.name] = (
+            layout.unsharded_padded_shape[0] - layout.unsharded_shape[0]
+        )
+        s.table_to_padding_columns[table.name] = (
+            layout.unsharded_padded_shape[1] - layout.unsharded_shape[1]
+        )
+
+    logging.info(
+        "Number of tables after stacking is %d.",
+        len(s.stacked_table_to_tables),
+    )
+
+    s.table_to_sample_count = {
+        table_name: 0 for table_name in s.stacked_table_to_tables
+    }
+    for feature_path, feature in flat_features:
+      stacked_table_name = s.table_to_stacked_table_offset[feature.table.name][
+          0
+      ]
+      s.feature_to_sample_offset[feature_path] = s.table_to_sample_count[
+          stacked_table_name
+      ]
+      s.table_to_sample_count[stacked_table_name] += functools.reduce(
           operator.mul, feature.output_shape
       )
 
-    for table in table_config:
-      key = (
-          table.dim,
-          table.optimizer,
-          repr(table.quantization_config)
-          if table.quantization_config
-          else None,
-      )
-      if key not in table_data_to_group:
-        table_data_to_group[key] = len(table_data_to_group)
-      table_groups.append(table_data_to_group[key])
-      table_names.append(table.name)
-      table_widths.append(table.dim)
-      table_heights.append(table.vocabulary_size)
-      table_num_samples.append(table_to_num_samples[table.name])
-
-    table_stacks_by_name = _pywrap_tpu_embedding.stack_tables(
-        table_heights,
-        table_widths,
-        table_num_samples,
-        table_groups,
-        table_names,
-        num_partitions,
-    )
-
-    table_stacks = [
-        [table_name_to_table[table_name] for table_name in stack_by_name]
-        for stack_by_name in table_stacks_by_name
-    ]
-
-  s.table_name_to_table = table_name_to_table
-  # Store the mapping between stacked table names to the actual tableConfigs.
-  s.stacked_table_to_tables = {}
-  # Store the mapping between table to name of the stacked table which
-  # contains the table and its offset.
-  s.table_to_stacked_table_offset = {}
-  # Save Quantization Config per stacked tables
-  s.quantization_configs = {}
-  for tables in table_stacks:
-    stacked_table_name = "_".join(map(lambda table: table.name, tables))
-    if stacked_table_name in s.stacked_table_to_tables:
-      raise ValueError(f"{stacked_table_name} already exists!")
-    s.stacked_table_to_tables[stacked_table_name] = tables
-    s.quantization_configs[stacked_table_name] = tables[0].quantization_config
-
-    current_offset = 0
-    current_index = 0
-    for table in tables:
-      s.table_to_stacked_table_offset[table.name] = (
-          stacked_table_name,
-          current_offset,
-          num_sc_per_partition * current_index,
-      )
-      current_offset += table.vocabulary_size
-      current_index += 1
-
-  logging.info(
-      "Number of tables after stacking is %d.",
-      len(s.stacked_table_to_tables),
-  )
-
-  s.feature_to_sample_offset = {}
-  s.table_to_sample_count = {
-      table_name: 0 for table_name in s.stacked_table_to_tables
-  }
-  for feature_path, feature in flat_features:
-    stacked_table_name = s.table_to_stacked_table_offset[feature.table.name][0]
-    s.feature_to_sample_offset[feature_path] = s.table_to_sample_count[
-        stacked_table_name
-    ]
-    s.table_to_sample_count[stacked_table_name] += functools.reduce(
-        operator.mul, feature.output_shape
-    )
-  return s
+    return s
 
 
 # TODO(b/233952762): Add tests of this version of the mid-level API.
@@ -593,6 +585,119 @@ class TPUEmbeddingV2(tpu_embedding_base.TPUEmbeddingBase):
 
     self._pipelining = pipeline_execution_with_tensor_core
 
+  def _compute_sc_shard_info(
+      self,
+      table: TableConfig,
+      partition_shape: tuple[int, int],
+      partition_offset: List[int],
+      total_vocab_size: int,
+      sc_idx: int,
+  ) -> base.ShardInfo:
+    # Scale the partition to get sizes for the current table,
+    # then select this sc shard.
+    sc_shard_size = (
+        table.vocabulary_size
+        * partition_shape[0]
+        // total_vocab_size
+        // self._num_sc_per_chip
+    )
+    sc_shard_offset = (
+        table.vocabulary_size
+        * partition_offset[0]
+        // total_vocab_size
+    ) + sc_idx * sc_shard_size
+
+    return base.ShardInfo([sc_shard_size, table.dim], [sc_shard_offset, 0])
+
+  def _compute_sc_shard_idx_and_offset(
+      self,
+      table_name: str,
+      shard_info: base.ShardInfo
+  ) -> tuple[int, int]:
+    tpu_devices = self._strategy.extended._tpu_devices  # pylint:disable=protected-access
+    num_replicas, num_cores_per_replica = tpu_devices.shape
+    num_devices = num_replicas * num_cores_per_replica
+
+    shift = self._s.table_to_stacked_table_offset[table_name][2]
+    shard_index = shard_info.offset[0] // shard_info.shape[0]
+    # Rotate the shards.
+    shard_index = (shard_index - shift) % self._num_sc_shards
+    num_sc = num_devices * self._num_sc_per_chip
+
+    return shard_index, num_sc
+
+  def _host_table_initializer(
+      self,
+      stacked_tables: List[TableConfig],
+      total_vocab_size: int,
+      partition_shape: tuple[int, int],
+      dtype: dtypes.DType,
+  ) -> Dict[int, List[Dict[str, tensor.Tensor]]]:
+    cpu_table_tensors = {}
+
+    tpu_devices = self._strategy.extended._tpu_devices  # pylint:disable=protected-access
+    num_replicas, num_cores_per_replica = tpu_devices.shape
+    num_devices = num_replicas * num_cores_per_replica
+
+    partition_shape = (partition_shape[0] // num_devices, partition_shape[1])
+    partition_offset = [0] * len(partition_shape)
+
+    for rid in range(num_replicas):
+      for cid in range(num_cores_per_replica):
+        device_cpu = (
+            tf_device.DeviceSpec.from_string(tpu_devices[rid][cid])
+            .replace(device_type="CPU", device_index=0)
+            .to_string()
+        )
+
+        shard_dim_offset = (
+            (rid * num_cores_per_replica) + cid
+        ) * partition_shape[0]
+        cpu_table_tensors[shard_dim_offset] = []
+
+        for i in range(self._num_sc_per_chip):
+          # Each underlying table has column lookups rotated by 1 to avoid hot
+          # spots on core 0 for id=0. We shift the initializer as well to help
+          # with comparisons against CPU.
+          full_tables = {}
+          cpu_table_tensors[shard_dim_offset].append({})
+          for table in stacked_tables:
+            arg_spec = tf_inspect.getfullargspec(table.initializer)
+            sharding_aware = (
+                "shard_info" in arg_spec.args
+                or "shard_info" in arg_spec.kwonlyargs
+            )
+
+            if (
+                self._sparse_core_embedding_config.initialize_tables_on_host
+                and not sharding_aware
+            ):
+              # When the user-initializer is not sharding aware but includes
+              # shard info, we pre-construct the full initial table on the host
+              # and then slice out the individual shards.
+              partition_offset[0] = shard_dim_offset
+              sc_shard_info = self._compute_sc_shard_info(
+                  table,
+                  partition_shape,
+                  partition_offset,
+                  total_vocab_size,
+                  i,
+              )
+              shard_index, shard_offset = self._compute_sc_shard_idx_and_offset(
+                  table.name, sc_shard_info
+              )
+
+              with ops.device(device_cpu):
+                if table.name not in full_tables:
+                  full_tables[table.name] = table.initializer(
+                      shape=(table.vocabulary_size, table.dim),
+                      dtype=dtype,
+                  )
+                sc_shard = full_tables[table.name][shard_index::shard_offset, :]
+                cpu_table_tensors[shard_dim_offset][i][table.name] = sc_shard
+
+    return cpu_table_tensors
+
   def _update_sparse_core_buffer_size_after_table_stacking(self):
     """Update the sparse core buffer size after table stacking."""
     for table_name in self._stacked_table_to_tables:
@@ -669,6 +774,17 @@ class TPUEmbeddingV2(tpu_embedding_base.TPUEmbeddingBase):
     return table_shards
 
   @property
+  def embedding_layouts(
+      self,
+  ) -> Dict[str, sparse_core_layout_pb2.SparseCoreTableLayout]:
+    """Returns how the tables are laid out in the variables.
+
+    The SparseCoreTableLayout describes how a table is stored in its internal
+    state. You need this only if you need to pull apart the internal state.
+    """
+    return self._s.table_to_layout
+
+  @property
   def variables(
       self,
   ) -> Dict[
@@ -687,11 +803,27 @@ class TPUEmbeddingV2(tpu_embedding_base.TPUEmbeddingBase):
     total_vocab_size = sum([table.vocabulary_size for table in stacked_tables])
     table_dim = stacked_tables[0].dim
     variable_shape = (total_vocab_size, table_dim)
+    variable_dtype = dtypes.float32
     optimizer = stacked_tables[0].optimizer
 
+    # Compute those table shards early on host that might otherwise saturate
+    # device HBM from needing to initialize full embedding tables.
+    host_table_tensors = self._host_table_initializer(
+        stacked_tables, total_vocab_size, variable_shape, variable_dtype,
+    )
+
     def table_initialize_fn(shape, dtype, shard_info=None):
+      # If enable fast table initialization, we will initialize the table
+      # directly on the device and use the initializer from the first table.
+      if self._sparse_core_embedding_config.enable_fast_table_initialization:
+        return stacked_tables[0].initializer(
+            shape=(shard_info.shape[0], stacked_tables[0].dim),
+            dtype=dtype,
+        )
+
       # Concat all the tables along the first axis.
-      table_tensors = []
+      concat_tensors = []
+
       # Temporary patch, we need to initialize tables with the SC level
       # sharding. Note that we need to ensure that the vocab size is divisible
       # by the global number of SC.
@@ -699,57 +831,45 @@ class TPUEmbeddingV2(tpu_embedding_base.TPUEmbeddingBase):
         # Each underlying table has column lookups rotated by 1 to avoid hot
         # spots on core 0 for id=0. We shift the initializer as well to help
         # with comparisons against CPU.
-        full_tables = {}
         for table in stacked_tables:
-          shift = self._table_to_stacked_table_offset[table.name][2]
           arg_spec = tf_inspect.getfullargspec(table.initializer)
           sharding_aware = (
               "shard_info" in arg_spec.args
               or "shard_info" in arg_spec.kwonlyargs
           )
 
-          # If the user-initializer is not sharding aware, use it to construct
-          # the full initial table and then slice out the individual shards.
-          if shard_info and not sharding_aware:
-            if table.name not in full_tables:
-              full_tables[table.name] = table.initializer(
-                  shape=(table.vocabulary_size, table.dim),
-                  dtype=dtype,
-              )
-          if shard_info is not None:
-            # A partition contains all of the tables.
-            partition_shape = shard_info.shape
-            partition_offset = shard_info.offset
-            # Scale the partition to get sizes for the current table,
-            # then select this sc shard.
-            sc_shard_size = (
-                table.vocabulary_size
-                * partition_shape[0]
-                // total_vocab_size
-                // self._num_sc_per_chip
+          if shard_info:
+            sc_shard_info = self._compute_sc_shard_info(
+                table,
+                shard_info.shape,
+                shard_info.offset,
+                total_vocab_size,
+                i,
             )
-            sc_shard_offset = (
-                table.vocabulary_size * partition_offset[0] // total_vocab_size
-            ) + i * sc_shard_size
-            sc_shard_info = base.ShardInfo(
-                [sc_shard_size, table.dim], [sc_shard_offset, 0]
-            )
-            if sharding_aware:
+            if not sharding_aware:
+              if (
+                  host_table_tensors
+                  and table.name in host_table_tensors[shard_info.offset[0]][i]
+              ):
+                sc_shard = host_table_tensors[shard_info.offset[0]][i][
+                    table.name
+                ]
+              else:
+                shard_index, shard_offset = (
+                    self._compute_sc_shard_idx_and_offset(
+                        table.name, sc_shard_info
+                    )
+                )
+                sc_shard = table.initializer(
+                    shape=(table.vocabulary_size, table.dim), dtype=dtype
+                )[shard_index::shard_offset, :]
+
+            else:
               sc_shard = table.initializer(
                   shape=(table.vocabulary_size, table.dim),
                   dtype=dtype,
                   shard_info=sc_shard_info,
               )
-            else:
-              shard_index = sc_shard_info.offset[0] // sc_shard_info.shape[0]
-              # Rotate the shards.
-              shard_index = (shard_index - shift) % self._num_sc_shards
-              tpu_devices = self._strategy.extended._tpu_devices  # pylint:disable=protected-access
-              num_replicas, num_cores_per_replica = tpu_devices.shape
-              num_sc = (
-                  num_replicas * num_cores_per_replica * self._num_sc_per_chip
-              )
-              sc_shard = full_tables[table.name][shard_index::num_sc, :]
           else:
             sc_shard = table.initializer(
                 shape=(
@@ -760,8 +880,8 @@ class TPUEmbeddingV2(tpu_embedding_base.TPUEmbeddingBase):
                 ),
                 dtype=dtype,
             )
-          table_tensors.append(sc_shard)
-      return array_ops.concat(table_tensors, axis=0)
+          concat_tensors.append(sc_shard)
+      return array_ops.concat(concat_tensors, axis=0)
 
     def getter(name, shape, dtype, initializer, trainable):
       del shape
@@ -786,7 +906,7 @@ class TPUEmbeddingV2(tpu_embedding_base.TPUEmbeddingBase):
           name=name,
           initializer=initializer,
           shape=variable_shape,
-          dtype=dtypes.float32,
+          dtype=variable_dtype,
           getter=getter,
           trainable=False,
       )
@@ -825,6 +945,28 @@ class TPUEmbeddingV2(tpu_embedding_base.TPUEmbeddingBase):
       )
     return variables
 
+  def _track_restore_info_for_cpu(self) -> None:
+    layouts = sparse_core_layout_pb2.SparseCoreTableLayouts()
+    layouts.tables.extend(self.embedding_layouts.values())
+    logging.info(
+        "Saving sparse core layouts for %s tables", len(layouts.tables)
+    )
+    with ops.device("/cpu:0"):
+      self._track_trackable(
+          tpu_embedding_v3_utils.SparseCoreLayoutsTrackable(
+              constant_op.constant(
+                  layouts.SerializeToString(), dtype=dtypes.string
+              )
+          ),
+          tpu_embedding_v3_utils.SPARSECORE_LAYOUTS_CHECKPOINT_KEY,
+      )
+
+  def _checkpoint_adapter(self, path):
+    # The TPUEmbedding may need to reshard checkpoint values during restore.
+    return tpu_embedding_v3_checkpoint_adapter.TpuEmbeddingV3CheckpointAdapter.create_from_checkpoint(
+        path
+    )
+
   def _maybe_build(self):
     if not self._built:
       # This can be called while tracing a function, so we wrap the
@@ -840,6 +982,7 @@ class TPUEmbeddingV2(tpu_embedding_base.TPUEmbeddingBase):
     if self._built:
       return
     self._variables = self._create_variables_and_slots()
+    self._track_restore_info_for_cpu()
     self._built = True
 
   def apply_gradients(

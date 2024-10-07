@@ -22,6 +22,7 @@
 #include <optional>
 #include <string>
 #include <utility>
+#include <variant>
 #include <vector>
 
 #include "absl/base/thread_annotations.h"
@@ -34,16 +35,17 @@
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
+#include "absl/strings/str_join.h"
 #include "absl/strings/string_view.h"
 #include "absl/synchronization/mutex.h"
 #include "absl/types/span.h"
 #include "llvm/Support/Casting.h"
 #include "xla/layout.h"
-#include "xla/pjrt/pjrt_client.h"
 #include "xla/pjrt/pjrt_layout.h"
 #include "xla/python/ifrt/array.h"
 #include "xla/python/ifrt/compiler.h"
 #include "xla/python/ifrt/device.h"
+#include "xla/python/ifrt/device_list.h"
 #include "xla/python/ifrt/dtype.h"
 #include "xla/python/ifrt/executable.h"
 #include "xla/python/ifrt/future.h"
@@ -55,6 +57,7 @@
 #include "xla/python/ifrt/serdes.h"
 #include "xla/python/ifrt/shape.h"
 #include "xla/python/ifrt/sharding.h"
+#include "xla/python/ifrt/value.h"
 #include "xla/python/ifrt_proxy/common/array_util.h"
 #include "xla/python/ifrt_proxy/common/ifrt_service.pb.h"
 #include "xla/python/ifrt_proxy/common/proto_util.h"
@@ -78,7 +81,7 @@ namespace ifrt {
 namespace proxy {
 
 IfrtBackend::IfrtBackend(IfrtProxyVersion version, uint64_t session_id,
-                         std::unique_ptr<xla::ifrt::Client> ifrt_client,
+                         std::shared_ptr<xla::ifrt::Client> ifrt_client,
                          std::shared_ptr<HostBufferStore> host_buffer_store)
     : version_(std::move(version)),
       session_id_(session_id),
@@ -99,7 +102,7 @@ IfrtBackend::IfrtBackend(IfrtProxyVersion version, uint64_t session_id,
 
 absl::StatusOr<std::unique_ptr<IfrtBackend>> IfrtBackend::Create(
     IfrtProxyVersion version, uint64_t session_id,
-    std::unique_ptr<xla::ifrt::Client> ifrt_client,
+    std::shared_ptr<xla::ifrt::Client> ifrt_client,
     std::shared_ptr<HostBufferStore> host_buffer_store) {
   if (ifrt_client == nullptr) {
     return absl::InvalidArgumentError("ifrt_client cannot be a nullptr.");
@@ -164,8 +167,10 @@ Future<BackendInterface::Response> IfrtBackend::Process(
     case IfrtRequest::RequestCase::kDisassembleIntoSingleDeviceArraysRequest:
       return Future<Response>(
           HandleDisassembleIntoSingleDeviceArraysRequest(std::move(request)));
-    case IfrtRequest::RequestCase::kCheckArrayReadyRequest:
-      return Future<Response>(HandleCheckArrayReadyRequest(std::move(request)));
+    case IfrtRequest::RequestCase::kCheckValueReadyRequest:
+      return Future<Response>(HandleCheckValueReadyRequest(std::move(request)));
+    case IfrtRequest::RequestCase::kCopyArraysRequest:
+      return Future<Response>(HandleCopyArraysRequest(std::move(request)));
     case IfrtRequest::RequestCase::kReshardRequest:
       return Future<Response>(HandleReshardRequest(std::move(request)));
     case IfrtRequest::RequestCase::kFullyReplicatedShardRequest:
@@ -202,6 +207,8 @@ Future<BackendInterface::Response> IfrtBackend::Process(
       return Future<Response>(
           HandleGetDefaultDeviceAssignmentRequest(std::move(request)));
     default:
+      LOG(ERROR) << "Got unimplemented request type: "
+                 << request->DebugString();
       return Future<Response>(absl::UnimplementedError(absl::StrCat(
           "Got unimplemented request type: ", request->request_case())));
   }
@@ -259,8 +266,14 @@ absl::StatusOr<BackendInterface::Response> IfrtBackend::HandleInit(
   init_resp->set_runtime_type(AsProtoStringData(client_->runtime_type()));
   init_resp->set_process_index(client_->process_index());
 
-  for (auto* device : client_->devices()) {
-    InitResponse::Device* d = init_resp->add_devices();
+  absl::Span<xla::ifrt::Device* const> all_devices;
+  if (version_.protocol_version() < 7) {
+    all_devices = client_->devices();
+  } else {
+    all_devices = client_->GetAllDevices();
+  }
+  for (auto* device : all_devices) {
+    InitResponse::Device* d = init_resp->add_all_devices();
     d->set_id(device->Id().value());
     d->set_device_kind(AsProtoStringData(device->Kind()));
     if (auto default_memory = device->DefaultMemory(); default_memory.ok()) {
@@ -271,17 +284,28 @@ absl::StatusOr<BackendInterface::Response> IfrtBackend::HandleInit(
     }
     d->set_debug_string(AsProtoStringData(device->DebugString()));
     d->set_to_string(AsProtoStringData(device->ToString()));
-    for (const auto& [name, attr] : device->Attributes()) {
-      TF_ASSIGN_OR_RETURN((*d->mutable_attributes())[name],
-                          ToVariantProto(attr));
+    if (version_.protocol_version() <= 3) {
+      for (const auto& [name, attr] : device->Attributes().map()) {
+        TF_ASSIGN_OR_RETURN(
+            (*d->mutable_deprecated_attributes())[name],
+            std::visit(
+                [&](const auto& attr) { return ToVariantProto(attr.value); },
+                attr));
+      }
+    } else {
+      *d->mutable_attributes() = device->Attributes().ToProto();
+    }
+
+    if (device->IsAddressable()) {
+      init_resp->add_addressable_device_ids(device->Id().value());
     }
   }
-  for (auto* addressable_device : client_->addressable_devices()) {
-    init_resp->add_addressable_device_ids(addressable_device->Id().value());
+  for (auto* device : client_->devices()) {
+    init_resp->add_primary_device_ids(device->Id().value());
   }
 
   absl::flat_hash_map<int, xla::ifrt::Memory*> memories;
-  for (auto* device : client_->devices()) {
+  for (auto* device : all_devices) {
     for (xla::ifrt::Memory* memory : device->Memories()) {
       const auto [it, inserted] =
           memories.insert({memory->Id().value(), memory});
@@ -338,6 +362,41 @@ Future<BackendInterface::Response> IfrtBackend::HandleCheckFutureRequest(
   });
 
   return Future<BackendInterface::Response>(std::move(promise));
+}
+
+Future<BackendInterface::Response> IfrtBackend::HandleCheckValueReadyRequest(
+    std::unique_ptr<IfrtRequest> request) {
+  std::vector<tsl::RCReference<xla::ifrt::Value>> values;
+  values.reserve(request->check_value_ready_request().value_handles_size());
+  for (const auto& value_handle :
+       request->check_value_ready_request().value_handles()) {
+    // TODO(b/261991179): IFRT Proxy currently supports Arrays as the only value
+    // type, but this may be extended later to other types such as Tuples.
+    auto array = GetArray(value_handle);
+    if (!array.ok()) {
+      return Future<Response>(array.status());
+    }
+    values.push_back(*std::move(array));
+  }
+
+  auto ifrt_response_promise =
+      Future<BackendInterface::Response>::CreatePromise();
+  Future<BackendInterface::Response> ifrt_response_future(
+      ifrt_response_promise);
+
+  client_->GetReadyFuture(values).OnReady(
+      [op_id = request->request_metadata().op_id(),
+       promise = std::move(ifrt_response_promise)](
+          absl::Status status) mutable -> void {
+        if (!status.ok()) {
+          promise.Set(std::move(status));
+          return;
+        }
+        auto ifrt_response = NewIfrtResponse(op_id);
+        ifrt_response->mutable_check_value_ready_response();
+        promise.Set(std::move(ifrt_response));
+      });
+  return ifrt_response_future;
 }
 
 absl::StatusOr<BackendInterface::Response>
@@ -594,31 +653,57 @@ IfrtBackend::HandleDisassembleIntoSingleDeviceArraysRequest(
   return response;
 }
 
-Future<BackendInterface::Response> IfrtBackend::HandleCheckArrayReadyRequest(
+absl::StatusOr<BackendInterface::Response> IfrtBackend::HandleCopyArraysRequest(
     std::unique_ptr<IfrtRequest> request) {
-  auto array = GetArray(request->check_array_ready_request().array_handle());
-  if (!array.ok()) {
-    return Future<Response>(array.status());
+  const auto& copy_arrays_request = request->copy_arrays_request();
+
+  std::vector<tsl::RCReference<xla::ifrt::Array>> arrays;
+  arrays.reserve(copy_arrays_request.array_handles_size());
+  for (const auto& handle : copy_arrays_request.array_handles()) {
+    TF_ASSIGN_OR_RETURN(arrays.emplace_back(), GetArray(handle));
+  }
+  std::optional<tsl::RCReference<DeviceList>> devices;
+  if (!copy_arrays_request.device_ids().empty()) {
+    BasicDeviceList::Devices ds;
+    for (const auto& device_id : copy_arrays_request.device_ids()) {
+      TF_ASSIGN_OR_RETURN(ds.emplace_back(),
+                          client_->LookupDevice(DeviceId(device_id)));
+    }
+    devices.emplace(BasicDeviceList::Create(std::move(ds)));
+  }
+  std::optional<MemoryKind> memory_kind;
+  if (copy_arrays_request.has_memory_kind()) {
+    if (const absl::string_view m = copy_arrays_request.memory_kind();
+        !m.empty()) {
+      memory_kind.emplace(MemoryKind(m));
+    } else {
+      memory_kind.emplace(MemoryKind());
+    }
+  }
+  TF_ASSIGN_OR_RETURN(
+      auto semantics,
+      FromArrayCopySemanticsProto(copy_arrays_request.copy_semantics()));
+
+  TF_ASSIGN_OR_RETURN(
+      auto new_arrays,
+      client_->CopyArrays(absl::MakeSpan(arrays), std::move(devices),
+                          memory_kind, semantics));
+
+  std::unique_ptr<IfrtResponse> ifrt_resp =
+      NewIfrtResponse(request->request_metadata().op_id());
+  auto* const copy_arrays_resp = ifrt_resp->mutable_copy_arrays_response();
+
+  std::vector<uint64_t> new_handles(new_arrays.size());
+  handle_generator_.BulkNew(absl::MakeSpan(new_handles));
+  {
+    absl::MutexLock lock(&arrays_mutex_);
+    for (int i = 0; i < new_arrays.size(); ++i) {
+      arrays_.insert({new_handles[i], new_arrays[i]});
+      copy_arrays_resp->add_array_handles(new_handles[i]);
+    }
   }
 
-  auto ifrt_response_promise =
-      Future<BackendInterface::Response>::CreatePromise();
-  Future<BackendInterface::Response> ifrt_response_future(
-      ifrt_response_promise);
-
-  (*array)->GetReadyFuture().OnReady(
-      [op_id = request->request_metadata().op_id(),
-       promise = std::move(ifrt_response_promise)](
-          absl::Status status) mutable -> void {
-        if (!status.ok()) {
-          promise.Set(std::move(status));
-          return;
-        }
-        auto ifrt_response = NewIfrtResponse(op_id);
-        ifrt_response->mutable_check_array_ready_response();
-        promise.Set(std::move(ifrt_response));
-      });
-  return ifrt_response_future;
+  return ifrt_resp;
 }
 
 absl::StatusOr<BackendInterface::Response> IfrtBackend::HandleReshardRequest(
@@ -633,13 +718,24 @@ absl::StatusOr<BackendInterface::Response> IfrtBackend::HandleReshardRequest(
   TF_ASSIGN_OR_RETURN(auto semantics, FromArrayCopySemanticsProto(
                                           reshard_request.copy_semantics()));
 
-  TF_ASSIGN_OR_RETURN(auto resharded_array,
-                      array->Reshard(sharding, semantics));
+  // Emulate the old `Array::Reshard` behavior using `Client::CopyArrays`. No
+  // existing IFRT implementations before `Array::Reshard` was deleted actually
+  // supported resharding, so this should be safe.
+  if (!array->sharding().HasSamePartitioning(*sharding)) {
+    return absl::InvalidArgumentError(absl::StrCat(
+        "IFRT Proxy does not support resharding, but got ",
+        array->sharding().DebugString(), " as the original sharding and ",
+        sharding->DebugString(), " as the target sharding"));
+  }
+  TF_ASSIGN_OR_RETURN(
+      auto copied_arrays,
+      client_->CopyArrays(absl::MakeSpan(&array, 1), sharding->devices(),
+                          sharding->memory_kind(), semantics));
 
   uint64_t resharded_array_handle = handle_generator_.New();
   {
     absl::MutexLock lock(&arrays_mutex_);
-    arrays_.insert({resharded_array_handle, std::move(resharded_array)});
+    arrays_.insert({resharded_array_handle, std::move(copied_arrays[0])});
   }
 
   auto ifrt_resp = NewIfrtResponse(request->request_metadata().op_id());
@@ -681,14 +777,32 @@ IfrtBackend::HandleFullyReplicatedShardRequest(
 
 absl::StatusOr<BackendInterface::Response>
 IfrtBackend::HandleDeleteArrayRequest(std::unique_ptr<IfrtRequest> request) {
-  TF_ASSIGN_OR_RETURN(auto array,
-                      GetArray(request->delete_array_request().array_handle()));
+  std::vector<uint64_t> bad_handles;
+  std::vector<Future<>> deletion_futures;
 
-  auto deletion_future = array->Delete();
+  auto delete_handle = [&](uint64_t handle) {
+    auto array = GetArray(handle);
+    if (array.ok()) {
+      deletion_futures.push_back(array.value()->Delete());
+    } else {
+      deletion_futures.push_back(Future<>(array.status()));
+    }
+  };
+
+  if (request->delete_array_request().has_array_handle_deprecated()) {
+    // TODO(b/296144873): After removing array_handle_deprecated(), move
+    // delete_handle's definition to the single place it is used.
+    delete_handle(request->delete_array_request().array_handle_deprecated());
+  }
+
+  for (auto array_handle : request->delete_array_request().array_handle()) {
+    delete_handle(array_handle);
+  }
+
   uint64_t future_handle = handle_generator_.New();
   {
     absl::MutexLock lock(&futures_mutex_);
-    futures_.insert({future_handle, std::move(deletion_future)});
+    futures_.insert({future_handle, JoinFutures(deletion_futures)});
   }
 
   auto ifrt_resp = NewIfrtResponse(request->request_metadata().op_id());
@@ -710,16 +824,30 @@ IfrtBackend::HandleIsArrayDeletedRequest(std::unique_ptr<IfrtRequest> request) {
 
 absl::StatusOr<BackendInterface::Response>
 IfrtBackend::HandleDestructArrayRequest(std::unique_ptr<IfrtRequest> request) {
+  std::vector<uint64_t> bad_handles;
   {
     absl::MutexLock lock(&arrays_mutex_);
-    bool deleted =
-        arrays_.erase(request->destruct_array_request().array_handle());
-    if (!deleted) {
-      return absl::NotFoundError(
-          absl::StrCat("Unknown array handle: ",
-                       request->destruct_array_request().array_handle()));
+    for (const uint64_t array_handle :
+         request->destruct_array_request().array_handle()) {
+      if (!arrays_.erase(array_handle)) {
+        bad_handles.push_back(array_handle);
+      }
+    }
+
+    if (request->destruct_array_request().has_array_handle_deprecated()) {
+      const uint64_t array_handle =
+          request->destruct_array_request().array_handle_deprecated();
+      if (!arrays_.erase(array_handle)) {
+        bad_handles.push_back(array_handle);
+      }
     }
   }
+
+  if (!bad_handles.empty()) {
+    return absl::NotFoundError(absl::StrCat("Unknown array handle(s): ",
+                                            absl::StrJoin(bad_handles, ",")));
+  }
+
   auto ifrt_resp = NewIfrtResponse(request->request_metadata().op_id());
 
   // Currently DestructArrayResponse is an empty message, but proxy clients may
@@ -796,13 +924,6 @@ Future<BackendInterface::Response> IfrtBackend::HandleCompileRequest(
     // Populate executable metadata.
     compile_resp->set_name(AsProtoStringData(executable->name()));
     compile_resp->set_num_devices(executable->num_devices());
-    for (const auto& logical_device_id :
-         executable->addressable_device_logical_ids()) {
-      LogicalDeviceIds* proto =
-          compile_resp->add_addressable_device_logical_ids();
-      proto->set_replica(logical_device_id.replica);
-      proto->set_partition(logical_device_id.partition);
-    }
     for (const auto* device : executable->addressable_devices()) {
       compile_resp->add_addressable_device_ids(device->Id().value());
     }
@@ -947,16 +1068,22 @@ IfrtBackend::HandleLoadedExecutableExecuteRequest(
   TF_ASSIGN_OR_RETURN(auto execute_options,
                       xla::ifrt::LoadedExecutable::ExecuteOptions::FromProto(
                           execute.execute_options()));
+  // Force the old behavior where `fill_status` was implicitly true before
+  // protocol version 6. Can be cleaned up once version 6 is outside the
+  // compatibility window.
+  if (version_.protocol_version() < 6) {
+    execute_options.fill_status = true;
+  }
 
-  std::optional<DeviceList> devices;
+  std::optional<tsl::RCReference<DeviceList>> devices;
   if (!execute.device_ids().empty()) {
-    DeviceList::Devices d;
+    BasicDeviceList::Devices d;
     d.reserve(execute.device_ids_size());
     for (const int32_t device_id : execute.device_ids()) {
       TF_ASSIGN_OR_RETURN(d.emplace_back(),
                           client_->LookupDevice(DeviceId(device_id)));
     }
-    devices = DeviceList(std::move(d));
+    devices = BasicDeviceList::Create(std::move(d));
   }
 
   TF_ASSIGN_OR_RETURN(
@@ -971,7 +1098,10 @@ IfrtBackend::HandleLoadedExecutableExecuteRequest(
   // `CheckFuture` exactly once to check for its status and erase it. In future,
   // we may introduce separate mechanisms to remove futures from `futures_`
   // without checking its status for situations where futures are not used.
-  {
+  //
+  // Starting protocol version 6, the client tells the server whether the status
+  // future needs to be populated or not.
+  if (version_.protocol_version() < 6 || execute_options.fill_status) {
     absl::MutexLock lock(&futures_mutex_);
     execute_response->set_status_handle(handle_generator_.New());
     futures_.insert(
@@ -1222,9 +1352,9 @@ IfrtBackend::HandleGetDefaultDeviceAssignmentRequest(
   // Currently, the xla::DeviceAssignment::Serialize does not fail. If test
   // coverage for this error is needed, consider using testing::test_value to
   // inject one.
-  TF_RETURN_IF_ERROR(assignment.Serialize(
+  assignment.Serialize(
       ifrt_resp->mutable_get_default_device_assignment_response()
-          ->mutable_device_assignment()));
+          ->mutable_device_assignment());
 
   return ifrt_resp;
 }

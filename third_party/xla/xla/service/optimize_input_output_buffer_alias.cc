@@ -21,6 +21,7 @@ limitations under the License.
 #include "absl/container/flat_hash_map.h"
 #include "absl/container/flat_hash_set.h"
 #include "absl/log/log.h"
+#include "absl/status/statusor.h"
 #include "absl/strings/string_view.h"
 #include "absl/types/span.h"
 #include "xla/hlo/ir/hlo_input_output_alias_config.h"
@@ -29,7 +30,6 @@ limitations under the License.
 #include "xla/shape.h"
 #include "xla/shape_util.h"
 #include "xla/status_macros.h"
-#include "xla/statusor.h"
 #include "tsl/platform/errors.h"
 
 namespace xla {
@@ -149,6 +149,7 @@ absl::StatusOr<bool> OptimizeInputOutputBufferAlias::Run(
   // and output_shape.
   const auto& entry_computation_layout = module->entry_computation_layout();
   std::vector<Shape> input_shapes;
+  input_shapes.reserve(module->entry_computation()->num_parameters());
   for (int64_t i = 0; i < module->entry_computation()->num_parameters(); ++i) {
     input_shapes.push_back(entry_computation_layout.parameter_shape(i));
   }

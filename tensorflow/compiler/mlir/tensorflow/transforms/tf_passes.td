@@ -2225,7 +2225,7 @@ def XlaCallModuleDeserializationPass
     "shape::ShapeDialect",
     "stablehlo::StablehloDialect",
     "vhlo::VhloDialect",
-    "quant::QuantizationDialect",
+    "quant::QuantDialect",
   ];
 
   let constructor = "TF::CreateXlaCallModuleDeserializationPass()";
@@ -2304,4 +2304,24 @@ def MoveTpuCompileToFrontPass : Pass<"tf-move-tpu-compile-to-front", "mlir::func
     where they are.
   }];
   let constructor = "TF::CreateMoveTpuCompileToFrontPass()";
+}
+
+def DecomposeOptionalsPass : Pass<"tf-decompose-optionals", "ModuleOp"> {
+  let summary = "Decomposes ops of the 'Optional' family";
+  let description = [{
+    Turns OptionalFromValue, OptionalGetValue, OptionalNone,
+    and OptionalHasValue into identities.
+
+    For example, if we have:
+
+      %1 = "tf.OptionalFromValue"(%0) : (tensor<f32>) -> !tf_type.variant
+      %2 = "tf.OptionalGetValue"(%1) : (tensor<!tf_type.variant>) -> tensor<f32>
+
+    then after the pass, this will have been transformed to:
+
+      %1 = "tf.Identity"(%0) : (tensor<f32>) -> tensor<f32>
+      %2 = "tf.Identity"(%1) : (tensor<f32>) -> tensor<f32>
+
+  }];
+  let constructor = "TF::CreateDecomposeOptionalsPass()";
 }

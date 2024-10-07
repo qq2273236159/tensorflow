@@ -44,24 +44,6 @@ using mlir::OpPassManager;
 using mlir::PassManager;
 using mlir::func::FuncOp;
 
-// Setup the input pass manager to enable IR dumping after each pass.
-// Note a side effect of this method is that multi threading will be disabled.
-void EnablePassIRPrinting(PassManager& pm, const std::string& dump_group_name,
-                          llvm::StringRef module_name) {
-  // Print the whole module after each pass, which requires disabling
-  // multi-threading as well.
-  pm.getContext()->disableMultithreading();
-  pm.enableIRPrinting(std::make_unique<::tensorflow::DataDumperLoggerConfig>(
-      [module_name, dump_group_name](const std::string& pass_tag_name,
-                                     mlir::Operation* op) {
-        return DEBUG_DATA_DUMPER()->GetDumpFilename(
-            module_name.str(), dump_group_name, pass_tag_name);
-      },
-      /*pass_prefix=*/"",
-      /*print_module_scope=*/true));
-  pm.enableTiming();
-}
-
 void AddClusterToIfrtRuntimeOpsPassPipeline(OpPassManager& pm,
                                             llvm::StringRef module_name) {
   pm.addNestedPass<mlir::func::FuncOp>(
@@ -81,6 +63,10 @@ void AddClusterToIfrtRuntimeOpsPassPipeline(OpPassManager& pm,
 
   pm.addPass(CreateRewriteClusterToIfrtCallPass());
 
+  // After device program is extracted, we can clean up device attributes from
+  // all ops.
+  pm.addNestedPass<mlir::func::FuncOp>(CreateTfDeviceCleanupPass());
+
   // Sink VarHandle with ReadVariableOp: subsequent SinkVariableAsNamedArrayPass
   // rely on the co-existence of VarHandle and ReadVariable in the same
   // function.
@@ -92,11 +78,35 @@ void AddClusterToIfrtRuntimeOpsPassPipeline(OpPassManager& pm,
   pm.addPass(mlir::createInlinerPass());
   pm.addPass(::tensorflow::CreateSinkInInvariantOpsPass());
 
+  // Decompose resource ops as resource variables are loaded by ReadVariableOp
+  // and can be lowered to IfrtLoadVariableOp in the subsequent
+  // SinkVariableAsNamedArrayPass.
+  pm.addNestedPass<mlir::func::FuncOp>(
+      mlir::TFDevice::CreateDecomposeResourceOpsPass());
+
   // Sink variable tensor as named array in IFRT.
   pm.addPass(CreateSinkVariableAsNamedArrayPass());
 }
 
 }  // namespace
+
+// Setup the input pass manager to enable IR dumping after each pass.
+// Note a side effect of this method is that multi threading will be disabled.
+void EnablePassIRPrinting(PassManager& pm, const std::string& dump_group_name,
+                          llvm::StringRef module_name) {
+  // Print the whole module after each pass, which requires disabling
+  // multi-threading as well.
+  pm.getContext()->disableMultithreading();
+  pm.enableIRPrinting(std::make_unique<::tensorflow::DataDumperLoggerConfig>(
+      [module_name, dump_group_name](const std::string& pass_tag_name,
+                                     mlir::Operation* op) {
+        return DEBUG_DATA_DUMPER()->GetDumpFilename(
+            module_name.str(), dump_group_name, pass_tag_name);
+      },
+      /*pass_prefix=*/"",
+      /*print_module_scope=*/true));
+  pm.enableTiming();
+}
 
 absl::Status RunClusterToIfrtRuntimeOpsPassPipeline(
     mlir::ModuleOp module, llvm::StringRef module_name) {

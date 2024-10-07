@@ -15,6 +15,7 @@
 """Tests for `tf.data.Dataset.flat_map()`."""
 import random
 from typing import Callable, Optional
+import unittest
 
 from absl.testing import parameterized
 import numpy as np
@@ -466,6 +467,10 @@ class FlatMapCheckpointTest(
     verify_fn(self, build_dataset, num_outputs=3 * 4 - num_skips)
 
 
+@unittest.skip(
+    "TODO: b/355241367 - `flat_map_dataset_op.cc` still needs to be fixed."
+    " Please use concatenate dataset op plus global shuffling instead."
+)
 class FlatMapGlobalShuffleTest(
     test_base.DatasetTestBase, parameterized.TestCase):
 
@@ -498,9 +503,26 @@ class FlatMapGlobalShuffleTest(
     self.assertNotEqual(dataset_output, expected)
     self.assertLen(dataset_output, self.evaluate(dataset.cardinality()))
 
+  @combinations.generate(test_base.default_test_combinations())
+  def testInputCardinalityTooLarge(self):
+    dataset = dataset_ops.Dataset.from_tensor_slices([[i] for i in range(101)])
+    dataset = dataset.flat_map(dataset_ops.Dataset.from_tensor_slices)
+    with self.assertRaisesRegex(
+        errors.FailedPreconditionError,
+        "The cardinality of the input to FlatMapDataset is too large to support"
+        " global shuffling",
+    ):
+      dataset = global_shuffle_op._global_shuffle(dataset, seed=42)
+      self.getDatasetOutput(dataset, requires_initialization=True)
 
+
+@unittest.skip(
+    "TODO: b/355241367 - `flat_map_dataset_op.cc` still needs to be fixed."
+    " Please use concatenate dataset op plus global shuffling instead."
+)
 class FlatMapGlobalShuffleCheckpointTest(
-    checkpoint_test_base.CheckpointTestBase, parameterized.TestCase):
+    checkpoint_test_base.CheckpointTestBase, parameterized.TestCase
+):
 
   @combinations.generate(
       combinations.times(

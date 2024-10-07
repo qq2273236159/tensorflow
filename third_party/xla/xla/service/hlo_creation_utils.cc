@@ -27,13 +27,14 @@ limitations under the License.
 #include "absl/algorithm/container.h"
 #include "absl/log/check.h"
 #include "absl/log/log.h"
+#include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
 #include "absl/types/span.h"
-#include "xla/client/lib/comparators.h"
-#include "xla/client/xla_builder.h"
-#include "xla/client/xla_computation.h"
 #include "xla/comparison_util.h"
+#include "xla/hlo/builder/lib/comparators.h"
+#include "xla/hlo/builder/xla_builder.h"
+#include "xla/hlo/builder/xla_computation.h"
 #include "xla/hlo/ir/hlo_clone_context.h"
 #include "xla/hlo/ir/hlo_instruction.h"
 #include "xla/hlo/ir/hlo_module.h"
@@ -45,7 +46,6 @@ limitations under the License.
 #include "xla/shape.h"
 #include "xla/shape_util.h"
 #include "xla/status_macros.h"
-#include "xla/statusor.h"
 #include "xla/util.h"
 #include "xla/xla_data.pb.h"
 #include "tsl/platform/errors.h"
@@ -422,6 +422,26 @@ HloInstruction* MakeReducePrecisionHlo(HloInstruction* operand,
       metadata);
 }
 
+namespace {
+static HloComputation* MakeBinaryScalarComputation(HloOpcode binary_opcode,
+                                                   PrimitiveType dtype,
+                                                   HloInstruction* ctx,
+                                                   HloModule* module) {
+  CHECK_NE(ctx, nullptr);
+  HloComputation::Builder b(
+      absl::StrCat(ctx->name(), ".reduce_sub_computation"));
+  const Shape scalar_shape = ShapeUtil::MakeShape(dtype, {});
+  HloInstruction* lhs =
+      b.AddInstruction(HloInstruction::CreateParameter(0, scalar_shape, "lhs"));
+  HloInstruction* rhs =
+      b.AddInstruction(HloInstruction::CreateParameter(1, scalar_shape, "rhs"));
+  b.AddInstruction(
+      HloInstruction::CreateBinary(scalar_shape, binary_opcode, lhs, rhs));
+  CHECK_NE(module, nullptr);
+  return module->AddEmbeddedComputation(b.Build());
+}
+}  // namespace
+
 absl::StatusOr<HloInstruction*> MakeReduceHlo(
     HloInstruction* operand, HloInstruction* init_value,
     absl::Span<const int64_t> dimensions, HloComputation* reduce_computation,
@@ -448,24 +468,29 @@ absl::StatusOr<HloInstruction*> MakeReduceWindowHlo(
       metadata);
 }
 
+absl::StatusOr<HloInstruction*> MakeReduceWindowHlo(
+    HloInstruction* operand, HloInstruction* init_value, const Window& window,
+    HloOpcode binary_opcode, const OpMetadata* metadata) {
+  HloComputation* reduce_computation = MakeBinaryScalarComputation(
+      binary_opcode, operand->shape().element_type(), operand,
+      operand->GetModule());
+  TF_ASSIGN_OR_RETURN(Shape inferred_shape,
+                      ShapeInference::InferReduceWindowShape(
+                          operand->shape(), init_value->shape(), window,
+                          reduce_computation->ComputeProgramShape()));
+  return operand->parent()->AddInstruction(
+      HloInstruction::CreateReduceWindow(inferred_shape, operand, init_value,
+                                         window, reduce_computation),
+      metadata);
+}
+
 absl::StatusOr<HloInstruction*> MakeReduceHlo(
     HloInstruction* operand, HloInstruction* init_value,
     absl::Span<const int64_t> dimensions, HloOpcode binary_opcode,
     const OpMetadata* metadata, const FrontendAttributes* frontend_attributes) {
-  auto scalar_shape = ShapeUtil::MakeShape(operand->shape().element_type(), {});
-  HloComputation* reduce_computation;
-  {
-    HloComputation::Builder b(
-        absl::StrCat(operand->name(), ".reduce_sub_computation"));
-    auto lhs = b.AddInstruction(
-        HloInstruction::CreateParameter(0, scalar_shape, "lhs"));
-    auto rhs = b.AddInstruction(
-        HloInstruction::CreateParameter(1, scalar_shape, "rhs"));
-    b.AddInstruction(
-        HloInstruction::CreateBinary(scalar_shape, binary_opcode, lhs, rhs));
-    reduce_computation =
-        operand->GetModule()->AddEmbeddedComputation(b.Build());
-  }
+  HloComputation* reduce_computation = MakeBinaryScalarComputation(
+      binary_opcode, operand->shape().element_type(), operand,
+      operand->GetModule());
   return MakeReduceHlo(operand, init_value, dimensions, reduce_computation,
                        metadata, frontend_attributes);
 }
@@ -478,19 +503,8 @@ absl::StatusOr<HloInstruction*> MakeReduceHlo(
   std::vector<int64_t> all_dims(operand->shape().rank());
   std::iota(all_dims.begin(), all_dims.end(), 0);
 
-  auto scalar_shape = ShapeUtil::MakeShape(operand->shape().element_type(), {});
-  HloComputation* reduce_computation;
-  {
-    HloComputation::Builder b(
-        absl::StrCat(operand->name(), ".reduce_sub_computation"));
-    auto lhs = b.AddInstruction(
-        HloInstruction::CreateParameter(0, scalar_shape, "lhs"));
-    auto rhs = b.AddInstruction(
-        HloInstruction::CreateParameter(1, scalar_shape, "rhs"));
-    b.AddInstruction(
-        HloInstruction::CreateBinary(scalar_shape, binary_opcode, lhs, rhs));
-    reduce_computation = module->AddEmbeddedComputation(b.Build());
-  }
+  HloComputation* reduce_computation = MakeBinaryScalarComputation(
+      binary_opcode, operand->shape().element_type(), operand, module);
   return MakeReduceHlo(operand, init_value, all_dims, reduce_computation,
                        metadata, frontend_attributes);
 }
@@ -782,7 +796,7 @@ HloInstruction* CreateDummyOp(HloComputation::Builder* b, const Shape& shape) {
 absl::StatusOr<std::unique_ptr<HloComputation>> CreateComputationWithSignature(
     absl::Span<const Shape* const> domain, const Shape& range,
     absl::string_view name) {
-  HloComputation::Builder b{std::string(name)};
+  HloComputation::Builder b{name};
   int64_t param_idx = 0;
   for (const Shape* param_shape : domain) {
     b.AddInstruction(HloInstruction::CreateParameter(
@@ -868,22 +882,6 @@ HloInstruction* ExpandDegenerateReshape(HloInstruction* inst) {
     return degenerate_adding_hlo;
   }
   return nullptr;
-}
-
-std::unique_ptr<HloInstruction> MakeConstantWithShape(const Shape& shape,
-                                                      int64_t value) {
-  return primitive_util::PrimitiveTypeSwitch<std::unique_ptr<HloInstruction>>(
-      [&](auto literal_constant) -> std::unique_ptr<HloInstruction> {
-        if constexpr (primitive_util::IsIntegralType(literal_constant)) {
-          using NativeT = primitive_util::NativeTypeOf<literal_constant>;
-          auto constant = HloInstruction::CreateConstant(
-              LiteralUtil::CreateR0(static_cast<NativeT>(value)));
-          *constant->mutable_shape() = shape;
-          return std::move(constant);
-        }
-        LOG(FATAL) << "Literal is of non-integral type";
-      },
-      shape.element_type());
 }
 
 }  // namespace xla

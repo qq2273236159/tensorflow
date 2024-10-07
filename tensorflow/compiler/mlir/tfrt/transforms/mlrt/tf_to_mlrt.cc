@@ -51,6 +51,7 @@ limitations under the License.
 #include "tensorflow/compiler/mlir/tfrt/ir/mlrt/tf_mlrt_ops.h"
 #include "tensorflow/compiler/mlir/tfrt/ir/mlrt/tf_mlrt_tpu_ops.h"
 #include "tensorflow/compiler/mlir/tfrt/transforms/mlrt/execute_op_registry.h"
+#include "tensorflow/compiler/mlir/tfrt/transforms/mlrt/mlrt_device_constants.h"
 #include "tensorflow/compiler/mlir/tfrt/transforms/mlrt/tpu_conversion_patterns.h"
 #include "tensorflow/compiler/mlir/tfrt/transforms/mlrt/util.h"
 #include "tensorflow/compiler/mlir/tfrt/transforms/utils.h"
@@ -113,7 +114,7 @@ class FuncOpSignatureConversion final
     });
 
     // Update the entry block
-    if (rewriter.applySignatureConversion(&func_op.getBody(),
+    if (rewriter.applySignatureConversion(&func_op.getBody().front(),
                                           converted_signature,
                                           &type_converter_) == nullptr) {
       return mlir::failure();
@@ -373,7 +374,7 @@ class IfrtRestoreVariableOpConversion
         op.getLoc(), adaptor.getOperands()[0], adaptor.getOperands()[1],
         adaptor.getOperands()[2],
         adaptor.getOperands().slice(3, adaptor.getOperands().size() - 3),
-        op.getRestoredDtypes());
+        op.getRestoredDtypes(), op.getTruncateInCast());
     rewriter.replaceOp(op, new_op);
 
     return mlir::success();

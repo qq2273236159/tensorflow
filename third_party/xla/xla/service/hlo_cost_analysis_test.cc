@@ -20,19 +20,19 @@ limitations under the License.
 #include <utility>
 #include <vector>
 
+#include "absl/status/statusor.h"
 #include "xla/client/client.h"
 #include "xla/client/client_library.h"
 #include "xla/client/local_client.h"
-#include "xla/client/padding.h"
-#include "xla/client/xla_builder.h"
-#include "xla/client/xla_computation.h"
+#include "xla/hlo/builder/padding.h"
+#include "xla/hlo/builder/xla_builder.h"
+#include "xla/hlo/builder/xla_computation.h"
 #include "xla/hlo/ir/hlo_instruction.h"
 #include "xla/hlo/ir/hlo_module.h"
 #include "xla/service/hlo_parser.h"
 #include "xla/service/local_service.h"
 #include "xla/service/service.h"
 #include "xla/shape_util.h"
-#include "xla/statusor.h"
 #include "xla/test_helpers.h"
 #include "xla/tests/hlo_test_base.h"
 #include "xla/xla_data.pb.h"
@@ -701,6 +701,32 @@ TEST_F(HloCostAnalysisTest, MatmulAndConvolutionCanBeTheSameComputation) {
   EXPECT_EQ(conv_analysis.flop_count(), matmul_analysis.flop_count());
 }
 
+// No instruction can finish faster than the clock cycle
+TEST_F(HloCostAnalysisTest, LatencyBoundedOptimalTime) {
+  absl::string_view hlo_string = R"(
+  HloModule module, is_scheduled=true
+
+  ENTRY Entry {
+    param0 = f32[1,1] parameter(0)
+    param1 = f32[1,1] parameter(1)
+    ROOT add = f32[1,1] add(param0, param1)
+  }
+  )";
+  TF_ASSERT_OK_AND_ASSIGN(auto module,
+                          ParseAndReturnUnverifiedModule(hlo_string));
+
+  const HloInstruction* add = module->entry_computation()->root_instruction();
+  HloCostAnalysis::Options options{ShapeSize};
+  const float clock_cycle_seconds = 10.0f;
+  options.set_flops_per_second(1024);
+  options.set_bytes_per_second(1024);
+  options.set_transcendentals_per_second(1024);
+  options.set_flops_min_latency_second(clock_cycle_seconds);
+  HloCostAnalysis cost_analysis(options);
+  ASSERT_IS_OK(add->Accept(&cost_analysis));
+  EXPECT_EQ(cost_analysis.optimal_seconds(), clock_cycle_seconds);
+}
+
 using FusionCostAnalysis = HloTestBase;
 
 TEST_F(FusionCostAnalysis, LoopFusionDynUpdateSlice) {
@@ -859,14 +885,14 @@ ENTRY temp {
 HloModule temp, is_scheduled=true
 
 fused_computation.4150.clone {
-  param_0.185389 = s8[2,6144,2,256]{3,1,0,2:T(32,128)(4,1)} parameter(0)
+  param_0.185389 = s8[2,6144,2,256]{3,1,0,2:T(8,128)(4,1)} parameter(0)
   constant.230138 = s32[]{:T(128)} constant(0)
   param_1.219146 = s32[]{:T(128)S(6)} parameter(1)
   ROOT dynamic-slice.40526 = s8[2,384,2,256]{3,1,0,2:T(8,128)(4,1)} dynamic-slice(param_0.185389, constant.230138, param_1.219146, constant.230138, constant.230138), dynamic_slice_sizes={2,384,2,256}
 }
 
 ENTRY temp {
-  param_2.123719 = s8[2,6144,2,256]{3,1,0,2:T(32,128)(4,1)} parameter(0)
+  param_2.123719 = s8[2,6144,2,256]{3,1,0,2:T(8,128)(4,1)} parameter(0)
   param_3.66279 = s32[]{:T(128)S(6)} parameter(1)
   ROOT fusion.85943 = s8[2,384,2,256]{3,1,0,2:T(8,128)(4,1)} fusion(param_2.123719, param_3.66279), kind=kLoop, calls=fused_computation.4150.clone
 }
@@ -886,6 +912,142 @@ ENTRY temp {
   // based on the size of the consuming dynamic slice.
   EXPECT_EQ(nested_analysis.bytes_accessed(*nested_root),
             fusion_analysis.bytes_accessed(*fusion_root));
+}
+
+TEST_F(FusionCostAnalysis, NestedCopyFusionDUS) {
+  absl::string_view nested_fusion_text = R"(
+HloModule temp, is_scheduled=true
+
+copy_fusion.1291.clone {
+  input.1291 = s8[2,6144,2,256]{3,1,0,2:T(32,128)(4,1)} parameter(0)
+  ROOT copy.74276 = s8[2,6144,2,256]{3,1,0,2:T(8,128)(4,1)} copy(input.1291)
+}
+
+fused_computation.4150.clone {
+  param_0.185389 = s8[2,6144,2,256]{3,1,0,2:T(32,128)(4,1)} parameter(0)
+  fusion.103344 = s8[2,6144,2,256]{3,1,0,2:T(8,128)(4,1)} fusion(param_0.185389), kind=kLoop, calls=copy_fusion.1291.clone
+  param_1.185389 = s8[2,6144,1,256]{3,1,0,2:T(8,128)(4,1)} parameter(2)
+  constant.230138 = s32[]{:T(128)} constant(0)
+  param_1.219146 = s32[]{:T(128)S(6)} parameter(1)
+  param_3.229 = pred[]{:T(512)} constant(false)
+  broadcast.11499 = pred[2,6144,1,256]{3,1,0,2:T(8,128)(4,1)} broadcast(param_3.229), dimensions={}
+  dynamic-slice.11241 = s8[2,6144,1,256]{3,1,0,2:T(8,128)(4,1)} dynamic-slice(fusion.103344, constant.230138, constant.230138, param_1.219146, constant.230138), dynamic_slice_sizes={2,6144,1,256}
+  select.9063 = s8[2,6144,1,256]{3,1,0,2:T(8,128)(4,1)} select(broadcast.11499, param_1.185389, dynamic-slice.11241)
+  ROOT dynamic-update-slice.40526 = s8[2,6144,2,256]{3,1,0,2:T(8,128)(4,1)} dynamic-update-slice(fusion.103344, select.9063, constant.230138, constant.230138, param_1.219146, constant.230138)
+}
+
+ENTRY temp {
+  param_2.123719 = s8[2,6144,2,256]{3,1,0,2:T(32,128)(4,1)} parameter(0)
+  param_3.66279 = s32[]{:T(128)S(6)} parameter(1)
+  param_1.123719 = s8[2,6144,1,256]{3,1,0,2:T(8,128)(4,1)} parameter(2)
+  ROOT fusion.85943 = s8[2,6144,2,256]{3,1,0,2:T(8,128)(4,1)} fusion(param_2.123719, param_3.66279, param_1.123719), kind=kLoop, calls=fused_computation.4150.clone
+}
+)";
+  absl::string_view fusion_text = R"(
+HloModule temp, is_scheduled=true
+
+fused_computation.4150.clone {
+  param_0.185389 = s8[2,6144,2,256]{3,1,0,2:T(8,128)(4,1)} parameter(0)
+  param_1.185389 = s8[2,6144,1,256]{3,1,0,2:T(8,128)(4,1)} parameter(2)
+  constant.230138 = s32[]{:T(128)} constant(0)
+  param_1.219146 = s32[]{:T(128)S(6)} parameter(1)
+  param_3.229 = pred[]{:T(512)} constant(false)
+  broadcast.11499 = pred[2,6144,1,256]{3,1,0,2:T(8,128)(4,1)} broadcast(param_3.229), dimensions={}
+  dynamic-slice.11241 = s8[2,6144,1,256]{3,1,0,2:T(8,128)(4,1)} dynamic-slice(param_0.185389, constant.230138, constant.230138, param_1.219146, constant.230138), dynamic_slice_sizes={2,6144,1,256}
+  select.9063 = s8[2,6144,1,256]{3,1,0,2:T(8,128)(4,1)} select(broadcast.11499, param_1.185389, dynamic-slice.11241)
+  ROOT dynamic-update-slice.40526 = s8[2,6144,2,256]{3,1,0,2:T(8,128)(4,1)} dynamic-update-slice(param_0.185389, select.9063, constant.230138, constant.230138, param_1.219146, constant.230138)
+}
+
+ENTRY temp {
+  param_2.123719 = s8[2,6144,2,256]{3,1,0,2:T(8,128)(4,1)} parameter(0)
+  param_3.66279 = s32[]{:T(128)S(6)} parameter(1)
+  param_1.123719 = s8[2,6144,1,256]{3,1,0,2:T(8,128)(4,1)} parameter(2)
+  ROOT fusion.85943 = s8[2,6144,2,256]{3,1,0,2:T(8,128)(4,1)} fusion(param_2.123719, param_3.66279, param_1.123719), kind=kLoop, calls=fused_computation.4150.clone
+}
+)";
+  TF_ASSERT_OK_AND_ASSIGN(auto nested_fusion_module,
+                          ParseAndReturnVerifiedModule(nested_fusion_text));
+  HloCostAnalysis nested_analysis(ShapeSize);
+  auto* nested_root =
+      nested_fusion_module->entry_computation()->root_instruction();
+  ASSERT_IS_OK(nested_root->Accept(&nested_analysis));
+  TF_ASSERT_OK_AND_ASSIGN(auto fusion_module,
+                          ParseAndReturnVerifiedModule(fusion_text));
+  HloCostAnalysis fusion_analysis(ShapeSize);
+  auto* fusion_root = fusion_module->entry_computation()->root_instruction();
+  ASSERT_IS_OK(fusion_root->Accept(&fusion_analysis));
+  // The nested fusion should only access the bytes size amount of the parameter
+  // based on the size of the consuming dynamic slice.
+  EXPECT_EQ(nested_analysis.bytes_accessed(*nested_root),
+            fusion_analysis.bytes_accessed(*fusion_root));
+}
+
+TEST_F(FusionCostAnalysis, NestedFusionFeedsMultipleUsers) {
+  absl::string_view hlo_text = R"(
+HloModule temp, is_scheduled=true
+
+fused_computation.1 {
+  tmp_0 = bf16[64,16,512,512]{2,3,1,0:T(8,128)(2,1)} parameter(0)
+  tmp_1 = bf16[64,16,512,512]{2,3,1,0:T(8,128)(2,1)} fusion(bf16[64,16,512,512]{2,3,1,0:T(8,128)(2,1)} tmp_0), kind=kLoop, calls=
+  {
+    tmp_0 = bf16[64,16,512,512]{2,3,1,0:T(8,128)(2,1)} parameter(0)
+    ROOT tmp_4 = bf16[64,16,512,512]{2,3,1,0:T(8,128)(2,1)} add(bf16[64,16,512,512]{2,3,1,0:T(8,128)(2,1)} tmp_0, bf16[64,16,512,512]{2,3,1,0:T(8,128)(2,1)} tmp_0)
+  }
+  tmp_2 = bf16[]{:T(256)} constant(0)
+  tmp_3 = bf16[64,16,512,512]{2,3,1,0:T(8,128)(2,1)} reduce-window(bf16[64,16,512,512]{2,3,1,0:T(8,128)(2,1)} tmp_1, bf16[]{:T(256)} tmp_2), window={size=1x1x1x1023 pad=0_0x0_0x0_0x511_511}, to_apply=
+  {
+    tmp_0 = bf16[]{:T(256)} parameter(0)
+    tmp_1 = bf16[]{:T(256)} parameter(1)
+    ROOT tmp_2 = bf16[]{:T(256)} add(bf16[]{:T(256)} tmp_0, bf16[]{:T(256)} tmp_1)
+  }
+  ROOT tmp_4 = bf16[64,16,512,512]{2,3,1,0:T(8,128)(2,1)} divide(bf16[64,16,512,512]{2,3,1,0:T(8,128)(2,1)} tmp_1, bf16[64,16,512,512]{2,3,1,0:T(8,128)(2,1)} tmp_3)
+}
+
+ENTRY temp {
+  tmp_0 = bf16[64,16,512,512]{2,3,1,0:T(8,128)(2,1)} parameter(0)
+  ROOT result = bf16[64,16,512,512]{2,3,1,0:T(8,128)(2,1)} fusion(tmp_0), kind=kLoop, calls=fused_computation.1
+}
+)";
+  TF_ASSERT_OK_AND_ASSIGN(auto fusion_module,
+                          ParseAndReturnVerifiedModule(hlo_text));
+  HloCostAnalysis fusion_analysis(ShapeSize);
+  auto* fusion_root = fusion_module->entry_computation()->root_instruction();
+  ASSERT_IS_OK(fusion_root->Accept(&fusion_analysis));
+  EXPECT_EQ(1073741824, fusion_analysis.bytes_accessed(*fusion_root));
+}
+
+TEST_F(FusionCostAnalysis, ParamFeedsNestedFusionAndTrivialUser) {
+  absl::string_view hlo_text = R"(
+HloModule temp, is_scheduled=true
+
+fused_computation.1 {
+  tmp_0 = bf16[64,16,512,512]{2,3,1,0:T(8,128)(2,1)} parameter(0)
+  tmp_1 = bf16[64,16,512,512]{2,3,1,0:T(8,128)(2,1)} fusion(bf16[64,16,512,512]{2,3,1,0:T(8,128)(2,1)} tmp_0), kind=kLoop, calls=
+  {
+    tmp_0 = bf16[64,16,512,512]{2,3,1,0:T(8,128)(2,1)} parameter(0)
+    ROOT tmp_4 = bf16[64,16,512,512]{2,3,1,0:T(8,128)(2,1)} add(bf16[64,16,512,512]{2,3,1,0:T(8,128)(2,1)} tmp_0, bf16[64,16,512,512]{2,3,1,0:T(8,128)(2,1)} tmp_0)
+  }
+  tmp_2 = bf16[]{:T(256)} constant(0)
+  tmp_3 = bf16[64,16,512,512]{2,3,1,0:T(8,128)(2,1)} reduce-window(bf16[64,16,512,512]{2,3,1,0:T(8,128)(2,1)} tmp_1, bf16[]{:T(256)} tmp_2), window={size=1x1x1x1023 pad=0_0x0_0x0_0x511_511}, to_apply=
+  {
+    tmp_0 = bf16[]{:T(256)} parameter(0)
+    tmp_1 = bf16[]{:T(256)} parameter(1)
+    ROOT tmp_2 = bf16[]{:T(256)} add(bf16[]{:T(256)} tmp_0, bf16[]{:T(256)} tmp_1)
+  }
+  ROOT tmp_4 = bf16[64,16,512,512]{2,3,1,0:T(8,128)(2,1)} divide(bf16[64,16,512,512]{2,3,1,0:T(8,128)(2,1)} tmp_0, bf16[64,16,512,512]{2,3,1,0:T(8,128)(2,1)} tmp_3)
+}
+
+ENTRY temp {
+  tmp_0 = bf16[64,16,512,512]{2,3,1,0:T(8,128)(2,1)} parameter(0)
+  ROOT result = bf16[64,16,512,512]{2,3,1,0:T(8,128)(2,1)} fusion(tmp_0), kind=kLoop, calls=fused_computation.1
+}
+)";
+  TF_ASSERT_OK_AND_ASSIGN(auto fusion_module,
+                          ParseAndReturnVerifiedModule(hlo_text));
+  HloCostAnalysis fusion_analysis(ShapeSize);
+  auto* fusion_root = fusion_module->entry_computation()->root_instruction();
+  ASSERT_IS_OK(fusion_root->Accept(&fusion_analysis));
+  EXPECT_EQ(1610612736, fusion_analysis.bytes_accessed(*fusion_root));
 }
 
 TEST_F(FusionCostAnalysis, LoopFusionTupleOutput) {
@@ -1331,6 +1493,38 @@ TEST_F(HloCostAnalysisTest, Gather) {
   EXPECT_EQ(analysis.output_bytes_accessed(*root), sizeof(float) * 2 * 3);
 }
 
+TEST_F(HloCostAnalysisTest, GatherBatchingDims) {
+  // Test the analysis on a gather.
+  XlaBuilder builder("gather");
+  Shape operand_shape = ShapeUtil::MakeShape(S32, {5, 3, 3});
+  Shape indices_shape = ShapeUtil::MakeShape(S32, {5});
+
+  auto operand = Parameter(&builder, 0, operand_shape, "operand");
+  auto indices = Parameter(&builder, 1, indices_shape, "indices");
+  GatherDimensionNumbers dim_numbers;
+  dim_numbers.add_offset_dims(1);
+  dim_numbers.add_collapsed_slice_dims(1);
+  dim_numbers.add_operand_batching_dims(0);
+  dim_numbers.add_start_indices_batching_dims(0);
+  dim_numbers.add_start_index_map(1);
+  dim_numbers.set_index_vector_dim(1);
+  Gather(operand, indices, dim_numbers, {1, 1, 3});
+
+  auto hlo_module = BuildHloGraph(&builder);
+
+  // Run HLO cost analysis.
+  HloCostAnalysis analysis(ShapeSize);
+  ASSERT_IS_OK(
+      hlo_module->entry_computation()->root_instruction()->Accept(&analysis));
+
+  EXPECT_EQ(analysis.bytes_accessed(), 140);
+
+  HloInstruction* root = hlo_module->entry_computation()->root_instruction();
+  EXPECT_EQ(analysis.operand_bytes_accessed(*root, 0), sizeof(float) * 5 * 3);
+  EXPECT_EQ(analysis.operand_bytes_accessed(*root, 1), sizeof(int32_t) * 5);
+  EXPECT_EQ(analysis.output_bytes_accessed(*root), sizeof(float) * 5 * 3);
+}
+
 TEST_F(HloCostAnalysisTest, Scatter) {
   // Test the analysis on a scatter.
   XlaBuilder builder("scatter");
@@ -1362,6 +1556,41 @@ TEST_F(HloCostAnalysisTest, Scatter) {
   EXPECT_EQ(analysis.operand_bytes_accessed(*root, 1), sizeof(int32_t) * 2);
   EXPECT_EQ(analysis.operand_bytes_accessed(*root, 2), sizeof(float) * 2 * 3);
   EXPECT_EQ(analysis.output_bytes_accessed(*root), sizeof(float) * 2 * 3);
+}
+
+TEST_F(HloCostAnalysisTest, ScatterBatchingDims) {
+  // Test the analysis on a scatter.
+  XlaBuilder builder("scatter");
+  Shape operand_shape = ShapeUtil::MakeShape(F32, {5, 3, 3});
+  Shape indices_shape = ShapeUtil::MakeShape(S32, {5});
+  Shape values_shape = ShapeUtil::MakeShape(F32, {5, 3});
+
+  auto operand = Parameter(&builder, 0, operand_shape, "operand");
+  auto indices = Parameter(&builder, 1, indices_shape, "indices");
+  auto values = Parameter(&builder, 2, values_shape, "values");
+  ScatterDimensionNumbers dim_numbers;
+  dim_numbers.set_index_vector_dim(1);
+  dim_numbers.add_update_window_dims(1);
+  dim_numbers.add_inserted_window_dims(1);
+  dim_numbers.add_input_batching_dims(0);
+  dim_numbers.add_scatter_indices_batching_dims(0);
+  dim_numbers.add_scatter_dims_to_operand_dims(1);
+  Scatter(operand, indices, values, add_, dim_numbers);
+
+  auto hlo_module = BuildHloGraph(&builder);
+
+  // Run HLO cost analysis.
+  HloCostAnalysis analysis(ShapeSize);
+  ASSERT_IS_OK(
+      hlo_module->entry_computation()->root_instruction()->Accept(&analysis));
+
+  EXPECT_EQ(analysis.bytes_accessed(), 4 * (5 + 3 * (5 * 3)));
+
+  HloInstruction* root = hlo_module->entry_computation()->root_instruction();
+  EXPECT_EQ(analysis.operand_bytes_accessed(*root, 0), sizeof(float) * 5 * 3);
+  EXPECT_EQ(analysis.operand_bytes_accessed(*root, 1), sizeof(int32_t) * 5);
+  EXPECT_EQ(analysis.operand_bytes_accessed(*root, 2), sizeof(float) * 5 * 3);
+  EXPECT_EQ(analysis.output_bytes_accessed(*root), sizeof(float) * 5 * 3);
 }
 
 TEST_F(HloCostAnalysisTest, MultioutputScatter) {
